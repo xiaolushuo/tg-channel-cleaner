@@ -280,11 +280,27 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v1.3.0"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.3.0", "2026-10-13", [
+        "**批量划分分组**：新增「📁 分组 ▾ → 批量划分到分组…」对话框，"
+        "一次把一批频道 / 群组加进或移出某个分组；快捷键 **Ctrl+G**",
+        "划分范围可选三档：**已勾选的行** / **当前筛选与搜索结果** / **全部会话**"
+        "——搜完直接整批划进分组，不必先挨个勾选",
+        "分组操作不再跳过受保护项（白名单 / 创建者 / 管理员）。"
+        "「受保护」只对退出 / 删除有意义，此前用「全选」划分组会静默少划一部分",
+        "修复：把会话加入分组时，若它在**排除名单（exclude_peers）**里，"
+        "此前只写 include_peers 会被排除名单压住 —— 日志说已加入、Telegram 里却没有",
+        "修复：从**带自动规则**的分组移出会话（如「所有群组」这类）此前只从手工名单里删除，"
+        "规则下次仍会把它收回来 —— 日志报「已移出 N 个」，客户端里看还在。"
+        "现在会写入排除名单，并且日志会说明有多少个属于这种情况",
+        "修复：「只看已勾选」开着时清空勾选，列表不会跟着变空（那段刷新代码写在 return 之后，"
+        "以前根本执行不到）",
+        "分组菜单改为**弹出时实时刷新**，直接显示「已勾选 N 个」「筛选结果 N 个」",
+    ]),
     ("v1.2.0", "2026-10-13", [
         "**多账号**：可添加多个账号随时切换，**切换时不会退出登录**"
         "——每个账号的登录态各自保留，切回来直接可用，不需要再收验证码",
@@ -499,6 +515,20 @@ FOLDER_RULE_FLAGS = ("contacts", "non_contacts", "groups", "broadcasts", "bots",
 FOLDER_TYPE_FLAGS = ("contacts", "non_contacts", "groups", "broadcasts", "bots")
 # Telegram 对「一个分组手工容纳多少会话」有限制，超过就提示（不阻止，由服务端最终裁决）
 FOLDER_SOFT_LIMIT = 100
+# exclude_peers 同样有上限；移出「靠规则进来的」会话会消耗它
+FOLDER_EXCLUDE_LIMIT = 100
+
+# 批量划分分组时「对哪些行生效」的三档范围。
+# 「当前筛选 / 搜索结果」是这里最要紧的一档：搜索完直接划分，不必先挨个勾选。
+FOLDER_SCOPE_CHECKED = "checked"    # 已勾选的行（含被筛选隐藏的勾选）
+FOLDER_SCOPE_VISIBLE = "visible"    # 当前筛选 / 搜索结果（列表里显示出来的行）
+FOLDER_SCOPE_ALL = "all"            # 全部会话（含被筛选隐藏的）
+FOLDER_SCOPES = (
+    (FOLDER_SCOPE_CHECKED, "已勾选的行"),
+    (FOLDER_SCOPE_VISIBLE, "当前筛选 / 搜索结果"),
+    (FOLDER_SCOPE_ALL, "全部会话"),
+)
+FOLDER_SCOPE_LABEL = dict(FOLDER_SCOPES)
 
 
 def peer_key_of(ent):
@@ -614,13 +644,38 @@ def folder_flag_of(state):
     return None
 
 
+def folder_keeps_by_rule(f, state):
+    """**光靠自动规则**，这个分组会不会把该会话算进来。
+
+    只看「该会话类别对应的那一个类型开关」+ 三个 exclude_* 开关，
+    **完全不看 include_peers / pinned_peers / exclude_peers** —— 这一点是关键，
+    因为它同时要回答两个不同的问题：
+
+    1) `filter_matches` 的规则分支：规则本身是否命中；
+    2) **移出分组时**：光把会话从 include_peers 里删掉够不够？
+       如果这里返回 True，说明规则仍会把它捞回来 —— 必须额外写进 exclude_peers
+       才能真正移出去（否则日志报「已移出 N 个」，用户在 Telegram 里一看还在）。
+
+    所以这个函数是「分组归属」这件事的单一真源，不要在两处各写一份开关判断。
+    """
+    flag = folder_flag_of(state)
+    if flag is None or not getattr(f, flag, None):
+        return False
+    if getattr(f, "exclude_muted", None) and state.get("muted"):
+        return False
+    if getattr(f, "exclude_read", None) and not (state.get("unread") or 0):
+        return False
+    if getattr(f, "exclude_archived", None) and state.get("archived"):
+        return False
+    return True
+
+
 def filter_matches(f, key, state):
     """本地复现「这个会话属不属于该分组」。规则语义（对齐 Telegram 官方客户端）：
-    - exclude_peers 命中 -> 不属于（最高优先级）
+    - exclude_peers 命中 -> 不属于（**最高优先级**，比手工加入还高）
     - 手工加入（include/pinned）-> 属于，不再看规则
-    - 有规则 -> 该会话类别对应的那个开关必须打开（没打开一律不属于；
-      一个类型开关都没勾的分组因此等于「纯手工」，不会自动收人）
-    - 最后依次套用 exclude_muted / exclude_read / exclude_archived
+    - 否则看规则：该会话类别对应的那个开关必须打开
+      （一个类型开关都没勾的分组因此等于「纯手工」，不会自动收人）
     """
     try:
         for p in (getattr(f, "exclude_peers", None) or []):
@@ -628,16 +683,7 @@ def filter_matches(f, key, state):
                 return False
         if key in manual_peer_keys(f):
             return True
-        flag = folder_flag_of(state)
-        if flag is None or not getattr(f, flag, None):
-            return False
-        if getattr(f, "exclude_muted", None) and state.get("muted"):
-            return False
-        if getattr(f, "exclude_read", None) and not (state.get("unread") or 0):
-            return False
-        if getattr(f, "exclude_archived", None) and state.get("archived"):
-            return False
-        return True
+        return folder_keeps_by_rule(f, state)
     except Exception:
         return False
 
@@ -1682,9 +1728,11 @@ class App:
         ttk.Button(frm_sel, text="清空全部", command=lambda: self.set_all(False, scope="all")).pack(side="left", padx=3)
         self.btn_whitelist = ttk.Button(frm_sel, text="🔒 白名单", command=self.on_toggle_whitelist_checked)
         self.btn_whitelist.pack(side="left", padx=3)
-        # 分组操作：对勾选的行批量加入 / 移出分组（只改归属，不退出也不删除）
+        # 分组操作：对一批行批量加入 / 移出分组（只改归属，不退出也不删除）
         self.btn_folder = ttk.Menubutton(frm_sel, text="📁 分组 ▾")
-        self._folder_menu = tk.Menu(self.btn_folder, tearoff=0)
+        # postcommand：菜单弹出前重算（勾选数 / 筛选结果数会一直变，静态菜单会显示旧数字）
+        self._folder_menu = tk.Menu(self.btn_folder, tearoff=0,
+                                    postcommand=self._refresh_folder_menu)
         self.btn_folder["menu"] = self._folder_menu
         self.btn_folder.pack(side="left", padx=3)
         self._rebuild_folder_menu()
@@ -1879,10 +1927,18 @@ class App:
         self.root.bind("<Control-A>", self._on_select_all_key)
         self.root.bind("<Control-f>", self._on_focus_search)
         self.root.bind("<Control-F>", self._on_focus_search)
+        # Ctrl+G：搜索完直接开「批量划分到分组」，不必先点菜单
+        self.root.bind("<Control-g>", self._on_folder_bulk_key)
+        self.root.bind("<Control-G>", self._on_folder_bulk_key)
         self.root.bind("<F5>", self._on_refresh_key)
         self.root.bind("<Escape>", self._on_escape)
         self.tree.bind("<space>", self._on_space_toggle)
         self.tree.bind("<Button-3>", self.on_tree_right_click)
+
+    def _on_folder_bulk_key(self, event=None):
+        """Ctrl+G：打开「批量划分到分组」。搜索 / 筛选完直接按它，把整批结果一次划进分组。"""
+        self._folder_bulk_dialog(True)
+        return "break"
 
     def _on_focus_search(self, event=None):
         try:
@@ -3496,6 +3552,38 @@ class App:
         except (TypeError, ValueError):
             return None
 
+    def _find_filter_by_name(self, name):
+        """按分组名找本地那份 DialogFilter（只用于界面预览，真正写回时现读现改）。"""
+        for f in (getattr(self, "_filters", None) or []):
+            try:
+                if is_real_folder(f) and folder_title(f) == name:
+                    return f
+            except Exception:
+                continue
+        return None
+
+    def _folder_scope_iids(self, scope):
+        """批量划分分组时「对哪些行生效」。
+        - checked：已勾选的行（含被筛选隐藏的勾选）—— 传统的多选路径；
+        - visible：**当前筛选 / 搜索结果**（列表里显示出来的行）—— 搜索完直接划分，不必先挨个勾；
+        - all    ：全部会话（含被筛选隐藏的）。
+        ⚠️ 三档都**不跳过受保护行**：分组归属跟能不能退出是两回事，
+        白名单 / 创建者 / 管理员同样要能划进分组。
+        """
+        if scope == FOLDER_SCOPE_CHECKED:
+            return self.selected_items_all()
+        if scope == FOLDER_SCOPE_VISIBLE:
+            return self._visible_ids()
+        return list(self.channels)
+
+    def _refresh_folder_menu(self):
+        """菜单即将弹出时才重算内容 —— 这样「已勾选 N 个」「筛选结果 N 个」永远是当下的数字。
+        （Tk 菜单是静态的，建好之后不会自己更新。）"""
+        try:
+            self._rebuild_folder_menu()
+        except Exception:
+            pass
+
     def _rebuild_folder_menu(self):
         m = getattr(self, "_folder_menu", None)
         if m is None:
@@ -3504,21 +3592,34 @@ class App:
             m.delete(0, "end")
         except Exception:
             pass
-        names = list(getattr(self, "_folder_names", []) or [])
-        editable = getattr(self, "_editable_folder_names", None)
-        if editable is None:
-            editable = names
-        names = list(editable)
-        if names:
+        editable = list(getattr(self, "_editable_folder_names", None) or [])
+        if not editable:
+            m.add_command(label="（尚未连接，或还没在 Telegram 里建过分组）", state="disabled")
+            m.add_separator()
+            m.add_command(label="重新读取分组列表", command=self.on_reload_folders)
+            return
+
+        m.add_command(label="批量划分到分组…（可选范围）",
+                      command=lambda: self._folder_bulk_dialog(True))
+        m.add_command(label="批量移出分组…（可选范围）",
+                      command=lambda: self._folder_bulk_dialog(False))
+        m.add_separator()
+
+        n_checked = len(self.selected_items_all())
+        n_visible = len(self._visible_ids())
+        for n, scope, label in ((n_checked, FOLDER_SCOPE_CHECKED, "已勾选的行"),
+                                (n_visible, FOLDER_SCOPE_VISIBLE, "当前筛选 / 搜索结果")):
             sub_add = tk.Menu(m, tearoff=0)
             sub_del = tk.Menu(m, tearoff=0)
-            for nm in names:
-                sub_add.add_command(label=nm, command=lambda n=nm: self.on_folder_action(True, n))
-                sub_del.add_command(label=nm, command=lambda n=nm: self.on_folder_action(False, n))
-            m.add_cascade(label="加入分组（勾选的行）", menu=sub_add)
-            m.add_cascade(label="移出分组（勾选的行）", menu=sub_del)
-        else:
-            m.add_command(label="（尚未连接或还没有分组）", state="disabled")
+            for nm in editable:
+                sub_add.add_command(
+                    label=nm,
+                    command=lambda n2=nm, s=scope: self.on_folder_action(True, n2, s))
+                sub_del.add_command(
+                    label=nm,
+                    command=lambda n2=nm, s=scope: self.on_folder_action(False, n2, s))
+            m.add_cascade(label=f"{label}（{n} 个）加入 ▸", menu=sub_add)
+            m.add_cascade(label=f"{label}（{n} 个）移出 ▸", menu=sub_del)
         m.add_separator()
         m.add_command(label="重新读取分组列表", command=self.on_reload_folders)
 
@@ -3532,20 +3633,147 @@ class App:
         await self._load_folders()
         self.root.after(0, self._refresh_folder_cells)
 
-    def on_folder_action(self, add=True, folder_name=None):
+    def on_folder_action(self, add=True, folder_name=None, scope=FOLDER_SCOPE_CHECKED):
+        """菜单快捷项：直接对「勾选的行」或「当前筛选 / 搜索结果」批量加入 / 移出分组。
+        需要自己挑范围时走 _folder_bulk_dialog。"""
         name = folder_name or self.folder_filter_var.get()
-        if name in (FOLDER_ALL, FOLDER_NONE):
-            messagebox.showinfo("提示", "请先在顶部「分组」下拉里选中一个具体分组，再执行这个操作。")
+        if not name or name in (FOLDER_ALL, FOLDER_NONE):
+            messagebox.showinfo("提示", "请先指定一个具体分组（用「📁 分组 ▾ → 批量划分到分组…」）。")
             return
-        iids = self.selected_items_all()
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接账号。")
+            return
+        iids = self._folder_scope_iids(scope)
         if not iids:
-            messagebox.showinfo("提示", "还没有勾选任何行。先在列表里勾选，再来操作分组。")
+            messagebox.showinfo("提示", f"「{FOLDER_SCOPE_LABEL.get(scope, scope)}」里没有可操作的行。")
             return
         verb = "加入" if add else "移出"
-        if not messagebox.askyesno("确认", f"把已勾选的 {len(iids)} 个会话{verb}分组「{name}」？\n"
-                                          "（只改分组归属，不会退出或删除任何会话）"):
+        extra = ""
+        if scope == FOLDER_SCOPE_CHECKED and getattr(self, "_sel_hidden", None):
+            extra = f"\n（其中 {len(self._sel_hidden)} 个已被筛选隐藏，会一并处理）"
+        if not messagebox.askyesno(
+                "确认",
+                f"把「{FOLDER_SCOPE_LABEL.get(scope, scope)}」的 {len(iids)} 个会话{verb}"
+                f"分组「{name}」？\n{self._kinds_text(self._count_kinds(iids))}{extra}\n"
+                "（只改分组归属，不会退出或删除任何会话）"):
             return
         self.run_async(self._set_folder_membership(iids, name, add))
+
+    def _folder_bulk_dialog(self, add=True, scope=None, folder_name=None):
+        """「批量划分到分组」对话框：选目标分组 + 选范围 + 实时预览，一步到位。
+
+        存在的理由有两个，都是实打实的：
+        1) **搜索 / 筛选完直接整体划分**。以前必须先挨个勾选（或全选），
+           而「全选」会跳过白名单 / 创建者 / 管理员 —— 那些行在分组这件事上
+           本来毫无理由被跳过，结果是「明明搜出 40 个，只划进去 28 个」。
+        2) 把「改的是哪个分组、动的是哪批行、影响多少个」在执行前一次讲清楚。
+        """
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接账号。")
+            return
+        editable = list(getattr(self, "_editable_folder_names", None) or [])
+        if not editable:
+            messagebox.showinfo(
+                "提示",
+                "还没有可用的分组。\n\n"
+                "本工具只能把会话放进**已存在**的分组，不会替你在服务端新建分组\n"
+                "（新建要自己生成分组 id，撞上其它设备刚建的分组就会把它覆盖掉，风险不值得冒）。\n\n"
+                "请先在 Telegram 客户端里建好分组，再点「📁 分组 ▾ → 重新读取分组列表」。")
+            return
+
+        verb = "加入" if add else "移出"
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"批量{verb}分组")
+        dlg.transient(self.root)
+        try:
+            dlg.geometry("640x380")
+        except Exception:
+            pass
+        outer = ttk.Frame(dlg, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=f"把一批频道 / 群组批量{verb}到指定分组",
+                  font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="只改分组归属，不会退出、也不会删除任何会话。",
+                  foreground="#6b7280").pack(anchor="w", pady=(2, 8))
+
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=(0, 8))
+        ttk.Label(row, text="目标分组：").pack(side="left")
+        fvar = tk.StringVar(value=folder_name or editable[0])
+        ttk.Combobox(row, textvariable=fvar, state="readonly", width=24,
+                     values=editable).pack(side="left", padx=4)
+        lbl_rule = ttk.Label(row, text="", foreground="#6b7280")
+        lbl_rule.pack(side="left", padx=8)
+
+        box = ttk.LabelFrame(outer, text="对哪些行生效", padding=8)
+        box.pack(fill="x")
+        svar = tk.StringVar(value=scope or FOLDER_SCOPE_CHECKED)
+        radios = []
+        for key, label in FOLDER_SCOPES:
+            rb = ttk.Radiobutton(box, text=f"{label}（{len(self._folder_scope_iids(key))} 个）",
+                                 value=key, variable=svar)
+            rb.pack(anchor="w", pady=1)
+            radios.append(rb)
+
+        lbl_preview = ttk.Label(outer, text="", foreground="#185FA5",
+                                wraplength=600, justify="left")
+        lbl_preview.pack(anchor="w", pady=(8, 0))
+        lbl_warn = ttk.Label(outer, text="", foreground="#a32d2d",
+                             wraplength=600, justify="left")
+        lbl_warn.pack(anchor="w", pady=(3, 0))
+
+        def update_preview(*_a):
+            iids = self._folder_scope_iids(svar.get())
+            nm = fvar.get()
+            lbl_preview.configure(
+                text=f"将{'加入' if add else '移出'}分组「{nm}」：{len(iids)} 个 —— "
+                     + self._kinds_text(self._count_kinds(iids)))
+            f = self._find_filter_by_name(nm)
+            lbl_rule.configure(text=("规则：" + folder_rules_text(f)) if f is not None else "")
+            warns = []
+            if f is not None and not add:
+                ruled = folder_rules_on(f)
+                if ruled:
+                    warns.append(
+                        "⚠️「%s」带自动规则（%s）：靠规则进去的会话，光从手工名单里删掉是没用的，"
+                        "会被写入**排除名单**才算真正移出（会占用 100 项配额）。"
+                        % (nm, " + ".join(FOLDER_FLAG_LABEL[n] for n in ruled)))
+            if svar.get() == FOLDER_SCOPE_ALL and add:
+                warns.append(f"⚠️ 范围是「全部会话」：会把整个列表（含被筛选隐藏的行）都{verb}该分组。")
+            lbl_warn.configure(text="\n".join(warns))
+            ok_btn.configure(state="normal" if iids else "disabled")
+            return len(iids)
+
+        for rb in radios:
+            rb.configure(command=update_preview)
+
+        result = {"ok": False}
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", side="bottom", pady=(10, 0))
+        ok_btn = ttk.Button(bar, text=f"确认{verb}")
+
+        def on_ok():
+            result["ok"] = True
+            dlg.destroy()
+
+        ok_btn.configure(command=on_ok)
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=4)
+        ok_btn.pack(side="right", padx=4)
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.bind("<Return>", lambda e: on_ok())
+        update_preview()
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.wait_window()
+        if not result["ok"]:
+            return
+        iids = self._folder_scope_iids(svar.get())
+        if not iids:
+            return
+        self.run_async(self._set_folder_membership(iids, fvar.get(), add))
 
     async def _set_folder_membership(self, iids, folder_name, add=True):
         """把勾选的会话加入 / 移出指定分组。
@@ -3556,8 +3784,9 @@ class App:
            自己 new 一个 DialogFilter 再逐字段填，会丢掉 Telethon 这个版本不认识的字段
            （例如 color / title_noanimate），把分组的颜色和样式悄悄清掉。
         """
+        self._last_rule_excluded = 0     # 每轮开始清零，避免上一轮的计数残留到日志里
         self.root.after(0, lambda: self.start_task(
-            f"正在{'加入' if add else '移出'}分组「{folder_name}」…"))
+            f"正在{'加入' if add else '移出'}分组「{folder_name}」…共 {len(iids)} 个"))
         try:
             res = await self.client(tl_messages.GetDialogFiltersRequest())
             target = None
@@ -3605,6 +3834,12 @@ class App:
                     if k is not None and k not in have:
                         keep.append(p)
                         have.add(k)
+                # ★ 必须同时把它从 exclude_peers 里摘掉。
+                # exclude_peers 的优先级**高于**手工加入（见 filter_matches）：
+                # 只要它还在排除名单里，就算写进 include_peers 也进不去 ——
+                # 表现为「日志说已加入，Telegram 里就是没有」。
+                keep_exc = [p for p in (getattr(target, "exclude_peers", None) or [])
+                            if input_peer_key(p) not in keys]
             else:
                 # 移出：include_peers 与 pinned_peers 两处都要摘干净，
                 # 否则从分组里「移出」了、却还留在置顶列表里。
@@ -3612,6 +3847,28 @@ class App:
                         if input_peer_key(p) not in keys]
                 keep_pin = [p for p in (getattr(target, "pinned_peers", None) or [])
                             if input_peer_key(p) not in keys]
+                keep_exc = [p for p in (getattr(target, "exclude_peers", None) or [])
+                            if input_peer_key(p) not in keys]
+                # ★ 关键：靠**自动规则**进来的会话，光从 include_peers 删掉是没用的 ——
+                # 规则（比如「所有群组」）下一次仍会把它算进来，用户在 Telegram 里一看还在，
+                # 但日志却已经报了「已移出 N 个」。必须把它写进 exclude_peers 才真正移出去。
+                need_exc = set()
+                for iid in iids:
+                    ent = self.channels.get(iid)
+                    if ent is None:
+                        continue
+                    k = peer_key_of(ent)
+                    st = (getattr(self, "_dlg_state", None) or {}).get(k) or {}
+                    if k is not None and folder_keeps_by_rule(target, st):
+                        need_exc.add(k)
+                have_exc = {input_peer_key(p) for p in keep_exc}
+                have_exc.discard(None)
+                for p in peers:
+                    k = input_peer_key(p)
+                    if k in need_exc and k not in have_exc:
+                        keep_exc.append(p)
+                        have_exc.add(k)
+                self._last_rule_excluded = len(need_exc)
             if not keep and not keep_pin:
                 # 服务端会直接报 FILTER_INCLUDE_EMPTY，提前拦下来并说清原因
                 self.log_msg(f"⛔ 这样会把分组「{folder_name}」清空 —— Telegram 不允许 include_peers 为空，"
@@ -3621,9 +3878,13 @@ class App:
             if len(keep) > FOLDER_SOFT_LIMIT:
                 self.log_msg(f"⚠️ 分组「{folder_name}」将有 {len(keep)} 个手工会话，"
                              f"超过常见上限 {FOLDER_SOFT_LIMIT}，服务端可能拒绝。")
+            if len(keep_exc) > FOLDER_EXCLUDE_LIMIT:
+                self.log_msg(f"⚠️ 分组「{folder_name}」的排除名单将有 {len(keep_exc)} 项，"
+                             f"超过常见上限 {FOLDER_EXCLUDE_LIMIT}，服务端可能拒绝。")
 
             target.include_peers = keep
             target.pinned_peers = keep_pin
+            target.exclude_peers = keep_exc
             await self.client(tl_messages.UpdateDialogFilterRequest(id=target.id, filter=target))
 
             # 顺手把本地那份 _filters 里对应的对象换成刚提交的这份。
@@ -3637,6 +3898,10 @@ class App:
             msg = f"✅ 已把 {len(keys)} 个会话{'加入' if add else '移出'}分组「{folder_name}」"
             if bad:
                 msg += f"（{bad} 个会话实体解析失败，已跳过）"
+            n_rule = int(getattr(self, "_last_rule_excluded", 0) or 0)
+            if not add and n_rule:
+                msg += (f"\n　 其中 {n_rule} 个原本是被分组「{folder_name}」的**自动规则**收进去的，"
+                        f"只从手工名单里删没用 —— 已写入排除名单，这才算真移出。")
             self.log_msg(msg)
             self.root.after(0, lambda: self.finish_task(f"分组操作完成：{len(keys)} 个"))
             self.root.after(0, self._refresh_folder_cells)
@@ -4331,18 +4596,23 @@ class App:
     def _visible_ids(self):
         return list(self.tree.get_children())
 
-    def set_all(self, val, scope="visible"):
+    def set_all(self, val, scope="visible", skip_protected=None):
         """勾选 / 取消勾选。
         scope="visible"：仅当前显示中的行（筛选生效时即「筛选结果」）；
         scope="all"    ：含被筛选隐藏的行（用于彻底清空，避免隐藏行残留勾选）。
-        全选时会**自动跳过受保护行**（白名单 / 创建者 / 管理员）—— 它们不是退不掉就是不该退。
+        全选时默认**自动跳过受保护行**（白名单 / 创建者 / 管理员）—— 它们不是退不掉就是不该退。
+        ⚠️ 但「受保护」只对退出 / 删除有意义：分组归属跟能不能退出毫无关系，
+        所以分组相关操作传 skip_protected=False，否则白名单里的频道永远勾不上，
+        也就永远划不进分组（用户会以为是功能坏了）。
         取消勾选（val=False）不跳，永远能一键清干净。"""
         mark = "☑" if val else "☐"
         if scope == "all":
             iids = list(self.channels)
         else:
             iids = self._visible_ids()
-        skip = bool(val) and var_bool(self, "skip_protected_var", True)
+        if skip_protected is None:
+            skip_protected = var_bool(self, "skip_protected_var", True)
+        skip = bool(val) and bool(skip_protected)
         skipped = 0
         for iid in iids:
             if skip and self.protected_reason(iid):
@@ -4363,10 +4633,12 @@ class App:
             # 只动了可见行，隐藏行的勾选保持不变
             pass
         self.update_count()
-        return skipped
+        # 「只看已勾选」开着时清空勾选，列表必须立刻跟着变空 —— 否则显示的是一堆
+        # 勾不上、也处理不了的行，看着像功能坏了。（这段以前写在 return 之后，是死代码）
         if getattr(self, "_only_checked", False) and not val:
             self.apply_filter(verbose=False)
             self.log_msg("ℹ️ 「只看已勾选」已开启：勾选被清空后列表为空，点「清除」可恢复显示。")
+        return skipped
 
     def select_all_visible(self):
         """全选当前显示的行（筛选生效时=全选筛选结果），隐藏行不受影响。"""
@@ -4377,7 +4649,10 @@ class App:
         self.set_all(True, scope="visible")
         scope = "筛选结果" if (self._filter_active or shown != len(self.channels)) else "全部"
         picked = len(self.selected_items())
-        extra = f"，跳过 {shown - picked} 个受保护项" if shown > picked else ""
+        extra = ""
+        if shown > picked:
+            extra = (f"，跳过 {shown - picked} 个受保护项（白名单 / 创建者 / 管理员）"
+                     "── 只是不参与退出 / 删除；要划进分组请用「📁 分组 ▾」或 Ctrl+G，不受此限制")
         self.log_msg(f"☑ 已全选{scope} {picked} 个{extra}。")
 
     def apply_filter_and_select_all(self):
@@ -5443,6 +5718,29 @@ def selftest():
         assert not is_editable_folder(tl_types.DialogFilterChatlist(
             id=9, title=tl_types.TextWithEntities(text="shared", entities=[]),
             pinned_peers=[], include_peers=[]))
+
+        # ---- 分组「加入 / 移出」的两个静默失败点（v1.3.0 修）----
+        # 1) exclude_peers 优先级**高于**手工加入：不先把它摘干净，写进 include_peers 也进不去；
+        # 2) 靠自动规则进来的会话，不写 exclude_peers 就永远移不出去（规则下次又把它捞回来）。
+        assert folder_keeps_by_rule(flt, _st_ch) is True    # flt 开了 broadcasts
+        assert folder_keeps_by_rule(flt, _st_u) is False    # 频道分组不收用户
+        _ip_ch = tl_types.InputPeerChannel(channel_id=1, access_hash=0)
+        _ex = tl_types.DialogFilter(id=3, title="ex", pinned_peers=[],
+                                    include_peers=[_ip_ch], exclude_peers=[_ip_ch],
+                                    broadcasts=True)
+        assert filter_matches(_ex, ("channel", 1), _st_ch) is False, "排除名单必须优先级最高"
+        _mn = tl_types.DialogFilter(id=4, title="mn", pinned_peers=[],
+                                    include_peers=[tl_types.InputPeerUser(user_id=3, access_hash=1)],
+                                    exclude_peers=[], broadcasts=True)
+        assert filter_matches(_mn, ("user", 3), _st_u) is True, "手工加入的应当属于，哪怕规则不命中"
+        assert folder_keeps_by_rule(_mn, _st_u) is False, "但光靠规则并不命中 -> 移出时必须写排除名单"
+        assert folder_keeps_by_rule(flt, {"kind": KIND_GROUP}) is False, "开关按类别各查各的"
+
+        # 批量划分的三档范围：搜索 / 搜索结果必须是其中一档（用户明确要求的）
+        assert [s for s, _l in FOLDER_SCOPES] == [
+            FOLDER_SCOPE_CHECKED, FOLDER_SCOPE_VISIBLE, FOLDER_SCOPE_ALL]
+        assert FOLDER_SCOPE_VISIBLE in FOLDER_SCOPE_LABEL
+        assert FOLDER_EXCLUDE_LIMIT > 0
         assert DESTROY_CONFIRM_WORD
 
         # 「退出」必须能吃掉全部会话类型：私聊 / 机器人 -> 删除会话，
@@ -5542,6 +5840,16 @@ def selftest():
             assert app._per_account() == {} and app._whitelist_of() == set()
             assert app._selected_account_key() is None
             _selftest_say(lines, "多账号：账号注册表 / 按账号 session 与缓存路径 / 切换入口控件 OK")
+            # 批量划分分组：按钮 + 菜单 + 三档范围解析 + 按名字找分组
+            assert app.btn_folder is not None, "缺少「📁 分组」按钮"
+            assert app._folder_menu is not None, "缺少分组操作菜单"
+            assert callable(app._folder_bulk_dialog) and callable(app.on_folder_action)
+            assert app._find_filter_by_name("这个分组不存在") is None
+            for _sc in (FOLDER_SCOPE_CHECKED, FOLDER_SCOPE_VISIBLE, FOLDER_SCOPE_ALL):
+                assert isinstance(app._folder_scope_iids(_sc), list), _sc
+            # 空列表下三档都必须返回空（未连接 / 未加载时不能抛）
+            assert app._folder_scope_iids(FOLDER_SCOPE_ALL) == []
+            _selftest_say(lines, "批量划分分组：分组按钮 / 操作菜单 / 三档范围（勾选·筛选结果·全部）OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
