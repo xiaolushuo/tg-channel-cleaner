@@ -12,7 +12,8 @@ TG 频道批量退出工具 (GUI 版)
   2. pip install telethon
   3. 运行本脚本，填入 api_id / api_hash / 手机号，点击「连接/登录」。
      首次登录会要求输入手机收到的验证码（若开启了两步验证还需输入密码）。
-  4. 等频道列表加载完，勾选要退出的，点「退出选中频道」。
+  4. 等会话列表加载完，勾选要处理的，点「退出 / 删除选中」。
+     频道 / 群组会被**退出**；私聊 / 机器人没有「退出」这个概念，会被**删除会话**。
 
 注意事项:
   - 本工具仅用于管理你自己的账号，请遵守 Telegram 服务条款。
@@ -135,6 +136,76 @@ STATS_CACHE_FILE = os.path.join(BASE_DIR, "tg_stats_cache.json")
 ROLE_CACHE_FILE = os.path.join(BASE_DIR, "tg_role_cache.json")
 # 身份标识 → 界面文案。创建者/管理员退不出去（Telegram 不允许），必须提前识别并跳过。
 ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
+
+# ---------------- 版本号与更新日志 ----------------
+# 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
+# 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
+APP_NAME = "TG 频道批量退出工具"
+APP_VERSION = "v1.1.2"
+APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
+
+# [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
+CHANGELOG = [
+    ("v1.1.2", "2026-10-13", [
+        "「退出 / 删除选中」现在能处理**全部会话类型**：频道 / 群组真的退出，"
+        "私聊 / 机器人没有「退出」这个概念，自动改为删除会话"
+        "（此前勾到私聊会整批报「不支持的会话类型」，现在不会再出现）",
+        "确认窗直接说清这批「退出多少个、删除多少个」，不再让你自己猜",
+        "界面显示版本号（状态栏右下角），新增「📋 更新日志」窗口",
+        "统计日志更准确：全部命中本地缓存时直接说明「未发任何请求」，"
+        "不再出现「成功 0 个」这种看着像失败的说法",
+        "仓库补充 CHANGELOG.md",
+    ]),
+    ("v1.1.1", "2026-10-13", [
+        "修复：分组会把全部群组 / 频道都算进去 —— 判定改为「按会话类别各查各的开关」，"
+        "对齐 Telegram 官方客户端（此前勾了「非联系人」的分组会收下所有群组和频道）",
+        "新增：列表上方的类型统计条（共 N 个 │ 频道 N │ 群组 N │ 私聊 N │ 机器人 N │ 已不在 N），"
+        "筛选生效时显示「显示 N / 共 M」",
+        "新增：加载分组时逐个打印它的自动规则，一眼看清「这个分组为什么收了这么多」",
+        "修复：Telegram 的「共享分组」不再被误改（只读展示，加入 / 移出会被拦下并说明原因）",
+    ]),
+    ("v1.1.0", "2026-10-13", [
+        "列表扩展为「全部会话」：频道 / 超级群 / 普通群 / 私聊 / 机器人 / 已不在，"
+        "新增「类型」列与类型筛选",
+        "新增「活跃(天前)」列：最后一条消息距今多少天，并按活跃天数筛选（预设到 365 天）",
+        "新增「分组」列与分组筛选，可批量把会话加入 / 移出指定分组（只改归属，不退出也不删除）",
+        "新增「删除会话」：清掉会话及其聊天记录（本地隐藏，并不会退出）",
+        "新增「删除我创建的频道 / 群组」：真正销毁，仅创建者可用、不可恢复，需手打「删除」确认",
+        "新增「作品数」（消息总数），与用户数共用一次请求",
+    ]),
+    ("v1.0.0", "2026-10-13", [
+        "首个公开版本：批量退出频道 / 群组",
+        "图形界面，分页加载，几百上千个订阅也不卡；点表头排序",
+        "并发获取「用户数」+ 本地缓存（默认 24 小时）",
+        "白名单保护、退出间隔与随机抖动、遇 FloodWait 自动退避重试",
+        "导出 CSV（当前显示 / 全部 / 仅已勾选）",
+        "深色 / 浅色主题、代理设置、--selftest 打包自检",
+    ]),
+]
+
+
+def changelog_text():
+    """把 CHANGELOG 渲染成纯文本（更新日志窗口、自检、命令行 --changelog 共用）。"""
+    out = []
+    for ver, date, items in CHANGELOG:
+        out.append(f"{ver}    {date}")
+        for it in items:
+            out.append(f"   · {it}")
+        out.append("")
+    return "\n".join(out).strip() + "\n"
+
+
+def console_write(text):
+    """写标准输出。打包成「窗口版」exe 后 sys.stdout 是 None，直接 print 会抛
+    AttributeError，所以这里统一兜底（命令行参数在 GUI 下静默无效即可）。"""
+    out = getattr(sys, "stdout", None)
+    if out is None:
+        return
+    try:
+        out.write(text)
+        out.flush()
+    except Exception:
+        pass
 
 
 def var_bool(obj, attr, default=False):
@@ -556,6 +627,42 @@ async def destroy_entity(client, ent):
         return DEL_OK, ""
 
 
+# ---------------- 「退出」的统一入口 ----------------
+# Telegram 里只有**频道 / 群组**谈得上「退出」；**私聊和机器人压根没有这个动作** ——
+# 唯一能做的是删掉会话（只影响自己这边）。所以「退出选中」必须自己按类型分派，
+# 而不是把 User 当成错误拒掉：用户勾了一批私聊 / 机器人，期望的是「这些别再出现了」，
+# 报一个「不支持的会话类型」整批失败，是最没用的行为。
+EXIT_LEAVE = "leave"     # 频道 / 超级群 / 普通群 -> 真的退出（不再是成员）
+EXIT_DELETE = "delete"   # 私聊 / 机器人        -> 退不了，只能删除会话
+EXIT_SKIP = "skip"       # 已不在 / 未知类型    -> 没什么可做的
+
+
+def exit_action_of(kind):
+    """按会话类型决定「退出」该走哪条路。"""
+    if is_member_kind(kind):
+        return EXIT_LEAVE
+    if kind in (KIND_USER, KIND_BOT):
+        return EXIT_DELETE
+    return EXIT_SKIP
+
+
+async def leave_or_delete_entity(client, ent, kind=None):
+    """「退出」的真正入口：能退的退，退不了的删会话。
+
+    这是 build_leave_request 之外的**外层分派**：build_leave_request 仍然只认
+    频道 / 群组（对未知类型显式报错是对的，它不该替调用方猜意图），
+    而这里负责先把类型翻译成动作，再交给对应的原语。
+    返回 (状态, 说明)，状态沿用 LEAVE_* 常量，调用方不必区分两条路。"""
+    action = exit_action_of(kind or session_kind(ent))
+    if action == EXIT_LEAVE:
+        return await leave_entity(client, ent)
+    if action == EXIT_DELETE:
+        status, note = await delete_history_entity(client, ent)
+        return {DEL_OK: LEAVE_OK, DEL_GONE: LEAVE_GONE,
+                DEL_BLOCKED: LEAVE_BLOCKED}.get(status, LEAVE_OK), note
+    return LEAVE_GONE, "该会话已不在列表中"
+
+
 # 列表分页：每拉满一页就在界面追加显示，避免大账号长时间“没反应”
 DIALOG_PAGE = 200
 
@@ -620,7 +727,7 @@ class OperationCancelled(Exception):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("TG 频道批量退出工具")
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.geometry("1200x780")
 
         self.client = None          # TelethonClient 实例
@@ -768,7 +875,7 @@ class App:
     #             状态与进度固定在底部，日志按需收起，尽量把纵向空间还给列表。
     # ================================================================
     def build_ui(self):
-        self.root.title("TG 频道批量退出工具")
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.minsize(1080, 680)
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(2, weight=1)      # 第 2 行（主区）吃掉纵向空间
@@ -1189,7 +1296,7 @@ class App:
         # 4) 退出条（主操作，固定在列表下方）
         frm_act = ttk.Frame(parent)
         frm_act.grid(row=4, column=0, sticky="ew", pady=(5, 0))
-        self.btn_leave = ttk.Button(frm_act, text="🚪 退出选中频道", command=self.on_leave, state="disabled")
+        self.btn_leave = ttk.Button(frm_act, text="🚪 退出 / 删除选中", command=self.on_leave, state="disabled")
         self.btn_leave.pack(side="left", padx=3)
         # 删除类操作收进下拉菜单：破坏性高、使用频率低，
         # 平铺在主按钮旁边反而容易连同「退出」一起误点。
@@ -1220,6 +1327,13 @@ class App:
         self.progress.pack(side="left")
         self.lbl_task = ttk.Label(bar, text="空闲")
         self.lbl_task.pack(side="left", padx=8)
+        # 右侧（pack 顺序 = 从右往左）：版本号 | 更新日志 | 统计进度
+        # 版本号必须在界面上看得见 —— 排查问题时第一个要问的就是「你用的是哪一版」。
+        self.lbl_version = ttk.Label(bar, text=APP_VERSION, foreground="#6b7280")
+        self.lbl_version.pack(side="right", padx=(10, 0))
+        self.btn_changelog = ttk.Button(bar, text="📋 更新日志", width=12,
+                                        command=self.on_show_changelog)
+        self.btn_changelog.pack(side="right", padx=(10, 0))
         self.lbl_stats = ttk.Label(bar, text="")
         self.lbl_stats.pack(side="right", padx=4)
 
@@ -1237,6 +1351,55 @@ class App:
                   foreground="#6b7280").pack(side="right")
         self.log = scrolledtext.ScrolledText(self.frm_log, height=7, state="normal")
         self.log.pack(fill="both", expand=True, pady=(3, 0))
+
+    # ---------------- 更新日志 ----------------
+    def on_show_changelog(self):
+        """弹出更新日志窗口：当前版本置顶高亮，下面倒序列出历史版本。
+
+        内容来自模块级 CHANGELOG（与仓库里的 CHANGELOG.md 同一份事实），
+        所以打包成单文件 exe 后也照样能看，不依赖任何外部文件。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"更新日志 — {APP_NAME}")
+        dlg.transient(self.root)
+        try:
+            dlg.geometry("760x580")
+        except Exception:
+            pass
+
+        outer = ttk.Frame(dlg, padding=12)
+        outer.pack(fill="both", expand=True)
+        head = ttk.Frame(outer)
+        head.pack(fill="x")
+        ttk.Label(head, text=f"{APP_NAME} {APP_VERSION}",
+                  font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(head, text=APP_REPO, foreground="#2563eb").pack(anchor="w", pady=(2, 0))
+
+        txt = scrolledtext.ScrolledText(outer, wrap="word", height=20)
+        txt.pack(fill="both", expand=True, pady=(10, 8))
+        # 标签样式：当前版本用强调色 + 加粗，历史版本标题弱化，正文常规
+        txt.tag_configure("ver_cur", font=("", 11, "bold"), foreground="#2563eb",
+                          spacing1=2, spacing3=2)
+        txt.tag_configure("ver_old", font=("", 10, "bold"),
+                          spacing1=10, spacing3=2)
+        txt.tag_configure("date", foreground="#6b7280")
+        txt.tag_configure("item", lmargin1=18, lmargin2=32, spacing1=1)
+        for idx, (ver, date, items) in enumerate(CHANGELOG):
+            head_tag = "ver_cur" if idx == 0 else "ver_old"
+            txt.insert("end", ver, head_tag)
+            txt.insert("end", f"    {date}", "date")
+            if idx == 0:
+                txt.insert("end", "    （当前版本）", "date")
+            txt.insert("end", "\n")
+            for it in items:
+                txt.insert("end", f"· {it}\n", "item")
+        txt.configure(state="disabled")
+
+        foot = ttk.Frame(outer)
+        foot.pack(fill="x")
+        ttk.Label(foot, text="最新版本与下载：" + APP_REPO + "/releases",
+                  foreground="#6b7280").pack(side="left")
+        ttk.Button(foot, text="关闭", width=8, command=dlg.destroy).pack(side="right")
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     # ---------------- 面板开合 ----------------
     def toggle_left_panel(self):
@@ -2309,7 +2472,7 @@ class App:
             self.log_msg("ℹ️ 当前筛选条件下暂无可显示的行：统计获取完成前多为未获取状态，"
                          "可取消勾选「隐藏统计未获取的行」，或等统计跑完。")
         self.finish_task(f"列表加载完成：{n} 个会话")
-        self.log_msg(f"已加载 {n} 个会话，开始获取用户数 / 作品数 / 活跃时间 ...")
+        self.log_msg(f"已加载 {n} 个会话，开始读取用户数 / 作品数 / 活跃时间（命中本地缓存的不会发请求）...")
         self.run_async(self._fetch_stats(self._tree_epoch, force=False))
 
     def populate(self, items):
@@ -2889,12 +3052,16 @@ class App:
             if need_stats or need_role:
                 todo.append((iid, ent, need_stats, need_role))
 
-        self.log_msg(f"统计任务：共 {total} 个，命中缓存 {cached} 个"
-                     + (f"，角色已缓存 {cached_role} 个" if detect_roles else "（已关闭角色检测）")
-                     + f"，需请求 {len(todo)} 个。")
+        role_desc = (f"角色已缓存 {cached_role} 个" if detect_roles else "角色检测已关闭")
+        self.log_msg(f"📊 统计任务：共 {total} 个 —— 统计已缓存 {cached} 个，{role_desc}，"
+                     f"需发请求 {len(todo)} 个。")
         self.root.after(0, lambda: self._set_stats_running(True))
-        self.root.after(0, lambda: self.start_task(f"正在获取统计（{len(todo)} 个待请求）…"))
-        if not todo:
+        if todo:
+            self.root.after(0, lambda: self.start_task(f"正在获取统计（{len(todo)} 个待请求）…"))
+        else:
+            # 全部命中缓存 -> 一个请求都不用发。仍然要走完「开始 / 结束」这一对，
+            # 否则按钮会一直停在「统计中」的状态。
+            self.root.after(0, lambda: self.start_task("统计命中缓存，无需请求"))
             self.root.after(0, self.refresh_cache_info)
         done = 0
         failed = 0
@@ -3003,9 +3170,18 @@ class App:
                 self.root.after(0, lambda: self.finish_task("统计已废弃（列表已刷新）"))
                 self.log_msg("ℹ️ 列表已刷新，上一轮统计任务已终止。")
             else:
-                self.root.after(0, lambda: self.finish_task(
-                    f"统计完成：成功 {done - failed} 个，失败 {failed} 个"))
-                self.log_msg(f"✅ 统计完成：成功 {done - failed} 个，失败 {failed} 个。")
+                ok = done - failed
+                if todo:
+                    self.root.after(0, lambda: self.finish_task(
+                        f"统计完成：请求 {ok}/{len(todo)} 成功，{cached} 个用缓存"))
+                    self.log_msg(f"✅ 统计完成：实际请求 {len(todo)} 个 —— 成功 {ok} 个、失败 {failed} 个；"
+                                 f"另有 {cached} 个直接用了本地缓存，共 {total} 个。")
+                else:
+                    # 关键：不能报「成功 0 个」—— 那看着像全军覆没，实际是一个请求都没发。
+                    self.root.after(0, lambda: self.finish_task(
+                        f"统计完成：{total} 个全部来自缓存（0 次请求）"))
+                    self.log_msg(f"✅ 统计完成：{total} 个全部来自本地缓存，未发任何请求。"
+                                 f"（想强制重取请点「获取 / 更新统计」）")
             try:
                 self.save_stats_cache()
             except Exception:
@@ -3464,7 +3640,7 @@ class App:
         self.set_all(True, scope="visible")
         picked = len(self.selected_items())
         if picked:
-            self.log_msg(f"☑ 已全选筛选结果 {picked} 个，可直接点「退出选中频道」。")
+            self.log_msg(f"☑ 已全选筛选结果 {picked} 个，可直接点「退出 / 删除选中」。")
         else:
             messagebox.showinfo("提示", "筛选结果全部受保护（白名单 / 创建者 / 管理员），没有可勾选的行。")
 
@@ -3638,6 +3814,32 @@ class App:
                 to_leave.append(snap)
         return to_leave, blocked
 
+    def _exit_breakdown(self, rows):
+        """待处理清单里「真退出」与「删除会话」各多少个 —— 用来把动作说清楚。
+
+        优先看实体的真实类型（`session_kind`），拿不到才退回行里的「类型」列文本；
+        两者在列表刷新后始终一致，但实体更可靠（类型列是渲染出来的字符串）。"""
+        n_leave = n_del = 0
+        for r in rows:
+            ent = self.channels.get(r.get("iid"))
+            kind = session_kind(ent) if ent is not None else r.get("type")
+            act = exit_action_of(kind)
+            if act == EXIT_LEAVE:
+                n_leave += 1
+            elif act == EXIT_DELETE:
+                n_del += 1
+        return n_leave, n_del
+
+    def _exit_headline(self, total, n_leave, n_del):
+        """一句话说清这批勾选会被怎么处理 —— 「私聊会被删除」绝不能藏着不说。"""
+        if n_del and n_leave:
+            return (f"将处理 {total} 个会话：退出 {n_leave} 个频道 / 群组，"
+                    f"删除 {n_del} 个私聊 / 机器人会话。")
+        if n_del:
+            return (f"将删除 {n_del} 个私聊 / 机器人会话"
+                    f"（Telegram 对它们没有「退出」，只能删除会话）。")
+        return f"确定要退出选中的 {n_leave} 个频道 / 群组？"
+
     def confirm_leave(self, to_leave, blocked, notes=""):
         """退出前确认。默认弹「待退出清单」预览窗；关掉预览选项后退化为普通确认框。
         返回 True 表示用户确认执行。"""
@@ -3645,7 +3847,13 @@ class App:
         if blocked:
             reason_txt = f"\n\n将跳过 {len(blocked)} 个受保护项（白名单 / 创建者 / 管理员）。"
         if not var_bool(self, "preview_leave_var", True):
-            msg = f"确定要退出选中的 {len(to_leave)} 个频道 / 群组吗？{reason_txt}"
+            n_leave, n_del = self._exit_breakdown(to_leave)
+            parts = []
+            if n_leave:
+                parts.append(f"退出 {n_leave} 个频道 / 群组")
+            if n_del:
+                parts.append(f"删除 {n_del} 个私聊 / 机器人会话（它们没有「退出」）")
+            msg = "确定要" + "、".join(parts) + "吗？" + reason_txt
             if notes:
                 msg += "\n\n" + notes
             return bool(messagebox.askyesno("确认", msg))
@@ -3740,12 +3948,17 @@ class App:
         return result["ok"]
 
     def _preview_leave_dialog(self, to_leave, blocked, notes=""):
-        """待退出清单预览窗：左右两栏分别列出「将退出」与「已跳过（受保护）」。"""
+        """待退出清单预览窗：左右两栏分别列出「将处理」与「已跳过（受保护）」。"""
+        n_leave, n_del = self._exit_breakdown(to_leave)
+        extra = ""
+        if n_del:
+            extra = (f"其中 {n_del} 个是私聊 / 机器人（Telegram 没有「退出」，"
+                     f"将改为删除会话，只影响你自己这边的记录）。")
         return self._plan_dialog(
             "退出前确认",
-            f"确定要退出选中的 {len(to_leave)} 个频道 / 群组？",
-            to_leave, blocked, notes,
-            ok_text=f"确认退出 {len(to_leave)} 个",
+            self._exit_headline(len(to_leave), n_leave, n_del),
+            to_leave, blocked, (notes + "\n" + extra).strip() if extra else notes,
+            ok_text=f"确认处理 {len(to_leave)} 个",
             blocked_tab=f"已跳过 · 受保护（{len(blocked)}）",
             remember_attr="preview_leave_var")
 
@@ -3772,16 +3985,16 @@ class App:
 
     def leave_items(self, iids, auto_confirm=False):
         if not iids:
-            self._warn_no_selection("没有可退出的频道。")
+            self._warn_no_selection("没有可退出 / 可删除的会话。")
             return
         to_leave, blocked = self.build_leave_plan(iids)
-        notes = self._scope_notes("本次不会退出")
+        notes = self._scope_notes("本次不会处理")
         if not to_leave:
             names = "、".join(b["name"] for b in blocked[:6])
             more = f"，另有 {len(blocked) - 6} 个" if len(blocked) > 6 else ""
             messagebox.showinfo(
                 "提示",
-                f"勾选的 {len(iids)} 个全部受保护，没有可退出的频道。\n\n"
+                f"勾选的 {len(iids)} 个全部受保护，没有可处理的会话。\n\n"
                 f"受保护项：{names}{more}\n"
                 "（白名单可右键或点「🔒 白名单」移出；创建者 / 管理员在 Telegram 里无法退出）",
             )
@@ -3987,18 +4200,25 @@ class App:
         self._set_run_buttons(False)
 
     async def _leave(self, sel, interval, jitter=0):
-        """退出选中频道 / 群组（对私聊 / 机器人无意义，见 build_leave_request）。"""
+        """退出选中会话：频道 / 群组真的退出，私聊 / 机器人改为删除会话。
+
+        分派在 leave_or_delete_entity 里（Telegram 对私聊不提供「退出」，
+        build_leave_request 收到 User 会显式报错 —— 那是原语层的正确行为，
+        不该让用户看到，所以在这里先翻译成动作）。"""
         async def _do_leave(ent, name):
-            status, note = await leave_entity(self.client, ent)
+            kind = session_kind(ent)
+            status, note = await leave_or_delete_entity(self.client, ent, kind)
             if status == LEAVE_BLOCKED:
                 return False, f"⛔ 无法退出（{note}）: {name}"
             if status == LEAVE_GONE:
                 return True, f"➖ 无需退出（{note}）: {name}"
+            if exit_action_of(kind) == EXIT_DELETE:
+                return True, f"🗑 已删除会话（{kind}没有「退出」，只能删除）: {name}"
             return True, f"✅ 已退出: {name}"
 
         await self._run_destructive(
             sel, interval, jitter, _do_leave, "退出",
-            task_label=f"正在退出频道（共 {len(sel)} 个）…")
+            task_label=f"正在处理选中的会话（共 {len(sel)} 个）…")
 
 
     # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
@@ -4201,7 +4421,7 @@ class App:
         if chan_like:
             self.log_msg(
                 f"ℹ️ 其中 {chan_like} 个是频道 / 群组：删除会话只清掉了本地记录，你仍是成员，"
-                "对方再发消息它就会重新出现。要彻底不再看到请改用「🚪 退出选中频道」。")
+                "对方再发消息它就会重新出现。要彻底不再看到请改用「🚪 退出 / 删除选中」。")
 
     # ---- 销毁自己创建的频道 / 群组 ----
     def on_destroy_created(self, want_kind):
@@ -4244,7 +4464,7 @@ class App:
                 "提示",
                 f"勾选的 {len(iids)} 个里没有可删除的{want_kind}。\n\n{detail}\n\n"
                 f"「删除我创建的{want_kind}」只处理【你本人创建】的{want_kind}；"
-                "其它会话请用「🗑 删除会话（含聊天记录）」或「🚪 退出选中频道」。")
+                "其它会话请用「🗑 删除会话（含聊天记录）」或「🚪 退出 / 删除选中」。")
             self.log_msg("⏭ 「删除自建%s」无可执行项（" % want_kind
                          + "；".join(f"{k} {v} 个" for k, v in reasons.items()) + "）")
             return
@@ -4466,7 +4686,49 @@ def selftest():
             id=9, title=tl_types.TextWithEntities(text="shared", entities=[]),
             pinned_peers=[], include_peers=[]))
         assert DESTROY_CONFIRM_WORD
+
+        # 「退出」必须能吃掉全部会话类型：私聊 / 机器人 -> 删除会话，
+        # 而不是像以前那样抛 ValueError 让整批勾选失败。
+        assert exit_action_of(KIND_CHANNEL) == EXIT_LEAVE
+        assert exit_action_of(KIND_GROUP) == EXIT_LEAVE
+        assert exit_action_of(KIND_USER) == EXIT_DELETE
+        assert exit_action_of(KIND_BOT) == EXIT_DELETE
+        assert exit_action_of(KIND_GONE) == EXIT_SKIP
+        try:
+            build_leave_request(usr)
+            raise AssertionError("原语层对 User 仍应显式报错")
+        except ValueError:
+            pass
+
+        _sent = []
+
+        class _EchoClient:
+            async def __call__(self, req):
+                _sent.append(req)
+                return "ok"
+
+        assert asyncio.run(leave_or_delete_entity(_EchoClient(), usr))[0] == LEAVE_OK
+        assert isinstance(_sent[-1], tl_messages.DeleteHistoryRequest), _sent[-1]
+        assert asyncio.run(leave_or_delete_entity(_EchoClient(), ch))[0] == LEAVE_OK
+        assert isinstance(_sent[-1], tl_channels.LeaveChannelRequest), _sent[-1]
+
+        # 版本号与更新日志必须互相对得上：改了 APP_VERSION 却忘了写更新日志，
+        # 界面就会出现「标题是 v1.1.2、日志停在 v1.1.1」这种前言不搭后语。
+        assert re.match(r"^v\d+(\.\d+)+$", APP_VERSION), APP_VERSION
+        assert CHANGELOG, "更新日志为空"
+        assert len(CHANGELOG) >= 2, "更新日志至少保留一个历史版本"
+        assert CHANGELOG[0][0] == APP_VERSION, (
+            "APP_VERSION=%s 与更新日志首条=%s 不一致（发版时忘了加条目？）"
+            % (APP_VERSION, CHANGELOG[0][0]))
+        assert APP_VERSION in changelog_text()
+        for _ver, _date, _items in CHANGELOG:
+            assert re.match(r"^v\d+(\.\d+)+$", _ver) and _items, (_ver, _items)
+            assert re.match(r"^\d{4}-\d{2}-\d{2}$", _date), _date
+        _vers = [tuple(int(x) for x in re.findall(r"\d+", v)) for v, _d, _i in CHANGELOG]
+        assert _vers == sorted(_vers, reverse=True), _vers
+
         _selftest_say(lines, "请求构造 / 类型判定 / 分组规则（按类别各查各的开关）/ 活跃换算 OK")
+        _selftest_say(lines, "版本 %s，更新日志 %d 条版本记录" % (APP_VERSION, len(CHANGELOG)))
 
         # 界面骨架：真的建一次主窗口再销毁 —— 有些精简包能 import tkinter 但建窗就崩，
         # 只 import 是测不出来的。用临时目录接管四个数据文件，确保**不碰**用户的
@@ -4486,12 +4748,20 @@ def selftest():
             assert cols == ("sel", "name", "username", "type", "members",
                             "posts", "active", "folder", "id", "safe"), cols
             assert app.btn_leave is not None and app.btn_destroy is not None
+            # 按钮文案必须写明它同时会删除会话（私聊 / 机器人退不了，只能删）
+            assert "退出" in str(app.btn_leave.cget("text"))
+            assert "删除" in str(app.btn_leave.cget("text")), app.btn_leave.cget("text")
             assert app.cmb_folder is not None
             # 列表上方的类型统计条（控件在、在表格上方、能算出文案）
             assert app.lbl_kind_stats is not None and app.stats_var is not None
             assert int(app.lbl_kind_stats.grid_info()["row"]) < int(app.tree.grid_info()["row"])
             app._update_stats()
             assert app.stats_var.get() != "", "统计条文案为空"
+            # 版本号必须真的出现在界面上（标题栏 + 状态栏），不是只有代码里有常量
+            assert APP_VERSION in str(r.title()), r.title()
+            assert app.lbl_version is not None, "状态栏缺版本号标签"
+            assert str(app.lbl_version.cget("text")) == APP_VERSION, app.lbl_version.cget("text")
+            assert app.btn_changelog is not None and callable(app.on_show_changelog)
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
@@ -4512,6 +4782,12 @@ def main():
 
     if "--selftest" in sys.argv:
         return sys.exit(selftest())
+    if "--version" in sys.argv or "-V" in sys.argv:
+        console_write(f"{APP_NAME} {APP_VERSION}\n")
+        return
+    if "--changelog" in sys.argv:
+        console_write(changelog_text())
+        return
     print("[启动] 正在初始化界面 ...", file=sys.stderr, flush=True)
     try:
         root = tk.Tk()
