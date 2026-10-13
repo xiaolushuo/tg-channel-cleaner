@@ -221,6 +221,9 @@ KIND_GONE = "已不在"       # ChatForbidden / ChannelForbidden：已被移出�
 KIND_OTHER = "其它"
 # 下拉框取值顺序
 TYPE_CHOICES = ("全部", KIND_CHANNEL, KIND_GROUP, KIND_USER, KIND_BOT, KIND_GONE)
+# 类型 -> 图标。顺序与 TYPE_CHOICES 一致，方便和「类型」下拉对照。
+KIND_ICON = ((KIND_CHANNEL, "📢"), (KIND_GROUP, "👥"), (KIND_USER, "💬"),
+             (KIND_BOT, "🤖"), (KIND_GONE, "🚫"), (KIND_OTHER, "❔"))
 # 私聊 / 机器人 / 已不在：没有「成员数」概念，也没有创建者/管理员，更不能「退出」
 NOT_APPLICABLE = "-"
 
@@ -320,6 +323,18 @@ def is_real_folder(f):
     return getattr(f, "id", None) is not None and type(f).__name__ != "DialogFilterDefault"
 
 
+def is_editable_folder(f):
+    """这个分组能不能用 updateDialogFilter 改成员名单。
+
+    DialogFilterChatlist（Telegram 的「共享分组 / 文件夹」）没有类型开关、也没有
+    exclude_peers，成员是服务端维护的，**只能用 chatlists.* 那套接口管**。
+    拿它的 id 去 updateDialogFilter，等于用一个新的 DialogFilter 去覆盖它，
+    会把这个共享分组改坏 —— 所以「加入 / 移出分组」要把它排除掉。
+    读取（分组列、分组筛选）不受影响。
+    """
+    return is_real_folder(f) and not isinstance(f, tl_types.DialogFilterChatlist)
+
+
 def manual_peer_keys(f):
     """分组里「手工加入」的会话键集合（pinned 也算 —— pinned 只是置顶显示）。"""
     keys = set()
@@ -334,13 +349,60 @@ def folder_rules_on(f):
     return [n for n in FOLDER_RULE_FLAGS if getattr(f, n, None)]
 
 
+FOLDER_FLAG_LABEL = {
+    "contacts": "联系人", "non_contacts": "非联系人",
+    "groups": "群组", "broadcasts": "频道", "bots": "机器人",
+    "exclude_muted": "排除已静音", "exclude_read": "仅保留未读",
+    "exclude_archived": "排除已归档",
+}
+
+
+def folder_rules_text(f):
+    """把分组的开关翻译成人话。日志里逐个打印，直接回答
+    「这个分组到底是什么规则、为什么它收了这么多会话」。"""
+    on = [FOLDER_FLAG_LABEL[n] for n in FOLDER_RULE_FLAGS if getattr(f, n, None)]
+    return " + ".join(on) if on else "无自动规则（纯手工）"
+
+
+def folder_flag_of(state):
+    """该会话在分组规则里对应的**那一个**开关名。
+
+    ⚠️ 这里必须「按会话类别各查各的开关」。Telegram 官方客户端
+    （Desktop 的 ChatFilter::contains / Android 的 DialogFilter）就是这么判的：
+
+        用户(非 bot)：联系人 -> contacts，非联系人 -> non_contacts
+        bot：      -> bots
+        普通群 / 超级群 -> groups
+        广播频道   -> broadcasts
+
+    不能写成「命中任意一个类型开关就算属于」。曾经的写法是
+        `non_contacts and not state["contact"]`
+    而 Channel / Chat 实体**根本没有 contact 属性** -> 恒为 False ->
+    **所有群组、所有频道都会被算成「非联系人」而误入该分组**，
+    表现出来就是「这个分组显示出了所有」，但 Telegram 客户端里并没有。
+    """
+    kind = state.get("kind")
+    if kind == KIND_CHANNEL:
+        return "broadcasts"
+    if kind == KIND_GROUP:
+        return "groups"
+    if kind == KIND_BOT:
+        return "bots"
+    if kind == KIND_USER:
+        return "contacts" if state.get("contact") else "non_contacts"
+    if kind == KIND_GONE:
+        # 已不在：ChannelForbidden 带 broadcast 标记，其余按群组算
+        return "broadcasts" if state.get("is_broadcast") else "groups"
+    return None
+
+
 def filter_matches(f, key, state):
-    """本地复现「这个会话属不属于该分组」。规则语义：
+    """本地复现「这个会话属不属于该分组」。规则语义（对齐 Telegram 官方客户端）：
     - exclude_peers 命中 -> 不属于（最高优先级）
     - 手工加入（include/pinned）-> 属于，不再看规则
-    - 没有规则 -> 纯手工分组，不自动匹配任何会话
-    - 有规则 -> 必须命中至少一个**类型**规则（只设 exclude_* 而无类型规则时不自动匹配）
-      再依次套用 exclude_muted / exclude_read / exclude_archived
+    - 有规则 -> 该会话类别对应的那个开关必须打开（没打开一律不属于；
+      一个类型开关都没勾的分组因此等于「纯手工」，不会自动收人）
+    - 最后依次套用 exclude_muted / exclude_read / exclude_archived
     """
     try:
         for p in (getattr(f, "exclude_peers", None) or []):
@@ -348,23 +410,8 @@ def filter_matches(f, key, state):
                 return False
         if key in manual_peer_keys(f):
             return True
-        if not folder_rules_on(f):
-            return False
-        matched_type = False
-        for name in FOLDER_TYPE_FLAGS:
-            if not getattr(f, name, None):
-                continue
-            if name == "contacts" and state.get("contact"):
-                matched_type = True
-            elif name == "non_contacts" and not state.get("contact"):
-                matched_type = True
-            elif name == "groups" and state.get("kind") == KIND_GROUP:
-                matched_type = True
-            elif name == "broadcasts" and state.get("kind") == KIND_CHANNEL:
-                matched_type = True
-            elif name == "bots" and state.get("kind") == KIND_BOT:
-                matched_type = True
-        if not matched_type:
+        flag = folder_flag_of(state)
+        if flag is None or not getattr(f, flag, None):
             return False
         if getattr(f, "exclude_muted", None) and state.get("muted"):
             return False
@@ -380,6 +427,7 @@ def filter_matches(f, key, state):
 def dialog_state(d, kind, ent):
     """取本地复现分组规则所需的状态（Telethon 的 Dialog 没有 muted 属性，要钻到 notify_settings）。"""
     st = {"kind": kind, "contact": bool(getattr(ent, "contact", False)),
+          "is_broadcast": bool(getattr(ent, "broadcast", False)),
           "muted": False, "unread": 0, "archived": False}
     try:
         st["unread"] = int(getattr(d, "unread_count", 0) or 0)
@@ -1061,8 +1109,15 @@ class App:
         # 2) 列表（表格占满剩余空间，横向纵向都能滚）
         frm_list = ttk.LabelFrame(parent, text="全部会话（频道 / 群组 / 私聊 / 机器人）—— 点「选择」列或按空格勾选", padding=7)
         frm_list.grid(row=2, column=0, sticky="nsew")
-        frm_list.grid_rowconfigure(0, weight=1)
+        frm_list.grid_rowconfigure(1, weight=1)   # 第 0 行让给列表上方的类型统计条
         frm_list.grid_columnconfigure(0, weight=1)
+
+        # 类型统计条：频道 / 群组 / 私聊 / 机器人 / 已不在 各多少个。
+        # 不设前景色，跟随 ttk 主题，深色模式下同样可读。
+        # ⚠️ 名字不能叫 lbl_stats —— 状态栏里已有一个同名标签（统计进度用），会被覆盖。
+        self.stats_var = tk.StringVar(value="")
+        self.lbl_kind_stats = ttk.Label(frm_list, textvariable=self.stats_var, anchor="w")
+        self.lbl_kind_stats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
         # 「id」「safe」保持在末尾：按位置构造行值的既有代码/测试不受影响，
         # 新增列一律插在 posts 之后、id 之前。
@@ -1094,9 +1149,9 @@ class App:
         vsb = ttk.Scrollbar(frm_list, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(frm_list, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns")
+        hsb.grid(row=2, column=0, sticky="ew")
 
         # 3) 选择条
         # 范围说明：筛选生效时「全选 / 反选」只作用于**当前显示出来的筛选结果**，
@@ -2427,7 +2482,7 @@ class App:
             self.root.after(0, self.apply_folders_to_ui)
             return
         self._filters = list(getattr(res, "filters", res) or [])
-        names, ruled = [], 0
+        names, editable, ruled, detail = [], [], 0, []
         for f in self._filters:
             if not is_real_folder(f):
                 continue
@@ -2436,12 +2491,21 @@ class App:
                 continue
             if t not in names:
                 names.append(t)
+            can_edit = is_editable_folder(f)
+            if can_edit and t not in editable:
+                editable.append(t)
             if folder_rules_on(f):
                 ruled += 1
+            # 逐个打印规则：分组「显示出了所有」几乎都是规则本身如此，把开关摊开写出来。
+            manual = len(manual_peer_keys(f))
+            detail.append(f"   · {t} —— 规则：{folder_rules_text(f)}"
+                          + (f"，另手工加入 {manual} 个" if manual else "")
+                          + ("" if can_edit else "　[共享分组，只能看、不能改成员]"))
         self._folder_names = names
+        self._editable_folder_names = editable
         self.log_msg(f"✅ 已读取 {len(names)} 个分组"
-                     + (f"（{len(names) - ruled} 个纯手工、{ruled} 个带自动规则）" if names else "")
-                     + ("：" + "、".join(names) if names else "。"))
+                     + (f"（{len(names) - ruled} 个纯手工、{ruled} 个带自动规则）" if names else "。")
+                     + ("：\n" + "\n".join(detail) if detail else ""))
         self.root.after(0, self.apply_folders_to_ui)
 
     def apply_folders_to_ui(self):
@@ -2528,6 +2592,10 @@ class App:
         except Exception:
             pass
         names = list(getattr(self, "_folder_names", []) or [])
+        editable = getattr(self, "_editable_folder_names", None)
+        if editable is None:
+            editable = names
+        names = list(editable)
         if names:
             sub_add = tk.Menu(m, tearoff=0)
             sub_del = tk.Menu(m, tearoff=0)
@@ -2587,6 +2655,12 @@ class App:
             if target is None:
                 self.log_msg(f"❌ 分组「{folder_name}」已不存在（可能刚在 Telegram 里改过），请重新读取分组。")
                 self.root.after(0, lambda: self.finish_task("分组不存在"))
+                return
+            if not is_editable_folder(target):
+                self.log_msg(f"❌ 「{folder_name}」是 Telegram 的**共享分组（chatlist）**，"
+                             "它的成员由服务端维护，本工具只能用 chatlists 那套接口管，"
+                             "用 updateDialogFilter 去改会把它弄坏 —— 已拦下，未发送任何请求。")
+                self.root.after(0, lambda: self.finish_task("共享分组不支持改成员"))
                 return
             peers, bad = [], 0
             for iid in iids:
@@ -3418,6 +3492,45 @@ class App:
         """所有行中被勾选的数量（含被筛选隐藏的）。"""
         return self.selected_items() + [i for i in self.channels if i in self._sel_hidden]
 
+    def _count_kinds(self, iids):
+        """按类型数一遍。iids 可以是全部会话，也可以是当前显示出来的行。"""
+        counts = {}
+        for iid in iids:
+            ent = self.channels.get(iid) if hasattr(self.channels, "get") else None
+            k = session_kind(ent) if ent is not None else KIND_OTHER
+            counts[k] = counts.get(k, 0) + 1
+        return counts
+
+    def _kinds_text(self, counts):
+        parts = []
+        for kind, icon in KIND_ICON:
+            n = counts.get(kind, 0)
+            if kind == KIND_OTHER and not n:
+                continue          # 「其它」为 0 时不占位，免得干扰
+            parts.append(f"{icon} {kind} {n} 个")
+        return "　".join(parts)
+
+    def _stats_text(self):
+        total = len(self.channels)
+        visible = list(self.tree.get_children())
+        if self._filter_active or len(visible) != total:
+            head = f"显示 {len(visible)} / 共 {total} 个"
+            body = self._kinds_text(self._count_kinds(visible))
+        else:
+            head = f"共 {total} 个"
+            body = self._kinds_text(self._count_kinds(list(self.channels.keys())))
+        return f"{head}　│　{body}" if body else head
+
+    def _update_stats(self):
+        """刷新列表上方的类型统计条。任何异常都不能打断列表加载/统计回填。"""
+        try:
+            var = getattr(self, "stats_var", None)
+            if var is None:
+                return
+            var.set(self._stats_text())
+        except Exception:
+            pass
+
     def update_count(self):
         total = len(self.channels)
         shown = len(self.tree.get_children())
@@ -3478,6 +3591,12 @@ class App:
             self.refresh_whitelist_info()   # 测试桩可能没有该方法，不能让它打断列表加载
         except Exception:
             pass
+        # 列表上方的类型统计条跟着一起刷新。
+        # getattr 兜底：测试桩可能只绑了 update_count 而没绑 _update_stats，
+        # 不能因为它缺失就把整条列表加载链打断（同上面 refresh_whitelist_info 的处理）。
+        stats_fn = getattr(self, "_update_stats", None)
+        if stats_fn is not None:
+            stats_fn()
 
     def _on_select_all_key(self, event=None):
         """Ctrl+A：全选当前显示的行。"""
@@ -4325,11 +4444,29 @@ def selftest():
                                     exclude_peers=[], broadcasts=True)
         assert is_real_folder(flt) and not is_real_folder(tl_types.DialogFilterDefault())
         assert folder_title(flt) == "x"
-        assert filter_matches(flt, ("channel", 1), {
-            "kind": KIND_CHANNEL, "contact": False, "muted": False,
-            "unread": 0, "archived": False}) is True
+        _st_ch = {"kind": KIND_CHANNEL, "contact": False, "is_broadcast": True,
+                  "muted": False, "unread": 0, "archived": False}
+        _st_u = {"kind": KIND_USER, "contact": False, "is_broadcast": False,
+                 "muted": False, "unread": 0, "archived": False}
+        assert filter_matches(flt, ("channel", 1), _st_ch) is True
+
+        # ⚠️ 分组规则必须「按会话类别各查各的开关」。曾经的写法用
+        # `non_contacts and not contact` 判定，而 Channel/Chat 没有 contact 属性，
+        # 于是所有群组、所有频道都被收进「非联系人」分组 —— 就是「某些分组显示所有」的根因。
+        nc = tl_types.DialogFilter(id=2, title="nc", pinned_peers=[], include_peers=[],
+                                   exclude_peers=[], non_contacts=True)
+        assert filter_matches(nc, ("user", 3), _st_u) is True
+        assert filter_matches(nc, ("channel", 1), _st_ch) is False
+        assert folder_flag_of({"kind": KIND_CHANNEL}) == "broadcasts"
+        assert folder_flag_of({"kind": KIND_GROUP}) == "groups"
+        assert folder_flag_of({"kind": KIND_USER, "contact": True}) == "contacts"
+        # 共享分组（chatlist）只能看、不能用 updateDialogFilter 改成员
+        assert is_editable_folder(flt)
+        assert not is_editable_folder(tl_types.DialogFilterChatlist(
+            id=9, title=tl_types.TextWithEntities(text="shared", entities=[]),
+            pinned_peers=[], include_peers=[]))
         assert DESTROY_CONFIRM_WORD
-        _selftest_say(lines, "请求构造 / 类型判定 / 分组规则 / 活跃换算 OK")
+        _selftest_say(lines, "请求构造 / 类型判定 / 分组规则（按类别各查各的开关）/ 活跃换算 OK")
 
         # 界面骨架：真的建一次主窗口再销毁 —— 有些精简包能 import tkinter 但建窗就崩，
         # 只 import 是测不出来的。用临时目录接管四个数据文件，确保**不碰**用户的
@@ -4350,6 +4487,11 @@ def selftest():
                             "posts", "active", "folder", "id", "safe"), cols
             assert app.btn_leave is not None and app.btn_destroy is not None
             assert app.cmb_folder is not None
+            # 列表上方的类型统计条（控件在、在表格上方、能算出文案）
+            assert app.lbl_kind_stats is not None and app.stats_var is not None
+            assert int(app.lbl_kind_stats.grid_info()["row"]) < int(app.tree.grid_info()["row"])
+            app._update_stats()
+            assert app.stats_var.get() != "", "统计条文案为空"
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
