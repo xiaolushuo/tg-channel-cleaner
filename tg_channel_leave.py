@@ -99,8 +99,11 @@ from telethon import errors as telethon_errors
 from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
 from telethon.tl.functions import channels as tl_channels
+from telethon.tl.functions import contacts as tl_contacts
 from telethon.tl.functions import messages as tl_messages
 from telethon.tl.types import Channel
+from telethon.utils import get_peer_id
+from telethon.utils import get_input_peer
 
 # 代理类型：用字符串形式，Telethon 的 _parse_proxy 在“python_socks 优先”和“PySocks 兜底”
 # 两种分支里都识别 socks5 / socks4 / http，因此不必直接依赖 socks 模块。
@@ -280,11 +283,32 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.3.1"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.3.1", "2026-10-13", [
+        "修复：**「删除会话」不再说成功却什么都没发生**。以前只要请求没抛异常就写「已删除」，"
+        "而 Telegram 会安静地收下请求却不执行 —— 这就是「提示成功、客户端里会话还在」。"
+        "现在删完会**回头问服务端**「这个会话还在吗」：确认没了才写「已删除」，"
+        "还在就如实报「未能删除」并把该行**留在列表里**，绝不把「请求发出去了」当成「删掉了」",
+        "修复：复核发现仍在时会**换 3 种写法重试**（显式 InputPeer 重发 / 带上服务端返回的"
+        " top_message 当 max_id 重发 / 改走 Telethon 高层 delete_dialog），每换一步都重新问一次"
+        "服务端；哪一步生效会写进日志，方便定位服务端究竟认哪种写法",
+        "修复：**「删除会话」以前对频道 / 群组完全无效**。Telegram 里这类会话只有退出才会从"
+        "列表消失，此前对它们发的删除请求服务端收下、不报错、会话却纹丝不动。现在按类型分派："
+        "私聊 / 机器人删会话，频道 / 群组**退出**（确认窗逐类写明后果）",
+        "修复：创建者点「删除会话」不再只甩一句看不懂的服务端报错，而是直接说明"
+        "「创建者退不出去，要删请用『🗑 删除我创建的群组 / 频道』」",
+        "新增：确认无法删除的会话会**直说原因**，不再让您反复点 —— 自己的「收藏夹 / "
+        "Saved Messages」、对方已注销的账号（Deleted Account）、Telegram 官方支持账号，"
+        "这三类是服务端的硬限制，重试也没有用",
+        "新增：日志落盘到程序目录的 `tg_leave_log.txt`（界面关掉后依然能查）；复核没通过时"
+        "附上只读诊断 —— 消息是否已被清空，用来区分「请求完全没生效」和「记录删了、"
+        "会话被 Telegram 保留」。遇到问题把这个文件发我即可",
+        "「退出」路径同样接入复核：私聊在「退出」里也是删会话，两条路要么都说真话，要么都在骗人",
+    ]),
     ("v1.3.0", "2026-10-13", [
         "**批量划分分组**：新增「📁 分组 ▾ → 批量划分到分组…」对话框，"
         "一次把一批频道 / 群组加进或移出某个分组；快捷键 **Ctrl+G**",
@@ -559,6 +583,17 @@ def input_peer_key(p):
     return None
 
 
+def safe_peer_id(ent):
+    """get_peer_id 的「绝不抛异常」版。
+
+    复核阶段拿不到 id 只意味着**这一个**会话无法判定，不该把整批复核带崩
+    （实体是 min、或 access_hash 缺失时 get_peer_id 会抛）。"""
+    try:
+        return get_peer_id(ent)
+    except Exception:
+        return None
+
+
 def folder_title(f):
     t = getattr(f, "title", None)
     if isinstance(t, tl_types.TextWithEntities):
@@ -742,11 +777,19 @@ def is_member_kind(kind):
 #   退出       channels.LeaveChannelRequest / messages.DeleteChatUserRequest(revoke_history=True)
 #              -> 不再是成员。对频道/群组有效；创建者/管理员**退不出去**。
 #
-#   删除会话   messages.DeleteHistoryRequest(revoke=False)
-#              -> 只从**我这边**的会话列表移除并清空聊天记录，其他成员完全不知情。
-#                 对**所有类型**（私聊 / 机器人 / 频道 / 群组）都适用。
-#              ⚠️ 对频道/群组它只是本地隐藏：你仍是成员，对方再发消息会话就会重新出现。
-#                 想彻底不再看到，必须用「退出」。
+#   删除会话   私聊 / 机器人 → messages.DeleteHistoryRequest(just_clear=False, revoke=False)
+#                          -> 从**我这边**删掉会话与聊天记录，对方完全不知情。
+#             频道 / 群组   → **只能靠退出**（同上面的「退出」）。
+#
+#              ⚠️ 这里曾经写错、也把功能带错了：以为 deleteHistory 对所有类型都有效，
+#                 于是对频道/群组也发它。真相是——Telegram 里**群组/频道的会话
+#                 只有退出才会消失**，deleteHistory 对它们发出去服务端照收不报错、
+#                 会话却纹丝不动（v1.3.1 之前「显示删除成功、客户端会话还在」就是这个）。
+#                 佐证：Telethon 自己的 client.delete_dialog() 对频道发
+#                 channels.LeaveChannelRequest、对普通群发 messages.DeleteChatUserRequest，
+#                 **只有私聊才用 DeleteHistoryRequest**。
+#                 语义上 just_clear=False 才是「连会话一起删」，just_clear=True 只清记录、
+#                 会话保留（= 「清空聊天记录」那个功能）。
 #
 #   销毁       channels.DeleteChannelRequest（频道 / 超级群，对所有成员生效、不可恢复）
 #              messages.DeleteChatRequest（普通群，同上）
@@ -763,13 +806,43 @@ DESTROY_CONFIRM_WORD = "删除"
 
 
 def build_delete_history_request(ent):
-    """构造「删除会话（含聊天记录）」请求。
+    """构造「删除私聊会话（含聊天记录）」请求 —— **只对私聊 / 机器人有意义**。
 
     revoke=False 是不可省的：它明确表示「不动对方那份记录」，
-    这正是「删除会话」的默认语义，也是这三条破坏性操作里最温和的一条。
-    max_id=0 表示删除该会话的全部消息（不只是当前已加载的那批）。"""
+    这正是「删除会话」的默认语义，也是这几条破坏性操作里最温和的一条。
+    max_id=0 表示删除该会话的全部消息（不只是当前已加载的那批）。
+    just_clear 必须为 False：True 是「只清空聊天记录、会话留在列表里」，
+    那是另一个功能，不是「删除会话」。"""
     return tl_messages.DeleteHistoryRequest(
         peer=ent, max_id=0, just_clear=False, revoke=False)
+
+
+def build_remove_dialog_requests(ent, revoke=False):
+    """构造「让这个会话从我这边彻底消失」所需的请求列表（一条或两条）。
+
+    这是「删除会话」按类型分派的**单一真源**。分派依据不是偏好，是 Telegram 的硬约束：
+
+      私聊 / 机器人 (User)   → messages.DeleteHistoryRequest(just_clear=False)
+                              —— 唯一能删掉会话的方法；just_clear=True 只清记录。
+      普通群        (Chat)   → messages.DeleteChatUserRequest(self, revoke_history=False)
+                              —— 普通群没有「删会话」这回事，把自己踢出去才会消失。
+     频道 / 超级群 (Channel) → channels.LeaveChannelRequest
+                              —— 同上，只有退出才会消失。
+
+    以前这里对所有类型一律发 deleteHistory：服务端不报错、会话却不动，
+    日志却已经写下「已删除」—— 那就是「显示成功、客户端还在」的真因。
+    未知类型显式报错，不替调用方猜意图。"""
+    if isinstance(ent, tl_types.User):
+        return [build_delete_history_request(ent)]
+    if isinstance(ent, tl_types.Chat):
+        # revoke_history=False：只删我这边那份记录，不动其他成员的聊天记录。
+        return [tl_messages.DeleteChatUserRequest(
+            ent.id, tl_types.InputUserSelf(), revoke_history=bool(revoke))]
+    if isinstance(ent, tl_types.Channel):
+        return [tl_channels.LeaveChannelRequest(ent)]
+    raise ValueError(
+        "不支持的会话类型，无法删除：%s（私聊 / 机器人 / 群组 / 频道才可删）"
+        % type(ent).__name__)
 
 
 def build_destroy_request(ent):
@@ -790,19 +863,139 @@ def can_destroy_kind(kind):
 
 
 async def delete_history_entity(client, ent):
-    """删除会话（含聊天记录），返回 (状态, 说明)。"""
+    """删除会话（= 让这个会话从我这边彻底消失），返回 (状态, 说明)。
+
+    按类型分派见 build_remove_dialog_requests —— 频道 / 群组走的是「退出」，
+    这是 Telegram 的硬约束，不是可选项。
+
+    ⚠️ 本函数**只负责把请求发出去**。是否真的生效必须由调用方用
+    dialogs_still_present() 回头复核 —— 不能拿「没抛异常」当成功：
+    Telegram 会安静地收下请求却什么都不做，v1.3.0 之前就是拿它当成功，
+    才出现「显示删除成功、客户端会话还在」。"""
     try:
-        await client(build_delete_history_request(ent))
+        for req in build_remove_dialog_requests(ent):
+            await client(req)
         return DEL_OK, ""
     except (telethon_errors.ChannelPrivateError,
             telethon_errors.UserNotParticipantError):
         return DEL_GONE, "会话已不存在或已不可访问"
     except telethon_errors.PeerIdInvalidError:
-        # 实体缓存过期：退化到高层接口，它会先解析实体再删
+        # 实体缓存过期：退化到高层接口，它会先解析实体再处理
         await client.delete_dialog(ent)
-        return DEL_OK, ""
+        return DEL_OK, "（实体缓存过期，已走兼容路径）"
     except telethon_errors.ChatAdminRequiredError:
         return DEL_BLOCKED, "没有权限删除该会话的聊天记录"
+    except telethon_errors.RPCError as e:
+        # 创建者退不出去是 Telegram 的设计，不是故障：直接说清该怎么走，
+        # 别让用户对着一句裸 RPC 报错猜。
+        if is_member_kind(session_kind(ent)) and getattr(ent, "creator", False):
+            return DEL_BLOCKED, (
+                "你是它的创建者 —— Telegram 不允许创建者直接退出自己的频道 / 群组"
+                "（会让它失去所有者）。要彻底去掉请用「🗑 删除我创建的群组 / 频道」，"
+                "或先在 Telegram 客户端里把所有权转给别人"
+                f"（服务端原话：{e}）")
+        raise
+
+
+async def dialogs_still_present(client, ents):
+    """只读复核：这些会话在「我这边」**是否仍然存在**。
+
+    用 messages.getPeerDialogs 精确问这几个 peer（比重拉整个会话列表便宜得多，
+    也不改变任何状态）。删除之后必须靠它判定成败。
+
+    返回 (仍在的 {peer_id: Dialog}, 无法复核的原因)：
+      - 能复核   -> ({...}, "")
+      - 复核失败 -> (None, 原因)，调用方**不得**当作成功，也不得当作失败。
+
+    ⚠️ 响应里没有 dialogs 字段时必须报「无法复核」，**绝不能**当成「都不在了」——
+    那等于换个姿势继续「没核对就报成功」，正是这个功能要根治的病。"""
+    peers = [e for e in (ents or []) if e is not None]
+    if not peers:
+        return {}, ""
+    try:
+        res = await client(tl_messages.GetPeerDialogsRequest(peers=peers))
+    except Exception as e:
+        return None, str(e)
+    dialogs = getattr(res, "dialogs", None)
+    if dialogs is None:
+        return None, "服务端响应里没有 dialogs 字段，无法判定"
+    still = {}
+    for d in dialogs:
+        try:
+            still[get_peer_id(getattr(d, "peer", None))] = d
+        except Exception:
+            continue
+    return still, ""
+
+
+# 「删了、但服务端说还在」时的备选写法。按顺序试，每一步都和上一步**真的不同**，
+# 每试一步都重新复核一次 —— 不靠猜，只看服务端最后怎么说。
+DIALOG_REMOVE_RETRY_STEPS = (
+    ("explicit_peer", "改用显式 InputPeer 重发（排除实体解析这一层的问题）"),
+    ("max_id", "带上服务端返回的 top_message 当 max_id 重发（排除 max_id=0 被当成「无事可做」）"),
+    ("delete_dialog", "改走 Telethon 的高层 delete_dialog"),
+)
+
+
+async def retry_remove_dialog(client, ent, step, dialog=None):
+    """备选写法。返回一句说明（跳过时）或 None。"""
+    if step == "explicit_peer":
+        try:
+            peer = get_input_peer(ent)
+        except Exception as e:
+            return "跳过（实体信息不全，无法构造 InputPeer：%s）" % e
+        await client(tl_messages.DeleteHistoryRequest(
+            peer=peer, max_id=0, just_clear=False, revoke=False))
+        return None
+    if step == "max_id":
+        top = int(getattr(dialog, "top_message", 0) or 0)
+        if top <= 0:
+            return "跳过（服务端没给出 top_message）"
+        await client(tl_messages.DeleteHistoryRequest(
+            peer=ent, max_id=top, just_clear=False, revoke=False))
+        return None
+    if step == "delete_dialog":
+        await client.delete_dialog(ent)
+        return None
+    raise ValueError("未知的重试写法：%s" % step)
+
+
+def dialog_remove_hint(ent):
+    """「服务端确认这个私聊仍然存在」时的解释。
+
+    下面几种是 Telegram 层面的**硬限制**，不是本工具请求写错了 —— 反复重试也没有用，
+    必须直说，不然用户只会一直点、一直被骗「已删除」。"""
+    try:
+        if getattr(ent, "is_self", False):
+            return ("这是你自己的「收藏夹 / Saved Messages」：Telegram **不允许删除**"
+                    "这个会话（服务端会接受请求但不执行），只能「清空聊天记录」。")
+        if getattr(ent, "deleted", False):
+            return ("对方的账号**已注销**（客户端里显示为灰头像的 Deleted Account）。"
+                    "Telegram 会长期保留这类会话，服务端不接受移除，重试也没有用。")
+        if getattr(ent, "support", False):
+            return "这是 Telegram 官方支持账号（Telegram），它的会话不能被删除。"
+        if getattr(ent, "min", False):
+            return ("这个用户实体是精简版（min），access_hash 不全，服务端定位不到会话；"
+                    "先点「🔄 刷新列表」重取完整实体再试。")
+    except Exception:
+        pass
+    return ""
+
+
+async def dialog_history_cleared(client, ent):
+    """只读诊断：这个会话的消息到底少了没有。
+
+    用来区分两种「看起来一样」的失败：
+      * 历史仍在 -> 请求**根本没生效**；
+      * 历史已空 -> 记录确实删掉了，只是**会话本身**被 Telegram 保留（收藏夹 / 已注销账号）。
+    返回 (剩余消息总数 或 None, 说明)。"""
+    try:
+        res = await client(tl_messages.GetHistoryRequest(
+            peer=ent, offset_id=0, offset_date=None, add_offset=0,
+            limit=1, max_id=0, min_id=0, hash=0))
+        return int(getattr(res, "total", 0) or 0), ""
+    except Exception as e:
+        return None, str(e)
 
 
 async def destroy_entity(client, ent):
@@ -920,6 +1113,33 @@ def migrate_legacy_data():
 class OperationCancelled(Exception):
     """用户取消登录输入时抛出。"""
     pass
+
+
+# ---------------- 日志落盘 ----------------
+# 界面日志一关就没了：用户报「显示成功但实际没生效」时，我这边只能靠猜。
+# 所以每条日志同时追加到程序目录，出问题直接读文件就能定位真因。
+LOG_FILE_NAME = "tg_leave_log.txt"
+LOG_FILE_MAX = 3 * 1024 * 1024      # 超过 3MB 轮转一代，不无限长大
+
+
+def log_file_path():
+    """日志文件路径（跟着 BASE_DIR 走，测试重定向 BASE_DIR 时自动隔离）。"""
+    return os.path.join(BASE_DIR, LOG_FILE_NAME)
+
+
+def append_log_file(line):
+    """把一行日志追加到 log 文件。**绝不抛异常** —— 记日志失败不能影响主流程。"""
+    try:
+        path = log_file_path()
+        try:
+            if os.path.getsize(path) > LOG_FILE_MAX:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+    except Exception:
+        pass
 
 
 class App:
@@ -2491,6 +2711,7 @@ class App:
                 print(msg, file=sys.stderr, flush=True)
             except Exception:
                 pass
+        append_log_file(msg)      # 同时落盘，界面关掉后还能查
         self.root.after(0, lambda: self._log(msg))
 
     def _log(self, msg):
@@ -5133,16 +5354,27 @@ class App:
             messagebox.showerror("导出失败", str(e))
 
     async def _run_destructive(self, sel, interval, jitter, do_one, verb,
-                               task_label=None, progress_verb=None):
+                               task_label=None, progress_verb=None, defer_drop=False):
         """退出 / 删除会话 / 销毁 三种破坏性批量操作的**公共执行器**。
 
         统一处理：限流退避重试、进度上报、成功行的行清理、按钮复位、结果汇总。
         do_one(ent, name) -> (是否成功, 日志文案)。
         抽出来的理由：这三条链路的失败处理必须完全一致 —— 任何一份漏了
-        `_drop_row`，统计任务都会继续去请求一个已经不存在的会话。"""
+        `_drop_row`，统计任务都会继续去请求一个已经不存在的会话。
+
+        返回 (成功数, 失败数, 宣告成功的 [(iid, ent, name), ...])。
+        第三个返回值是给「删后复核」用的**唯一可靠来源**：行清理是 `root.after`
+        排给 Tk 主循环的，调用方在这个协程里回头看 `self.channels` 时那些行
+        **还没被摘掉**（v1.3.1 第一版就是这么写的，复核因此从来没跑过），
+        所以「谁被宣告成功了」必须当场记下来，不能事后靠状态反推。
+
+        defer_drop=True：**先别摘行**，把「摘不摘」的决定权交给调用方 ——
+        删除 / 退出要先跟服务端复核，确认真的没了才把行移走（否则就是
+        「界面说删掉了、客户端里还在」）。"""
         pv = progress_verb or verb
         total = len(sel)
         done = 0
+        made = []
         if task_label:
             self.root.after(0, lambda t=task_label: self.start_task(t))
 
@@ -5155,10 +5387,13 @@ class App:
             name = self.tree.set(iid, "name") or str(ent.id)
             try:
                 success, line = await do_one(ent, name)
-                self.log_msg(line)
+                if line:            # 空串 = 「结论等复核完再报」，此时不许先claim
+                    self.log_msg(line)
                 if success:
                     ok += 1
-                    self.root.after(0, lambda i=iid: self._drop_row(i))
+                    made.append((iid, ent, name))
+                    if not defer_drop:
+                        self.root.after(0, lambda i=iid: self._drop_row(i))
                 else:
                     fail += 1
             except FloodWaitError as e:
@@ -5170,10 +5405,13 @@ class App:
                 try:
                     await asyncio.sleep(e.seconds)
                     success, line = await do_one(ent, name)
-                    self.log_msg(f"{line}（限流重试）")
+                    if line:
+                        self.log_msg(f"{line}（限流重试）")
                     if success:
                         ok += 1
-                        self.root.after(0, lambda i=iid: self._drop_row(i))
+                        made.append((iid, ent, name))
+                        if not defer_drop:
+                            self.root.after(0, lambda i=iid: self._drop_row(i))
                     else:
                         fail += 1
                 except Exception as e2:
@@ -5188,11 +5426,15 @@ class App:
             if done < total:
                 wait = interval + (random.uniform(0, jitter) if jitter > 0 else 0)
                 await asyncio.sleep(max(1.0, wait))
-        self.log_msg(f"🏁 完成：成功 {ok} 个，失败 {fail} 个。")
-        self.root.after(0, lambda o=ok, f=fail, v=verb: self.finish_task(
-            f"{v}完成：成功 {o} 个，失败 {f} 个"))
+        if not defer_drop:
+            # defer_drop 时**不能**在这里报总账：调用方还要跟服务端复核，
+            # 有些「成功」会被复核推翻。等复核完由调用方报一次最终结果。
+            self.log_msg(f"🏁 完成：成功 {ok} 个，失败 {fail} 个。")
+            self.root.after(0, lambda o=ok, f=fail, v=verb: self.finish_task(
+                f"{v}完成：成功 {o} 个，失败 {f} 个"))
         self.root.after(0, self._set_run_buttons_normal)
         self.root.after(0, self.update_count)
+        return ok, fail, made
 
     def _drop_row(self, iid):
         """删掉一行并同步清理所有引用它的映射 —— 漏掉任何一处，
@@ -5238,12 +5480,17 @@ class App:
             if status == LEAVE_GONE:
                 return True, f"➖ 无需退出（{note}）: {name}"
             if exit_action_of(kind) == EXIT_DELETE:
-                return True, f"🗑 已删除会话（{kind}没有「退出」，只能删除）: {name}"
+                # 私聊在「退出」里也是删会话：结论等复核完由 _finish_destructive 统一报
+                return True, ""
             return True, f"✅ 已退出: {name}"
 
-        await self._run_destructive(
+        _ok, _fail, made = await self._run_destructive(
             sel, interval, jitter, _do_leave, "退出",
-            task_label=f"正在处理选中的会话（共 {len(sel)} 个）…")
+            task_label=f"正在处理选中的会话（共 {len(sel)} 个）…", defer_drop=True)
+
+        # 退出也走同一套复核：私聊在「退出」里同样是删会话，不核对就报成功
+        # 会变成同一个谎 —— 两条路要么都说真话，要么都在骗人。
+        await self._finish_destructive(made, "退出", _ok, _fail)
 
 
     # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
@@ -5415,13 +5662,27 @@ class App:
 
     def _confirm_delete_dialogs(self, to_del, blocked, notes=""):
         """删除会话前确认：同样出清单预览，但**不给**「以后不再显示」的选项 ——
-        这是会永久清掉本地聊天记录的不可恢复操作，不值得为省一次点击留后门。"""
-        note = "说明：只清掉【你这边】的会话与聊天记录，对方及其他成员完全不受影响，且不可恢复。"
+        这是会永久清掉本地聊天记录的不可恢复操作，不值得为省一次点击留后门。
+
+        ⚠️ 必须逐类讲清楚，因为两类的后果根本不同：私聊只是删掉我这边那份记录；
+        频道 / 群组则**必须退出**才会从列表消失（Telegram 的硬约束）——
+        退出不可恢复、要重新加入才能再看，跟「删个聊天」不是一回事。"""
+        chats = sum(1 for x in to_del
+                    if str(x.get("type") or "") in (KIND_CHANNEL, KIND_GROUP))
+        users = len(to_del) - chats
+        lines = []
+        if users:
+            lines.append(f"· 私聊 / 机器人 {users} 个：只删掉【你这边】的会话与聊天记录，"
+                         "对方完全不受影响")
+        if chats:
+            lines.append(f"· 频道 / 群组 {chats} 个：**会退出它们** —— Telegram 里这类会话"
+                         "只有退出才会从列表消失；退出不可恢复，要看只能重新加入")
+        note = "说明：\n" + "\n".join(lines)
         return self._plan_dialog(
             "删除会话前确认",
-            f"确定要删除选中的 {len(to_del)} 个会话（含聊天记录）？",
+            f"确定要处理选中的 {len(to_del)} 个会话？",
             to_del, blocked, (notes + "\n" if notes else "") + note,
-            ok_text=f"确认删除 {len(to_del)} 个",
+            ok_text=f"确认处理 {len(to_del)} 个",
             blocked_tab=f"已跳过 · 受保护（{len(blocked)}）")
 
     async def _delete_dialogs(self, sel, interval, jitter):
@@ -5430,7 +5691,11 @@ class App:
             ent = self.channels.get(iid)
             k = session_kind(ent) if ent is not None else KIND_OTHER
             kinds[k] = kinds.get(k, 0) + 1
-        chan_like = sum(v for k, v in kinds.items() if is_member_kind(k))
+        member_like = sum(v for k, v in kinds.items() if is_member_kind(k))
+        if member_like:
+            self.log_msg(
+                f"ℹ️ 其中 {member_like} 个是频道 / 群组：Telegram 里这类会话"
+                "**只有退出才会从列表消失**，所以本次对它们是执行退出（和确认清单里列的一致）。")
 
         async def _do(ent, name):
             status, note = await delete_history_entity(self.client, ent)
@@ -5438,15 +5703,164 @@ class App:
                 return False, f"⛔ 无法删除（{note}）: {name}"
             if status == DEL_GONE:
                 return True, f"➖ 无需删除（{note}）: {name}"
-            return True, f"🗑 已删除会话: {name}"
+            if isinstance(ent, tl_types.User):
+                # ⚠️ 私聊先**不许**说「已删除」：请求只是发出去了，
+                # 服务端可能安静地收下却什么都不做。结论等复核完由
+                # _finish_destructive 统一报（空串 = 先别写日志）。
+                return True, ""
+            verb = "已退出并移除会话" if is_member_kind(session_kind(ent)) else "已删除会话"
+            return True, f"🗑 {verb}: {name}"
 
-        await self._run_destructive(
+        # ⚠️ 复核对象只能取执行器**当场记下**的成功名单。曾经想「跑完之后不在
+        # self.channels 里的就是成功的」——那是错的：行清理是 root.after 排给 Tk
+        # 主循环的，这个协程里回头去看时那些行还没被摘掉，claimed 恒为空，
+        # 复核代码一次都没执行过（测试就是这么把它抓出来的）。
+        _ok, _fail, made = await self._run_destructive(
             sel, interval, jitter, _do, "删除",
-            task_label=f"正在删除会话（共 {len(sel)} 个）…")
-        if chan_like:
-            self.log_msg(
-                f"ℹ️ 其中 {chan_like} 个是频道 / 群组：删除会话只清掉了本地记录，你仍是成员，"
-                "对方再发消息它就会重新出现。要彻底不再看到请改用「🚪 退出 / 删除选中」。")
+            task_label=f"正在删除会话（共 {len(sel)} 个）…", defer_drop=True)
+
+        await self._finish_destructive(made, "删除", _ok, _fail)
+
+    async def _finish_destructive(self, made, verb, ok, fail):
+        """复核 + 只摘掉「服务端确认没了」的行，最后报**一次**真实的总账。
+
+        没确认的行**留在列表里**：让用户当场看到哪几个没成，而不是先看到「已删除」、
+        回客户端一看还在（那正是这次要根治的毛病）。
+
+        总账必须等复核完再报：执行阶段说「成功 4 个」，复核可能推翻其中 1 个 ——
+        先报 4 再改口，等于又制造一次误导。
+
+        返回 (确认仍在 [(iid, name)...], 无法确认 [iid...])。"""
+        kept, unver = await self._verify_dialog_removal(made)
+        kept_ids = {iid for iid, _n in kept}
+        for iid, ent, name in made:
+            if isinstance(ent, tl_types.User):
+                # 私聊的「到底删掉没有」现在才有答案 —— 到这一步才写日志，
+                # 免得日志先写了「已删除」再改口。
+                if iid in kept_ids:
+                    self.log_msg(f"⚠️ 未能删除（服务端确认仍然存在）: {name}")
+                elif iid in unver:
+                    self.log_msg(f"❓ 未能复核（无法确认删掉没有）: {name}")
+                else:
+                    self.log_msg(f"🗑 已删除会话（服务端已复核确认）: {name}")
+            if iid in kept_ids or iid in unver:
+                continue        # 没被确认的一律留在列表，别让界面看起来「都成了」
+            self.root.after(0, lambda i=iid: self._drop_row(i))
+        real_ok = ok - len(kept) - len(unver)
+        real_fail = fail + len(kept)
+        bits = [f"成功 {real_ok} 个", f"失败 {real_fail} 个"]
+        if unver:
+            bits.append(f"未能确认 {len(unver)} 个")
+        if kept:
+            note = f"（{len(kept)} 个经服务端复核确认**没删掉**，已留在列表里）"
+        elif unver:
+            note = "（未能确认的也留在列表里，点「🔄 刷新列表」即可核对真实结果）"
+        else:
+            note = "。"
+        self.log_msg("🏁 完成：" + "，".join(bits) + note)
+        self.root.after(0, lambda o=real_ok, f=real_fail, v=verb: self.finish_task(
+            f"{v}完成：成功 {o} 个，失败 {f} 个"))
+        self.root.after(0, self.update_count)
+        return kept, unver
+
+    async def _verify_dialog_removal(self, made):
+        """删除 / 退出之后**回头问服务端**：这些私聊真的从我这边消失了吗？
+
+        返回 (服务端确认仍在的 [(iid, name)], 无法确认的 [iid])。
+        两种情况调用方都**不得**把行摘掉、也不得计入成功。
+
+        为什么非做不可：`messages.deleteHistory` 服务端会安静地收下请求却什么都不做，
+        而代码只要「没抛异常」就报成功 —— 「提示已删除、客户端里还在」就是这个来的。
+        一次不成还会换 3 种**写法确实不同**的方式重试，每一步都重新问服务端一次；
+        全部试完仍在的，如实报出来并给出原因（收藏夹 / 对方已注销这类是 Telegram
+        的硬限制，重试没有用，只能直说）。
+
+        只复核私聊 / 机器人：频道 / 群组退出后已不可访问，再用 peers 去查会整批报错，
+        反而把真正的信号淹掉（它们的成败由退出请求本身决定，服务端拒绝就会抛错）。"""
+        targets = [(iid, ent, name) for iid, ent, name in made
+                   if isinstance(ent, tl_types.User)]
+        if not targets:
+            return [], set()
+        pending = list(targets)
+        unver = set()          # 连 peer_id 都取不到 -> 无法判定，既不算成功也不算失败
+        dialogs = {}
+        for idx, (step, label) in enumerate([("request", "")] + list(DIALOG_REMOVE_RETRY_STEPS)):
+            if idx > 0:
+                names = "、".join(str(n) for _i, _e, n in pending[:10])
+                more = f"，另有 {len(pending) - 10} 个" if len(pending) > 10 else ""
+                self.log_msg(f"↻ 服务端仍返回这 {len(pending)} 个会话（{names}{more}）—— "
+                             f"改用下一步写法重试：{label}")
+                self.root.after(0, lambda: self.set_progress(
+                    0, 0, "正在换写法重试（服务端复核未通过）…"))
+                for _iid, ent, _name in pending:
+                    try:
+                        skip = await retry_remove_dialog(
+                            self.client, ent, step, dialogs.get(safe_peer_id(ent)))
+                        if skip:
+                            self.log_msg(f"   · {skip}")
+                    except Exception as e:      # noqa: BLE001
+                        self.log_msg(f"   · 重试失败（{_name}）: {e}")
+                    await asyncio.sleep(0)      # 让出事件循环，界面不卡
+                # 重试也要限速，别把服务端惹火
+                if pending:
+                    await asyncio.sleep(max(1.0, self._interval()))
+
+            still, why = await dialogs_still_present(
+                self.client, [ent for _i, ent, _n in pending])
+            if still is None:
+                self.log_msg(f"❓ 复核没做成（{why}）：这 {len(pending)} 个私聊到底删掉没有"
+                             "**无法确认** —— 我不把它当成功，也不当失败，"
+                             "这些行会留在列表里，点「🔄 刷新列表」即可核对真实结果。")
+                return [], unver | {iid for iid, _e, _n in pending}
+            dialogs = still
+            nxt = []
+            for iid, ent, name in pending:
+                pid = safe_peer_id(ent)
+                if pid is None:
+                    unver.add(iid)
+                elif pid in still:
+                    nxt.append((iid, ent, name))
+            pending = nxt
+            if not pending:
+                if idx == 0:
+                    self.log_msg(f"✅ 服务端复核通过：这 {len(targets)} 个私聊 / 机器人会话"
+                                 "已从你的账号里移除（是服务端确认过的，不只是「请求发出去了」）。")
+                    self.log_msg("   如果客户端里**还看得到**：先点「🔄 刷新列表」，"
+                                 "仍不消失就重启或重新登录一次客户端 —— "
+                                 "Telegram 桌面端对这种会话的本地列表刷新很慢，"
+                                 "但服务端这边已经确认删掉了。")
+                else:
+                    self.log_msg(f"✅ 换写法后服务端确认已移除（本步生效：{label}）—— "
+                                 f"共 {len(targets)} 个，用了 {idx} 次重试。")
+                return [], unver
+
+        # 所有写法都试过，服务端仍然说「在」
+        names = "、".join(str(n) for _i, _e, n in pending[:20])
+        more = f"，另有 {len(pending) - 20} 个" if len(pending) > 20 else ""
+        self.log_msg(f"⚠️ 服务端**确认这些会话仍然存在**（已换 3 种写法重试，均无效）："
+                     f"{names}{more}")
+        hints = []
+        for _iid, ent, name in pending:
+            h = dialog_remove_hint(ent)
+            if h and h not in hints:
+                hints.append(h)
+        for h in hints[:3]:
+            self.log_msg("   · " + h)
+        if not hints:
+            # 没有已知硬限制 -> 做一次只读诊断，区分「请求完全没生效」和「记录删了但会话被保留」
+            totals = set()
+            for _iid, ent, _name in pending[:5]:
+                total, err = await dialog_history_cleared(self.client, ent)
+                totals.add(-1 if err else total)
+            if totals == {0}:
+                self.log_msg("   · 诊断：这些会话的消息**已经清空**，但会话本身被 Telegram 保留"
+                             "（不是请求没生效）。这种情况通常就是收藏夹或对方已注销的账号。")
+            elif -1 not in totals and totals:
+                self.log_msg(f"   · 诊断：这些会话的消息**还在**（剩余 {sorted(totals)} 条）"
+                             "—— 说明删除请求完全没有生效，属于需要继续查的类型。")
+        self.log_msg("   这几行**已经留在列表里**（没有当作成功）。请把程序目录下的 "
+                     "tg_leave_log.txt 发我 —— 里面记了每一步的写法、服务端返回和上面的诊断。")
+        return [(iid, name) for iid, _e, name in pending], unver
 
     # ---- 销毁自己创建的频道 / 群组 ----
     def on_destroy_created(self, want_kind):
@@ -5768,6 +6182,50 @@ def selftest():
         assert asyncio.run(leave_or_delete_entity(_EchoClient(), ch))[0] == LEAVE_OK
         assert isinstance(_sent[-1], tl_channels.LeaveChannelRequest), _sent[-1]
 
+        # ---- 「删除会话」按类型分派（v1.3.1 修的核心）----
+        # 以前对所有类型一律发 DeleteHistoryRequest：服务端不报错、会话却纹丝不动，
+        # 日志却已经写下「已删除」—— 这就是「提示成功、客户端会话还在」的真因。
+        _r_u = build_remove_dialog_requests(usr)
+        _r_g = build_remove_dialog_requests(gp)
+        _r_c = build_remove_dialog_requests(ch)
+        assert len(_r_u) == 1 and isinstance(_r_u[0], tl_messages.DeleteHistoryRequest)
+        assert _r_u[0].just_clear is False and _r_u[0].revoke is False
+        assert len(_r_g) == 1 and isinstance(_r_g[0], tl_messages.DeleteChatUserRequest)
+        assert _r_g[0].revoke_history is False
+        assert len(_r_c) == 1 and isinstance(_r_c[0], tl_channels.LeaveChannelRequest)
+        try:
+            build_remove_dialog_requests(tl_types.InputUserSelf())
+            raise AssertionError("未知类型应当报错，而不是构造出必然失败的请求")
+        except ValueError:
+            pass
+        # 删完必须能回头问服务端 —— 「真的删掉了」的唯一凭据，不能靠「没抛异常」
+        assert callable(dialogs_still_present)
+        assert asyncio.run(dialogs_still_present(None, [])) == ({}, "")
+
+        # 「删了、服务端却说还在」时的备选写法：必须是**真的不同**的写法，
+        # 否则「重试」只是把同一条必然无效的请求再发一遍。
+        assert [s for s, _l in DIALOG_REMOVE_RETRY_STEPS] == [
+            "explicit_peer", "max_id", "delete_dialog"]
+        assert all(_l for _s, _l in DIALOG_REMOVE_RETRY_STEPS)
+        # 已知硬限制要能识别出来（收藏夹 / 已注销的账号）—— 它们重试也没有用，只能直说
+        assert "收藏夹" in dialog_remove_hint(tl_types.User(
+            id=1, is_self=True, access_hash=1, first_name="me"))
+        assert "注销" in dialog_remove_hint(tl_types.User(
+            id=2, is_self=False, access_hash=1, first_name="x", deleted=True))
+        assert dialog_remove_hint(usr) == ""
+        assert safe_peer_id(usr) == get_peer_id(usr)
+        assert safe_peer_id(None) is None
+
+        # 日志必须落盘：用户报故障时界面日志早关了，只剩这个文件可查
+        assert log_file_path() == os.path.join(BASE_DIR, LOG_FILE_NAME)
+        append_log_file("__selftest__ 日志落盘自检")
+        try:
+            with open(log_file_path(), encoding="utf-8") as _lf:
+                _logtxt = _lf.read()
+        except OSError:
+            _logtxt = ""
+        assert "__selftest__" in _logtxt, "日志没有落盘：%s" % log_file_path()
+
         # 版本号与更新日志必须互相对得上：改了 APP_VERSION 却忘了写更新日志，
         # 界面就会出现「标题是 v1.1.2、日志停在 v1.1.1」这种前言不搭后语。
         assert re.match(r"^v\d+(\.\d+)+$", APP_VERSION), APP_VERSION
@@ -5784,6 +6242,7 @@ def selftest():
         assert _vers == sorted(_vers, reverse=True), _vers
 
         _selftest_say(lines, "请求构造 / 类型判定 / 分组规则（按类别各查各的开关）/ 活跃换算 OK")
+        _selftest_say(lines, "删除会话：按类型分派（私聊删会话 · 频道群组退出）/ 删后服务端复核 + 3 步换写法重试 / 日志落盘 OK")
         _selftest_say(lines, "版本 %s，更新日志 %d 条版本记录" % (APP_VERSION, len(CHANGELOG)))
 
         # 界面骨架：真的建一次主窗口再销毁 —— 有些精简包能 import tkinter 但建窗就崩，
