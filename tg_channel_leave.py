@@ -283,11 +283,30 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.3.1"
+APP_VERSION = "v1.3.2"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.3.2", "2026-10-14", [
+        "修复：**已注销账号的私聊会话「删不掉」的真相搞清了**。您发回来的日志显示："
+        "60 个私聊全部「服务端确认仍在」。实测发现它们的聊天记录**已经被删掉**"
+        "（服务端返回的 top_message 是 0），被留下的是**会话条目本身** —— "
+        "对方账号已注销（客户端里是灰头像 / 纯数字名）时，Telegram 只删记录、不摘条目。"
+        "所以以前报「已删除」是错的（记录确实删了，会话也确实还在）",
+        "修复：复核没通过时**换 4 种更强写法重试**（新增「带 revoke=True 重发」与"
+        "「临时封禁 → 解封 → 再删」—— 后者是重置服务端对这条会话状态的办法）。"
+        "revoke=True 只对**已注销**的账号使用：对方账号已不存在，不存在误删别人记录的问题；"
+        "对正常在用的联系人会显式跳过并说明原因",
+        "修复：**「收藏夹 / Saved Messages」不再发任何删除请求**。Telegram 不会删除这个会话，"
+        "但请求里「删记录」那一半**真的会清空您收藏的内容** —— 那是不可逆的数据损失。"
+        "现在直接拦住并提示「要清空请到客户端用『清空聊天记录』」",
+        "修复：**复核没通过时一定会做只读实测并给出数字**（抽查 getHistory 看记录还剩几条）。"
+        "上一版这段诊断写在「命中硬限制提示就不诊断」的条件里，结果最需要它的场景（命中「收藏夹 / 已注销」"
+        "提示的那一批）反而一次都没执行，日志里只有推测、没有实测",
+        "新增：「未能删除」的每一行都补上原因标签（对方账号已注销 / 收藏夹 / 幽灵账号），"
+        "不用再靠翻上面的提示去对号入座",
+    ]),
     ("v1.3.1", "2026-10-13", [
         "修复：**「删除会话」不再说成功却什么都没发生**。以前只要请求没抛异常就写「已删除」，"
         "而 Telegram 会安静地收下请求却不执行 —— 这就是「提示成功、客户端里会话还在」。"
@@ -928,12 +947,55 @@ async def dialogs_still_present(client, ents):
     return still, ""
 
 
+def is_ghost_user(ent):
+    """对方是不是「幽灵账号」—— 已注销，或服务端只回了 id、一个名字字段都没有。
+
+    这一类在客户端里显示成灰头像 / 纯数字名（本工具的取名单链是
+    `d.name or title or str(ent.id)`，名字空就退化成 id，所以列表里那些
+    「7877144361」就是它们），也正是服务端唯一会「删掉记录、却把会话条目留着」的一类。
+    区分出来是为了只对它们动用更强的写法（revoke / 临时封禁），不误伤正常在用的联系人。
+    """
+    if not isinstance(ent, tl_types.User):
+        return False
+    if getattr(ent, "is_self", False):
+        return False
+    if getattr(ent, "deleted", False):
+        return True
+    return not (getattr(ent, "first_name", None)
+                or getattr(ent, "last_name", None)
+                or getattr(ent, "username", None))
+
+
+async def block_unblock_delete(client, ent, revoke=False):
+    """封禁 → 解封 → 再删。**解封一定执行**（放在 try/except 里显式兜底）。
+
+    为什么会有这么怪的一招：对「对方账号已注销」的会话，服务端会收下
+    messages.deleteHistory、把聊天记录删掉，却**不摘掉会话条目** —— 复核时它的
+    top_message 是 0（记录没了），条目却一直在列表里。社区里对这类「顽固幽灵会话」
+    唯一有效的办法就是先把这条会话的封禁状态改一遍，逼服务端重建这个 peer 的会话状态，
+    随后的删除才会真的生效。
+
+    安全性：这里只处理用户**已经勾选要删除**的会话；对已注销 / 陌生账号来说封禁没有副作用，
+    且封禁**不会通知对方**。解封放在 finally 语义的位置 —— 宁可这一步整体失败，
+    也绝不把用户留在「误封禁了别人」的状态里。"""
+    await client(tl_contacts.BlockRequest(ent))
+    try:
+        await client(tl_contacts.UnblockRequest(ent))
+    except Exception as e:      # noqa: BLE001
+        raise RuntimeError("解封失败，该会话可能仍处于封禁状态"
+                           "（请到 Telegram 客户端里手动解封）：%s" % e)
+    await client(tl_messages.DeleteHistoryRequest(
+        peer=ent, max_id=0, just_clear=False, revoke=bool(revoke)))
+
+
 # 「删了、但服务端说还在」时的备选写法。按顺序试，每一步都和上一步**真的不同**，
 # 每试一步都重新复核一次 —— 不靠猜，只看服务端最后怎么说。
 DIALOG_REMOVE_RETRY_STEPS = (
     ("explicit_peer", "改用显式 InputPeer 重发（排除实体解析这一层的问题）"),
     ("max_id", "带上服务端返回的 top_message 当 max_id 重发（排除 max_id=0 被当成「无事可做」）"),
     ("delete_dialog", "改走 Telethon 的高层 delete_dialog"),
+    ("revoke", "改带 revoke=True 重发（针对「对方账号已注销」这类只被删记录、不摘条目的会话）"),
+    ("block_cycle", "临时封禁 → 解封 → 再删（重置服务端对这条会话的状态）"),
 )
 
 
@@ -957,26 +1019,69 @@ async def retry_remove_dialog(client, ent, step, dialog=None):
     if step == "delete_dialog":
         await client.delete_dialog(ent)
         return None
+    if step == "revoke":
+        # revoke=True 是「连对方那份记录一起删」。只有对方账号**已经注销**时才可以这么干：
+        # 那边已经不存在了，删无可删；对着正常在用的联系人这么发就是替用户做了
+        # 一个他没点头的决定，所以显式跳过并说清原因。
+        if getattr(ent, "is_self", False):
+            return "跳过（你自己的收藏夹：Telegram 不允许删除，revoke 也没有用）"
+        if not getattr(ent, "deleted", False):
+            return ("跳过（对方是正常在用的账号：revoke=True 会连对方那份聊天记录一起删掉，"
+                    "这一步不替你做这个决定）")
+        await client(tl_messages.DeleteHistoryRequest(
+            peer=ent, max_id=0, just_clear=False, revoke=True))
+        return None
+    if step == "block_cycle":
+        if getattr(ent, "is_self", False):
+            return "跳过（你自己的收藏夹：Telegram 不允许删除）"
+        if not is_ghost_user(ent):
+            return ("跳过（对方是正常在用的账号：不替你临时封禁一个陌生 / 联系人，"
+                    "这一步只对已注销的幽灵账号使用）")
+        await block_unblock_delete(client, ent)
+        return None
     raise ValueError("未知的重试写法：%s" % step)
 
 
 def dialog_remove_hint(ent):
-    """「服务端确认这个私聊仍然存在」时的解释。
+    """「服务端确认这个会话仍然存在」时的解释。
 
-    下面几种是 Telegram 层面的**硬限制**，不是本工具请求写错了 —— 反复重试也没有用，
-    必须直说，不然用户只会一直点、一直被骗「已删除」。"""
+    这些是服务端行为，不是本工具请求写错了 —— 必须把**代价**和**出路**说清楚，
+    不然用户只会一直点、一直被骗「已删除」。v1.3.2 之前这里写的是「重试也没用」，
+    那是错的：已注销账号的会话确实还能用更强的写法再试（见 DIALOG_REMOVE_RETRY_STEPS）。"""
     try:
         if getattr(ent, "is_self", False):
-            return ("这是你自己的「收藏夹 / Saved Messages」：Telegram **不允许删除**"
-                    "这个会话（服务端会接受请求但不执行），只能「清空聊天记录」。")
+            return ("这是你自己的「收藏夹 / Saved Messages」：Telegram **不允许删除**这个会话"
+                    "（服务端接受请求但不执行）。本工具已经不再对它发任何删除请求 —— "
+                    "因为请求里「删记录」的那一半会**真的清空你收藏的内容**。"
+                    "要清空请到客户端里用「清空聊天记录」，会话条目会一直留在列表里。")
         if getattr(ent, "deleted", False):
-            return ("对方的账号**已注销**（客户端里显示为灰头像的 Deleted Account）。"
-                    "Telegram 会长期保留这类会话，服务端不接受移除，重试也没有用。")
+            return ("对方的账号**已注销**（客户端里显示为灰头像 / 纯数字名的 Deleted Account）。"
+                    "服务端对这类会话只删聊天记录、**不摘会话条目** —— 所以「删了但会话还在」"
+                    "不是没删掉，是条目被 Telegram 留着了。本工具会改用 revoke=True / "
+                    "临时封禁→解封→再删 这两种更强的写法重试，成不成以复核为准。")
+        if isinstance(ent, tl_types.User) and is_ghost_user(ent):
+            return ("这个用户实体一个名字字段都没有（服务端只回了 id），"
+                    "客户端里通常就是已注销 / 已被封的幽灵账号 —— "
+                    "服务端对这类会话往往只删记录、不摘条目，本工具会走更强的写法重试。")
         if getattr(ent, "support", False):
             return "这是 Telegram 官方支持账号（Telegram），它的会话不能被删除。"
         if getattr(ent, "min", False):
             return ("这个用户实体是精简版（min），access_hash 不全，服务端定位不到会话；"
                     "先点「🔄 刷新列表」重取完整实体再试。")
+    except Exception:
+        pass
+    return ""
+
+
+def dialog_remove_tag(ent):
+    """给「未能删除」那一行补一个一眼能看懂的原因标签（没把握就返回空串）。"""
+    try:
+        if getattr(ent, "is_self", False):
+            return "（收藏夹）"
+        if getattr(ent, "deleted", False):
+            return "（对方账号已注销）"
+        if is_ghost_user(ent):
+            return "（幽灵账号：服务端没给任何名字）"
     except Exception:
         pass
     return ""
@@ -5698,6 +5803,13 @@ class App:
                 "**只有退出才会从列表消失**，所以本次对它们是执行退出（和确认清单里列的一致）。")
 
         async def _do(ent, name):
+            # ⚠️ 收藏夹（is_self）连请求都不要发：Telegram 不会摘掉这个会话条目，
+            # 但请求里「删记录」的那一半**真的会把收藏内容清空** —— 那是不可逆的数据损失，
+            # 而用户勾「删除会话」时根本没意识到会丢收藏。宁可直接拦住并说清出路。
+            if isinstance(ent, tl_types.User) and getattr(ent, "is_self", False):
+                return False, ("⛔ 无法删除（这是你自己的「收藏夹」：Telegram 不允许删除这个会话；"
+                               "本次**没有**发送任何请求，以免误清空你收藏的内容。"
+                               "确实要清空请到客户端里用「清空聊天记录」）: %s" % name)
             status, note = await delete_history_entity(self.client, ent)
             if status == DEL_BLOCKED:
                 return False, f"⛔ 无法删除（{note}）: {name}"
@@ -5738,7 +5850,8 @@ class App:
                 # 私聊的「到底删掉没有」现在才有答案 —— 到这一步才写日志，
                 # 免得日志先写了「已删除」再改口。
                 if iid in kept_ids:
-                    self.log_msg(f"⚠️ 未能删除（服务端确认仍然存在）: {name}")
+                    self.log_msg(f"⚠️ 未能删除（服务端确认仍然存在）: {name}"
+                                 f"{dialog_remove_tag(ent)}")
                 elif iid in unver:
                     self.log_msg(f"❓ 未能复核（无法确认删掉没有）: {name}")
                 else:
@@ -5771,9 +5884,11 @@ class App:
 
         为什么非做不可：`messages.deleteHistory` 服务端会安静地收下请求却什么都不做，
         而代码只要「没抛异常」就报成功 —— 「提示已删除、客户端里还在」就是这个来的。
-        一次不成还会换 3 种**写法确实不同**的方式重试，每一步都重新问服务端一次；
-        全部试完仍在的，如实报出来并给出原因（收藏夹 / 对方已注销这类是 Telegram
-        的硬限制，重试没有用，只能直说）。
+        一次不成还会按 DIALOG_REMOVE_RETRY_STEPS 换几种**写法确实不同**的方式重试
+        （v1.3.2 起多了针对「对方账号已注销」的 revoke=True 与「临时封禁→解封→再删」），
+        每一步都重新问服务端一次；
+        全部试完仍在的，如实报出来并给出原因（并补一条只读实测：记录究竟清空了没有），
+        绝不为了让日志好看而写成「已删除」。
 
         只复核私聊 / 机器人：频道 / 群组退出后已不可访问，再用 peers 去查会整批报错，
         反而把真正的信号淹掉（它们的成败由退出请求本身决定，服务端拒绝就会抛错）。"""
@@ -5792,15 +5907,24 @@ class App:
                              f"改用下一步写法重试：{label}")
                 self.root.after(0, lambda: self.set_progress(
                     0, 0, "正在换写法重试（服务端复核未通过）…"))
+                # block_cycle 一次要发 3 个请求（封禁 / 解封 / 删除），60 个会话就是 180 个。
+                # 封禁类接口对「连续操作」很敏感，所以这一档**逐个限速**，别把服务端惹火；
+                # 其余档位保持原来的节奏（一次 sleep(0) 让出事件循环即可）。
+                per_peer = max(1.0, self._interval()) if step == "block_cycle" else 0.0
                 for _iid, ent, _name in pending:
                     try:
                         skip = await retry_remove_dialog(
                             self.client, ent, step, dialogs.get(safe_peer_id(ent)))
                         if skip:
                             self.log_msg(f"   · {skip}")
+                    except FloodWaitError as e:
+                        # 被限流了就老实等，别把整批都撞成失败
+                        wait = min(int(getattr(e, "seconds", 30) or 30), 180)
+                        self.log_msg(f"   · ⏳ 被限流（{_name}），等待 {wait} 秒后继续")
+                        await asyncio.sleep(wait)
                     except Exception as e:      # noqa: BLE001
                         self.log_msg(f"   · 重试失败（{_name}）: {e}")
-                    await asyncio.sleep(0)      # 让出事件循环，界面不卡
+                    await asyncio.sleep(per_peer)   # 让出事件循环（限量档顺带限速）
                 # 重试也要限速，别把服务端惹火
                 if pending:
                     await asyncio.sleep(max(1.0, self._interval()))
@@ -5837,7 +5961,8 @@ class App:
         # 所有写法都试过，服务端仍然说「在」
         names = "、".join(str(n) for _i, _e, n in pending[:20])
         more = f"，另有 {len(pending) - 20} 个" if len(pending) > 20 else ""
-        self.log_msg(f"⚠️ 服务端**确认这些会话仍然存在**（已换 3 种写法重试，均无效）："
+        self.log_msg(f"⚠️ 服务端**确认这些会话仍然存在**"
+                     f"（已换 {len(DIALOG_REMOVE_RETRY_STEPS)} 种写法重试，均无效）："
                      f"{names}{more}")
         hints = []
         for _iid, ent, name in pending:
@@ -5846,18 +5971,30 @@ class App:
                 hints.append(h)
         for h in hints[:3]:
             self.log_msg("   · " + h)
-        if not hints:
-            # 没有已知硬限制 -> 做一次只读诊断，区分「请求完全没生效」和「记录删了但会话被保留」
-            totals = set()
-            for _iid, ent, _name in pending[:5]:
-                total, err = await dialog_history_cleared(self.client, ent)
-                totals.add(-1 if err else total)
-            if totals == {0}:
-                self.log_msg("   · 诊断：这些会话的消息**已经清空**，但会话本身被 Telegram 保留"
-                             "（不是请求没生效）。这种情况通常就是收藏夹或对方已注销的账号。")
-            elif -1 not in totals and totals:
-                self.log_msg(f"   · 诊断：这些会话的消息**还在**（剩余 {sorted(totals)} 条）"
-                             "—— 说明删除请求完全没有生效，属于需要继续查的类型。")
+        # ⚠️ 实测这一段**必须无条件跑**。v1.3.1 把它写成「命中硬限制提示就跳过诊断」，结果最需要它的
+        # 场景（命中「收藏夹 / 已注销」提示的那一批）反而一次都没执行 —— 用户拿到的日志里
+        # 只有两句推测，没有一条实测数字，等于又用「猜」代替了「核对」，于是根本分不清
+        # 到底是「请求完全没生效」还是「记录删了、条目被服务端留着」。
+        cleared = remain = unknown = 0
+        for _iid, ent, _name in pending[:5]:
+            total, err = await dialog_history_cleared(self.client, ent)
+            if err:
+                unknown += 1
+            elif total == 0:
+                cleared += 1
+            else:
+                remain += 1
+        if cleared and not remain:
+            self.log_msg(f"   · 实测（只读 getHistory，抽查 {cleared} 个）：记录**已经清空**（0 条）"
+                         "—— 删除请求生效了，是服务端**不肯摘掉会话条目**。")
+            self.log_msg("     这正是 Telegram 对「已注销账号 / 你自己的收藏夹」这类会话的做法："
+                         "记录能删，条目留着。换写法也未必有用，所以工具不会谎报成功。")
+        elif remain and not cleared:
+            self.log_msg(f"   · 实测（只读 getHistory，抽查 {remain} 个）：记录**仍在**（还有消息）"
+                         "—— 删除请求完全没有生效，属于还需要继续查的类型。")
+        else:
+            self.log_msg(f"   · 实测（只读 getHistory，抽查 {cleared + remain + unknown} 个）："
+                         f"记录已经清空 {cleared} 个 / 记录仍在 {remain} 个 / 无法判定 {unknown} 个。")
         self.log_msg("   这几行**已经留在列表里**（没有当作成功）。请把程序目录下的 "
                      "tg_leave_log.txt 发我 —— 里面记了每一步的写法、服务端返回和上面的诊断。")
         return [(iid, name) for iid, _e, name in pending], unver
@@ -6205,11 +6342,37 @@ def selftest():
         # 「删了、服务端却说还在」时的备选写法：必须是**真的不同**的写法，
         # 否则「重试」只是把同一条必然无效的请求再发一遍。
         assert [s for s, _l in DIALOG_REMOVE_RETRY_STEPS] == [
-            "explicit_peer", "max_id", "delete_dialog"]
+            "explicit_peer", "max_id", "delete_dialog", "revoke", "block_cycle"]
         assert all(_l for _s, _l in DIALOG_REMOVE_RETRY_STEPS)
-        # 已知硬限制要能识别出来（收藏夹 / 已注销的账号）—— 它们重试也没有用，只能直说
+        # v1.3.2：用户发回的日志证明「对方账号已注销」的会话只会被删记录、条目被留下 ——
+        # revoke / block_cycle 这两档就是专门冲它去的，且都带闸门，不误伤正常在用的联系人。
+        assert is_ghost_user(tl_types.User(id=2, is_self=False, access_hash=1, deleted=True))
+        assert is_ghost_user(tl_types.User(id=3, is_self=False, access_hash=1))
+        assert not is_ghost_user(tl_types.User(
+            id=4, is_self=False, access_hash=1, first_name="a"))
+        assert not is_ghost_user(tl_types.User(id=5, is_self=True, access_hash=1))
+        assert dialog_remove_tag(tl_types.User(id=5, is_self=True, access_hash=1)) == "（收藏夹）"
+        assert dialog_remove_tag(tl_types.User(
+            id=6, is_self=False, access_hash=1, deleted=True)) == "（对方账号已注销）"
+        _live = tl_types.User(id=7, is_self=False, access_hash=1, first_name="live")
+        assert asyncio.run(retry_remove_dialog(_EchoClient(), _live, "revoke")) is not None
+        assert asyncio.run(retry_remove_dialog(_EchoClient(), _live, "block_cycle")) is not None
+        _sent.clear()
+        assert asyncio.run(retry_remove_dialog(
+            _EchoClient(), tl_types.User(id=8, is_self=False, access_hash=1, deleted=True),
+            "revoke")) is None
+        assert _sent and _sent[-1].revoke is True
+        _sent.clear()
+        assert asyncio.run(retry_remove_dialog(
+            _EchoClient(), tl_types.User(id=9, is_self=False, access_hash=1, deleted=True),
+            "block_cycle")) is None
+        assert [type(r).__name__ for r in _sent] == [
+            "BlockRequest", "UnblockRequest", "DeleteHistoryRequest"], _sent
+        # 已知硬限制要能识别出来（收藏夹 / 已注销的账号）—— 提示里要写清代价与出路
         assert "收藏夹" in dialog_remove_hint(tl_types.User(
             id=1, is_self=True, access_hash=1, first_name="me"))
+        assert "不摘会话条目" in dialog_remove_hint(tl_types.User(
+            id=10, is_self=False, access_hash=1, deleted=True))
         assert "注销" in dialog_remove_hint(tl_types.User(
             id=2, is_self=False, access_hash=1, first_name="x", deleted=True))
         assert dialog_remove_hint(usr) == ""
@@ -6242,7 +6405,7 @@ def selftest():
         assert _vers == sorted(_vers, reverse=True), _vers
 
         _selftest_say(lines, "请求构造 / 类型判定 / 分组规则（按类别各查各的开关）/ 活跃换算 OK")
-        _selftest_say(lines, "删除会话：按类型分派（私聊删会话 · 频道群组退出）/ 删后服务端复核 + 3 步换写法重试 / 日志落盘 OK")
+        _selftest_say(lines, "删除会话：按类型分派（私聊删会话 · 频道群组退出）/ 删后服务端复核 + 5 步换写法重试 / 日志落盘 OK")
         _selftest_say(lines, "版本 %s，更新日志 %d 条版本记录" % (APP_VERSION, len(CHANGELOG)))
 
         # 界面骨架：真的建一次主窗口再销毁 —— 有些精简包能 import tkinter 但建窗就崩，
