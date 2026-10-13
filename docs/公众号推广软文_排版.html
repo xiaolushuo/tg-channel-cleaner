@@ -1,0 +1,138 @@
+<div style="font-size:15px;line-height:1.75;color:#3f3f3f;letter-spacing:0.5px;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;">
+
+<h1 style="font-size:20px;font-weight:bold;color:#1a1a1a;line-height:1.5;margin:0 0 24px 0;text-align:center;">Telegram 加到 500 个群之后<br>我才发现官方根本没打算帮你「退群」</h1>
+
+<section style="background:#f7f7f7;border-left:3px solid #2AABEE;padding:14px 16px;margin:0 0 28px 0;border-radius:0 6px 6px 0;">
+<p style="margin:0;font-size:14px;line-height:1.7;color:#666;">如果你也关注了几十个频道、几个资源群，那这篇文章大概能帮你省下几个小时。</p>
+</section>
+
+<h2 style="font-size:17px;font-weight:bold;color:#1a1a1a;margin:32px 0 16px 0;padding-left:10px;border-left:4px solid #2AABEE;">你有没有撞上这堵墙</h2>
+
+<p style="margin:0 0 16px 0;">用 Telegram 的人，迟早会撞上一堵墙。</p>
+
+<p style="margin:0 0 16px 0;">你关注了几十个资讯频道、几个资源群、几个行业交流群，收藏夹越攒越厚。直到某一天，你看到一个很想关注的频道，点「加入」——弹出一句冷冰冰的提示：<span style="color:#c0392b;font-weight:bold;">你已达上限</span>。</p>
+
+<p style="margin:0 0 16px 0;">Telegram 免费账号能加入的<b>频道 + 群组合计上限是 500 个</b>（官方数字，Premium 会员翻倍到 1000 个）。也就是说，你每想关注一个新群，就必须先退掉一个旧的。</p>
+
+<p style="margin:0 0 16px 0;">而这里有个非常不合理的设计：</p>
+
+<p style="margin:0 0 16px 0;font-weight:bold;color:#1a1a1a;font-size:16px;">官方把「加入」做得极其顺手，却完全没打算帮你「退出」。</p>
+
+<p style="margin:0 0 16px 0;">Telegram 的桌面端和手机端，都没有多选、没有批量退出。你只能：长按群名 → 选择退出 → 二次确认 → 回到列表 → 找到下一个 → 再来一遍。<b>500 个群，就是 500 次重复动作。</b>手会累，心更累。</p>
+
+<h2 style="font-size:17px;font-weight:bold;color:#1a1a1a;margin:32px 0 16px 0;padding-left:10px;border-left:4px solid #2AABEE;">更麻烦的是：你根本不知道该退哪些</h2>
+
+<p style="margin:0 0 16px 0;">假设你终于下定决心要清理了，打开列表一看——傻眼。</p>
+
+<p style="margin:0 0 16px 0;">满屏只有<b>频道名字</b>。你看不出这个是 200 人的死群还是 10 万人的大群，看不出它上次更新是昨天还是三年前，看不出它是你每天都看的干货号还是当初手滑点进去的广告群。</p>
+
+<p style="margin:0 0 16px 0;">想搞清楚？只能一个个点进去看。500 个，点到明天。</p>
+
+<p style="margin:0 0 16px 0;">于是绝大多数人的处理方式是：<b>不清理了，去开会员吧。</b>Telegram Premium 月费约 4.99 美元，确实能把上限从 500 提到 1000。</p>
+
+<p style="margin:0 0 16px 0;">但说实话——为了腾出位置去关注几个新群，就为一个你一年用不上几次的「数字上限」付月费，这笔账怎么算都不划算。<b>你真正需要的不是更大的仓库，而是一个能快速清仓的工具。</b></p>
+
+<h2 style="font-size:17px;font-weight:bold;color:#1a1a1a;margin:32px 0 16px 0;padding-left:10px;border-left:4px solid #2AABEE;">所以我写了这个工具</h2>
+
+<p style="margin:0 0 16px 0;"><b>TG 频道批量退出工具</b>，一个单文件的 Windows 桌面程序（绿色，免安装，双击即用）。</p>
+
+<p style="margin:0 0 24px 0;">它要解决的就是上面那两件事：<b>让你看清楚该退哪些，然后一次退干净。</b></p>
+
+<h3 style="font-size:15px;font-weight:bold;color:#168ACD;margin:26px 0 12px 0;">一、把全部订阅一次性摊开给你看</h3>
+
+<p style="margin:0 0 16px 0;">连接你自己的账号后，工具会分页拉取你所有已订阅的频道和群组，直接铺成一张表：</p>
+
+<table style="width:100%;border-collapse:collapse;font-size:13px;margin:0 0 16px 0;">
+<thead>
+<tr style="background:#eef7fd;">
+<th style="border:1px solid #d5e6f3;padding:6px 4px;color:#168ACD;font-weight:normal;">名称</th>
+<th style="border:1px solid #d5e6f3;padding:6px 4px;color:#168ACD;font-weight:normal;">类型</th>
+<th style="border:1px solid #d5e6f3;padding:6px 4px;color:#168ACD;font-weight:normal;">用户数</th>
+<th style="border:1px solid #d5e6f3;padding:6px 4px;color:#168ACD;font-weight:normal;">作品数</th>
+<th style="border:1px solid #d5e6f3;padding:6px 4px;color:#168ACD;font-weight:normal;">安全</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;">某某资讯频道</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">频道</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">128,430</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">52,910</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">—</td>
+</tr>
+<tr>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;">某广告群</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">群组</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">212</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">8</td>
+<td style="border:1px solid #d5e6f3;padding:6px 4px;text-align:center;">—</td>
+</tr>
+</tbody>
+</table>
+
+<p style="margin:0 0 10px 0;">&bull; <b>分页加载</b>：即使你有 500 个订阅，也是边拉边显示，不会卡在那儿转圈</p>
+<p style="margin:0 0 10px 0;">&bull; <b>表头点一下就能排序</b>：用户数从大到小，作品数从小到大，一目了然</p>
+<p style="margin:0 0 16px 0;">&bull; <b>一眼分辨死活</b>：几万人的大群和 200 人的僵尸群，排在表里高下立判</p>
+
+<h3 style="font-size:15px;font-weight:bold;color:#168ACD;margin:26px 0 12px 0;">二、把「该退什么」变成一道可以算的题</h3>
+
+<p style="margin:0 0 16px 0;">工具能批量获取每个频道的<b>用户数</b>和<b>作品数</b>（消息总数）：</p>
+
+<p style="margin:0 0 10px 0;">&bull; <b>并发请求</b>，并发数可调，500 个频道几分钟跑完</p>
+<p style="margin:0 0 10px 0;">&bull; <b>本地缓存</b>：取到的数据存在本地，可设置缓存有效期（默认 24 小时）。下次打开直接秒出，不会重复向 Telegram 发请求——既省时间，也降低被限流的概率</p>
+<p style="margin:0 0 10px 0;">&bull; <b>快捷筛选</b>：内置「用户数 &lt; 10 / 50 / 100」「作品数 &lt; 10 / 50 / 100」等预设，也可以自己填条件。<b>一键就能筛出「人少、又不更新」的那批死群</b></p>
+<p style="margin:0 0 16px 0;">&bull; 支持<b>搜索</b>（名称 / 用户名）、<b>按类型筛</b>（只看频道 / 只看群组）、<b>只看已勾选</b></p>
+
+<h3 style="font-size:15px;font-weight:bold;color:#168ACD;margin:26px 0 12px 0;">三、真的能批量退，而不是假装能</h3>
+
+<p style="margin:0 0 10px 0;">&bull; <b>全选 / 反选 / 清空</b>，还可以「应用筛选并全选」——按条件筛出来直接全选，一步到位</p>
+<p style="margin:0 0 10px 0;">&bull; <b>按关键词批量退</b>：名称或用户名包含关键词就匹配，逗号或空格分隔多个词。比如当初关注了一堆同类资源群，现在不想留了，输一个词就能全部选中</p>
+<p style="margin:0 0 10px 0;">&bull; <b>退出间隔 + 随机抖动</b>：默认每个间隔 2 秒，可再加一段随机等待。这是防限流的关键——批量操作最怕被判定为异常行为</p>
+<p style="margin:0 0 16px 0;">&bull; <b>触发限流自动处理</b>：如果 Telegram 返回 FloodWait（要求等待 N 秒），工具自动等待并重试，不需要你盯着</p>
+
+<h3 style="font-size:15px;font-weight:bold;color:#168ACD;margin:26px 0 12px 0;">四、三道安全防护，避免白跑和误伤</h3>
+
+<p style="margin:0 0 16px 0;">批量操作最怕两件事：<b>退掉不该退的</b>，和<b>退一堆却全失败</b>。这个工具都考虑到了：</p>
+
+<p style="margin:0 0 10px 0;">&bull; <b>白名单</b>：把频道加进白名单，它就<b>永远不会被退出</b>（哪怕你手滑全选）。按频道 ID 记录，刷新列表、重启程序都不会丢</p>
+
+<p style="margin:0 0 10px 0;">&bull; <b>自动跳过创建者和管理员</b>：这是一个很多人踩过的坑——<b>如果你是某个频道的创建者或管理员，Telegram 根本不允许你退出</b>。不做判断就批量退，结果就是白跑一轮、报一堆错。这个工具会在获取统计时顺带识别你的身份，退的时候自动跳过，并在「安全」列标出来</p>
+
+<p style="margin:0 0 16px 0;">&bull; <b>退出前预览清单</b>：点退出后先弹一个清单，分成「将退出」和「已跳过（受保护）」两个页签，确认无误再执行。不想看也可以关掉</p>
+
+<h3 style="font-size:15px;font-weight:bold;color:#168ACD;margin:26px 0 12px 0;">五、还有这些顺手的地方</h3>
+
+<p style="margin:0 0 10px 0;">&bull; <b>导出 CSV</b>：当前显示的行 / 全部 / 仅已勾选，三种范围随你选。清理前先存档，心里有底</p>
+<p style="margin:0 0 10px 0;">&bull; <b>运行日志</b>：每一步都有记录，哪个成功、哪个失败、为什么失败，清清楚楚</p>
+<p style="margin:0 0 10px 0;">&bull; <b>代理支持</b>：SOCKS5 / SOCKS4 / HTTP 都行，内置「测试代理」按钮会真的试着连一次 Telegram。国内网络基本是必需品</p>
+<p style="margin:0 0 16px 0;">&bull; <b>深色模式 / 记住窗口布局 / 快捷键</b>（Ctrl+F 搜索、Ctrl+A 全选、空格勾选、F5 刷新）</p>
+
+<h2 style="font-size:17px;font-weight:bold;color:#1a1a1a;margin:32px 0 16px 0;padding-left:10px;border-left:4px solid #2AABEE;">怎么用（四步）</h2>
+
+<p style="margin:0 0 12px 0;"><b>1. 拿到自己的 API 凭据</b><br>打开 <code style="background:#f2f2f2;padding:1px 5px;border-radius:3px;font-size:13px;">my.telegram.org</code>，登录后进「API development tools」创建一个应用，得到 <code style="background:#f2f2f2;padding:1px 5px;border-radius:3px;font-size:13px;">api_id</code> 和 <code style="background:#f2f2f2;padding:1px 5px;border-radius:3px;font-size:13px;">api_hash</code>。这是 Telegram 官方给开发者用的接口凭据，<b>每个人用自己的，工具不会上传到任何服务器</b></p>
+
+<p style="margin:0 0 12px 0;"><b>2. 登录</b><br>把 api_id / api_hash / 手机号填进工具，点「连接 / 登录」，输入手机收到的验证码（开了两步验证的再输一次密码）。登录态保存在本地文件，下次自动连</p>
+
+<p style="margin:0 0 12px 0;"><b>3. 看数据、做筛选</b><br>点「获取 / 更新统计」，等它跑完，然后按用户数、作品数排序或筛选，挑出要清理的那批</p>
+
+<p style="margin:0 0 16px 0;"><b>4. 勾选、预览、退出</b><br>勾完点「退出选中频道」，看一眼清单，确认执行</p>
+
+<p style="margin:0 0 16px 0;">全程本地运行，工具<b>不依赖任何第三方服务器</b>，你的账号数据不会离开你的电脑。</p>
+
+<h2 style="font-size:17px;font-weight:bold;color:#1a1a1a;margin:32px 0 16px 0;padding-left:10px;border-left:4px solid #2AABEE;">几句实话</h2>
+
+<p style="margin:0 0 10px 0;">&bull; <b>只用于管理你自己的账号。</b>不要用它去操作别人的账号，也请遵守 Telegram 的服务条款。</p>
+<p style="margin:0 0 10px 0;">&bull; <b>Telegram 有风控。</b>批量操作天然有被限流的风险，<b>建议把间隔设置在 2 秒以上</b>，不要贪快。工具已经做了随机抖动和限流自动等待，但没有任何工具能保证 100% 不被限流。</p>
+<p style="margin:0 0 10px 0;">&bull; <b>创建者/管理员退不掉，这是 Telegram 的限制</b>，不是工具的 bug。创建者要退出，必须先转让频道或直接删除它。</p>
+<p style="margin:0 0 16px 0;">&bull; 目前是 <b>Windows 版本</b>，绿色单文件，不需要装 Python。</p>
+
+<section style="background:#eef7fd;border-radius:8px;padding:16px 18px;margin:28px 0 24px 0;">
+<p style="margin:0 0 8px 0;font-size:15px;font-weight:bold;color:#168ACD;">获取方式</p>
+<p style="margin:0 0 10px 0;font-size:14px;line-height:1.7;">开源在 GitHub，源码和可执行文件都在：</p>
+<p style="margin:0;font-size:14px;line-height:1.7;word-break:break-all;"><b>https://github.com/xiaolushuo/tg-channel-cleaner</b></p>
+<p style="margin:10px 0 0 0;font-size:14px;line-height:1.7;">下载 <code style="background:#ffffff;padding:1px 5px;border-radius:3px;font-size:13px;">TG频道批量退出工具.exe</code> 双击即可运行。有问题欢迎在仓库提 Issue。</p>
+</section>
+
+<p style="margin:0;font-size:12.5px;line-height:1.7;color:#999;border-top:1px solid #eee;padding-top:14px;">免责声明：本工具为账号管理辅助程序，仅用于批量退出用户本人已加入的频道 / 群组，不涉及任何数据抓取或第三方账号操作。使用者需自行遵守 Telegram 服务条款及所在地法律法规。</p>
+
+</div>

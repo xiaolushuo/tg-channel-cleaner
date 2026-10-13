@@ -1,0 +1,3136 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TG 频道批量退出工具 (GUI 版)
+================================
+使用 Telethon 操作你【自己的】Telegram 账号，列出已订阅的频道/群组，
+勾选后批量退出。纯本地工具，不依赖任何第三方服务器。
+
+使用前准备:
+  1. 打开 https://my.telegram.org ，登录后「API development tools」创建一个应用，
+     拿到 api_id 与 api_hash。
+  2. pip install telethon
+  3. 运行本脚本，填入 api_id / api_hash / 手机号，点击「连接/登录」。
+     首次登录会要求输入手机收到的验证码（若开启了两步验证还需输入密码）。
+  4. 等频道列表加载完，勾选要退出的，点「退出选中频道」。
+
+注意事项:
+  - 本工具仅用于管理你自己的账号，请遵守 Telegram 服务条款。
+  - 退出间隔默认 2 秒；若提示限流(FloodWait)，工具会自动等待后重试。
+  - 登录态保存在本目录 tg_session.session，请勿泄露该文件。
+"""
+
+import asyncio
+import csv
+import json
+import os
+import random
+import re
+import sys
+import threading
+import time
+
+# GUI 依赖 tkinter（Python 标准库），但部分“精简/嵌入式”Python 或 Linux 默认未安装。
+# 若缺失，给出明确指引而非原始报错。
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+except ModuleNotFoundError:
+    base = os.path.dirname(os.path.abspath(__file__))
+    exe_path = os.path.join(base, "dist", "TG频道批量退出工具.exe")
+    has_exe = os.path.isfile(exe_path)
+
+    guide = (
+        "[错误] 当前 Python 未包含 tkinter（GUI 模块），无法启动界面。\n"
+        "解决办法（任选其一）：\n"
+        "  1) 直接用已打包好的单文件程序：dist/TG频道批量退出工具.exe（无需安装 Python）。\n"
+        "  2) 换用带 tkinter 的完整版 Python：\n"
+        "     - Windows：从 https://www.python.org 安装官方 CPython（默认即含 tkinter）。\n"
+        "     - Linux(Debian/Ubuntu)：sudo apt install python3-tk\n"
+        "     - macOS：brew install python-tk，或重装 python.org 版。\n"
+        "  3) 装好 tkinter 后，再 pip install -r requirements.txt 运行本脚本。\n"
+    )
+
+    # 若已存在打包好的 exe，直接询问是否打开它（最省事，不依赖 tkinter）
+    launched = False
+    if has_exe:
+        try:
+            import ctypes
+
+            res = ctypes.windll.user32.MessageBoxW(
+                0,
+                "当前 Python 缺少 tkinter，无法直接运行本脚本。\n"
+                "已检测到打包好的单文件程序，是否现在直接打开它？",
+                "TG 频道批量退出工具",
+                0x24,  # MB_YESNO | MB_ICONQUESTION
+            )
+            if res == 6:  # IDYES
+                os.startfile(exe_path)
+                launched = True
+        except Exception:
+            pass
+
+    if not launched:
+        # sys.stderr 可能为 None（如 pythonw 启动），优先用系统弹窗提示
+        shown = False
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, guide, "TG 频道批量退出工具", 0x10)
+            shown = True
+        except Exception:
+            pass
+        if not shown:
+            try:
+                target = sys.__stderr__ if sys.stderr is None else sys.stderr
+                target.write(guide + "\n")
+            except Exception:
+                try:
+                    with open(os.path.join(base, "tkinter_missing.log"), "w", encoding="utf-8") as f:
+                        f.write(guide)
+                except Exception:
+                    pass
+    sys.exit(0 if launched else 1)
+
+from telethon import TelegramClient
+from telethon import errors as telethon_errors
+from telethon.errors import FloodWaitError
+from telethon.tl import types as tl_types
+from telethon.tl.functions import channels as tl_channels
+from telethon.tl.functions import messages as tl_messages
+from telethon.tl.types import Channel
+
+# 代理类型：用字符串形式，Telethon 的 _parse_proxy 在“python_socks 优先”和“PySocks 兜底”
+# 两种分支里都识别 socks5 / socks4 / http，因此不必直接依赖 socks 模块。
+# 真正建立异步代理连接需要 python-socks 包（已加入 requirements 与打包 hidden-imports）。
+PROXY_TYPES = {"SOCKS5": "socks5", "SOCKS4": "socks4", "HTTP": "http"}
+
+# 让 PyInstaller 能在构建时静态分析到 Telethon 的 TL 模块（否则打包后运行会报缺少子模块）
+try:
+    import telethon.tl.types as _tl_types  # noqa: F401
+    import telethon.tl.functions as _tl_functions  # noqa: F401
+    import telethon.tl.functions.channels as _tl_fn_channels  # noqa: F401
+    import telethon.tl.functions.messages as _tl_fn_messages  # noqa: F401
+    import telethon.tl.custom as _tl_custom  # noqa: F401
+except Exception:
+    pass
+
+# 同步代理接口：仅用于“测试代理”功能里真实地经代理出网验证，
+# 显式 import 以确保 PyInstaller 打包时也能收集到该子模块。
+try:
+    import python_socks.sync as _pysocks_sync  # noqa: F401
+except Exception:
+    _pysocks_sync = None
+
+if getattr(sys, "frozen", False):
+    # PyInstaller onefile：运行时自身被解压到临时目录（_MEI*），__file__ 指向那里，
+    # 不可靠。用 exe 所在目录作为数据目录，保证 session / config 真正持久化（关闭不丢）。
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "tg_cleaner_config.json")
+SESSION_FILE = os.path.join(BASE_DIR, "tg_session")
+STATS_CACHE_FILE = os.path.join(BASE_DIR, "tg_stats_cache.json")
+ROLE_CACHE_FILE = os.path.join(BASE_DIR, "tg_role_cache.json")
+# 身份标识 → 界面文案。创建者/管理员退不出去（Telegram 不允许），必须提前识别并跳过。
+ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
+
+
+def var_bool(obj, attr, default=False):
+    """安全读取某个 BooleanVar：属性不存在或不是变量时返回默认值。
+    放在模块级是为了测试桩（只有属性、没有方法）也能用。"""
+    var = getattr(obj, attr, None)
+    try:
+        return bool(var.get())
+    except Exception:
+        return default
+
+
+def whitelist_of(obj):
+    """取白名单集合（元素是字符串形式的频道 id），必要时懒初始化。
+    同样放在模块级，供测试桩复用。"""
+    s = getattr(obj, "_whitelist", None)
+    if not isinstance(s, set):
+        s = set(s or ())
+        try:
+            obj._whitelist = s
+        except Exception:
+            pass
+    return s
+
+
+# ---------------- 退出频道/群组的底层实现 ----------------
+# 注意：Telethon 的 TelegramClient **没有** leave_channel() 方法。
+# 「client.leave_channel(entity)」是旧版文档/示例里的写法，在 1.45 上会直接抛
+# AttributeError。正确做法是发 TL 请求，按实体类型分派：
+#   频道 / 超级群 (Channel) → channels.LeaveChannelRequest
+#   普通群       (Chat)     → messages.DeleteChatUserRequest(chat_id, InputUserSelf())
+# 刻意不用 client.delete_dialog()：它对非 bot 会再补一次 DeleteHistoryRequest，
+# 批量退出时请求数翻倍、更容易撞 FloodWait。只在实体解析失败时兜底用它。
+LEAVE_OK = "ok"            # 成功退出
+LEAVE_GONE = "gone"        # 本来就不在里面（等价于已完成）
+LEAVE_BLOCKED = "blocked"  # 创建者/管理员，Telegram 不允许退出
+
+
+def build_leave_request(ent):
+    """按实体类型构造「退出」请求。普通群必须用 InputUserSelf()，
+    传字符串 "me" 会 TypeError（TL 的 user_id 需要 InputUser 类型）。
+
+    对未知类型**显式报错**而不是默默兜底成 LeaveChannelRequest ——
+    否则传入 User 之类会构造出一个发出去必然报错的请求，真正的错因被掩盖。"""
+    if isinstance(ent, tl_types.Chat):
+        return tl_messages.DeleteChatUserRequest(
+            ent.id, tl_types.InputUserSelf(), revoke_history=True)
+    if isinstance(ent, tl_types.Channel):
+        return tl_channels.LeaveChannelRequest(ent)
+    raise ValueError(
+        "不支持的会话类型，无法退出：%s（只支持频道 / 超级群 / 普通群）"
+        % type(ent).__name__)
+
+
+async def leave_entity(client, ent):
+    """退出一个频道/群组，返回 (状态, 说明)，状态取值见 LEAVE_* 常量。
+
+    把 Telegram 的几种「其实不用退出」/「压根退不出去」的情况翻译成人话，
+    避免用户看到一堆原始异常。"""
+    try:
+        await client(build_leave_request(ent))
+        return LEAVE_OK, ""
+    except telethon_errors.ChatAdminRequiredError:
+        return LEAVE_BLOCKED, "你是该频道/群组的创建者或管理员，Telegram 不允许退出"
+    except (telethon_errors.ChannelPrivateError,
+            telethon_errors.UserNotParticipantError):
+        return LEAVE_GONE, "已经不在该频道/群组中"
+    except telethon_errors.PeerIdInvalidError:
+        # 实体缓存过期：退化到高层接口，它会先解析实体再决定退频道还是退群
+        await client.delete_dialog(ent)
+        return LEAVE_OK, ""
+
+
+# 列表分页：每拉满一页就在界面追加显示，避免大账号长时间“没反应”
+DIALOG_PAGE = 200
+
+# 快捷筛选预设：(显示名, 用户数上限(<), 作品数上限(<))；None 表示该条件不启用
+FILTER_PRESETS = [
+    ("不筛选（显示全部）", None, None),
+    ("用户数 < 10", 10, None),
+    ("用户数 < 50", 50, None),
+    ("用户数 < 100", 100, None),
+    ("作品数 < 10", None, 10),
+    ("作品数 < 50", None, 50),
+    ("作品数 < 100", None, 100),
+    ("用户数<10 且 作品数<10", 10, 10),
+    ("用户数<100 且 作品数<10", 100, 10),
+    ("用户数<10 且 作品数<100", 10, 100),
+]
+FILTER_CUSTOM = "自定义…"
+
+
+def migrate_legacy_data():
+    """旧版 onefile 把 session/config 写进了 PyInstaller 临时解压目录(_MEI*)，
+    程序一关就被清理，导致登录态/配置丢失。启动时把它们迁移到 BASE_DIR（exe 旁）。
+    仅在目标文件缺失时才迁移；若临时目录已被清理则静默跳过。"""
+    import glob
+    import shutil
+    import tempfile
+    temp = tempfile.gettempdir()
+    mappings = {
+        "tg_cleaner_config.json": CONFIG_FILE,
+        "tg_session.session": SESSION_FILE + ".session",
+        "tg_session.session-journal": SESSION_FILE + ".session-journal",
+    }
+    for src_name, dst in mappings.items():
+        if os.path.exists(dst):
+            continue
+        for d in glob.glob(os.path.join(temp, "_MEI*")):
+            src = os.path.join(d, src_name)
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, dst)
+                    print(f"[migrate] 已从临时目录恢复 {src_name} -> {dst}")
+                except Exception as e:
+                    print(f"[migrate] 恢复失败 {src_name}: {e}")
+                break
+
+
+class OperationCancelled(Exception):
+    """用户取消登录输入时抛出。"""
+    pass
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("TG 频道批量退出工具")
+        self.root.geometry("1200x780")
+
+        self.client = None          # TelethonClient 实例
+        self.loop = None            # 后台 asyncio 事件循环（单独线程拥有）
+        self.code_future = None     # 等待用户输入验证码/两步密码的 future
+        self.channels = {}          # tree item id -> entity
+        self._tree_epoch = 0        # 列表代次：刷新/清空时递增，用于废弃过期后台回填任务
+        self._sort_col = None       # 当前排序列
+        self._sort_rev = False      # 是否倒序
+        self._stats_cache = {}      # {频道id: [成员数, 作品数, 时间戳]} —— 避免重复请求
+        self._stats_cancel = threading.Event()   # 持久化取消事件：「停止」按钮始终作用于当前任务
+        self._list_cancel = threading.Event()    # 列表分页加载的取消事件（「停止全部」可中断）
+        self._row_order = []        # 行 id 的插入顺序（筛选隐藏行后用于按原顺序恢复显示）
+        self._visible = set()       # 当前可见（未被筛选隐藏）的行 id
+        self._filter_active = False # 当前是否有生效的筛选条件
+        self._sel_hidden = set()    # 已勾选、但当前被筛选隐藏的行 id（退出时不会处理，需提示用户）
+        self._filter_members_lt = None   # 当前生效的阈值（供 _set_stat 实时显隐判断）
+        self._filter_posts_lt = None
+        self._only_checked = False  # 是否「只看已勾选」
+        self._search_after = None   # 搜索防抖的 after id
+        self._task_start = None     # 当前阶段任务开始时间（用于显示耗时）
+        self._progress_running = False
+        self._left_visible = True
+        self._log_visible = True
+        self._last_left_width = 340
+        self._dark = False
+        self._default_theme = None  # 系统默认 ttk 主题（浅色时恢复回去）
+        self._role = {}             # iid -> "creator"/"admin"/""（本会话检测结果，随列表刷新重建）
+        self._role_cache = {}       # {频道id: [角色, 时间戳]} —— 角色很少变，缓存后不重复请求
+        self._whitelist = set()     # 白名单：频道 id（字符串），永不退出，全选自动跳过
+        migrate_legacy_data()       # 把旧版临时目录里的 session/config 救回 exe 旁
+        self.config = self.load_config()
+        self._stats_cache = self.load_stats_cache()
+        self._role_cache = self.load_role_cache()
+        # 白名单是「按频道 id」而不是行 id 存的 —— 刷新列表后行 id 会变，频道 id 不变
+        self._whitelist = {str(x) for x in (self.config.get("whitelist") or []) if str(x).strip()}
+
+        self.build_ui()
+        self.apply_config_to_ui()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # 启动后自动尝试用已保存的登录态连接（无需每次手动连、手动输验证码）
+        self.root.after(300, self.schedule_auto_connect)
+
+    # ---------------- 配置 ----------------
+    def load_config(self):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_config(self):
+        data = dict(self.config or {})
+        data.update({
+            "api_id": self.api_id_var.get().strip(),
+            "api_hash": self.api_hash_var.get().strip(),
+            "phone": self.phone_var.get().strip(),
+            "proxy_enabled": self.proxy_enabled_var.get(),
+            "proxy_type": self.proxy_type_var.get(),
+            "proxy_host": self.proxy_host_var.get().strip(),
+            "proxy_port": self.proxy_port_var.get().strip(),
+            "proxy_user": self.proxy_user_var.get().strip(),
+            "proxy_pass": self.proxy_pass_var.get().strip(),
+            "stats_concurrency": self._safe_int(self.conc_var, 6, 1, 32),
+            "stats_use_cache": bool(self.cache_var.get()),
+            "stats_ttl_hours": self._safe_int(self.ttl_var, 24, 1, 720),
+            "filter_members_lt": self.filter_members_var.get().strip(),
+            "filter_posts_lt": self.filter_posts_var.get().strip(),
+            "filter_hide_unknown": bool(self.filter_unknown_var.get()),
+            "leave_interval": self._safe_int(self.interval_var, 2, 1, 120),
+            "leave_jitter": self._safe_int(self.jitter_var, 0, 0, 60),
+            "dark_mode": bool(getattr(self, "dark_var", None) and self.dark_var.get()),
+            "remember_layout": bool(getattr(self, "remember_layout_var", None) and self.remember_layout_var.get()),
+            # 安全防护（用 getattr 兜底：build_ui 之前若被调用也不应崩）
+            "whitelist": sorted(self._whitelist),
+            "skip_protected": var_bool(self, "skip_protected_var", True),
+            "hide_protected": var_bool(self, "hide_protected_var", False),
+            "detect_roles": var_bool(self, "detect_role_var", True),
+            "preview_before_leave": var_bool(self, "preview_leave_var", True),
+        })
+        # 布局类字段：先清掉再按当前状态写回（“记住布局”关掉时就不该残留旧值）
+        for k in ("win_geometry", "col_widths", "left_width", "left_visible", "log_visible"):
+            data.pop(k, None)
+        data.update(self._ui_state())
+        self.config = data
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_int(var, default, lo, hi):
+        try:
+            v = int(var.get())
+        except Exception:
+            return default
+        return max(lo, min(hi, v))
+
+    def _bool_of(self, attr, default=False):
+        """兼容入口：等价于模块级 var_bool(self, attr, default)。"""
+        return var_bool(self, attr, default)
+
+    def load_role_cache(self):
+        try:
+            with open(ROLE_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_role_cache(self):
+        try:
+            with open(ROLE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._role_cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_stats_cache(self):
+        try:
+            with open(STATS_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_stats_cache(self):
+        try:
+            with open(STATS_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._stats_cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # ---------------- 界面 ----------------
+    # ================================================================
+    # 界面结构：顶部工具栏 + 登录验证条 +（左设置栏 | 右主区）+ 状态栏 + 日志抽屉
+    #   设计原则：设置项收进左栏（不常点），主区整块留给表格（常看常点），
+    #             状态与进度固定在底部，日志按需收起，尽量把纵向空间还给列表。
+    # ================================================================
+    def build_ui(self):
+        self.root.title("TG 频道批量退出工具")
+        self.root.minsize(1080, 680)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(2, weight=1)      # 第 2 行（主区）吃掉纵向空间
+        try:
+            self._default_theme = ttk.Style(self.root).theme_use()   # 浅色时恢复系统原生主题
+        except Exception:
+            self._default_theme = "vista"
+
+        self._build_header()        # row 0 工具栏 / row 1 登录验证条
+        self._build_body()          # row 2 左设置栏 | 右主区
+        self._build_statusbar()     # row 3 进度条 + 任务状态
+        self._build_log_panel()     # row 4 日志抽屉
+
+        self.on_proxy_toggle()
+        self._bind_shortcuts()
+
+        # 输入项改动即自动保存（API/手机号/代理/统计/筛选/退出节奏），避免每次重填；关窗时再兜底保存
+        for var in (self.api_id_var, self.api_hash_var, self.phone_var,
+                    self.proxy_enabled_var, self.proxy_type_var,
+                    self.proxy_host_var, self.proxy_port_var,
+                    self.proxy_user_var, self.proxy_pass_var,
+                    self.conc_var, self.ttl_var, self.cache_var,
+                    self.filter_members_var, self.filter_posts_var,
+                    self.filter_unknown_var,
+                    self.interval_var, self.jitter_var):
+            try:
+                var.trace_add("write", lambda *_a: self.save_config())
+            except Exception:
+                pass
+        self.refresh_cache_info()
+
+    # ---------------- 顶部工具栏 ----------------
+    def _build_header(self):
+        bar = ttk.Frame(self.root, padding=(10, 8, 10, 2))
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_columnconfigure(4, weight=1)         # 搜索框所在列吃掉多余宽度
+
+        self.btn_left_toggle = ttk.Button(bar, text="◧ 设置", width=9, command=self.toggle_left_panel)
+        self.btn_left_toggle.grid(row=0, column=0, padx=(0, 6))
+
+        # 连接状态：一眼看出是否已连上（登录态来自 session，有效时无需再输验证码）
+        self.status_var = tk.StringVar(value="⚪ 尚未连接")
+        self.lbl_status = ttk.Label(bar, textvariable=self.status_var, foreground="#7f8c8d")
+        self.lbl_status.grid(row=0, column=1, sticky="w", padx=(0, 12))
+
+        self.btn_connect = ttk.Button(bar, text="连接 / 登录", command=self.on_connect)
+        self.btn_connect.grid(row=0, column=2, padx=3)
+        self.btn_refresh = ttk.Button(bar, text="刷新列表", command=self.on_refresh, state="disabled")
+        self.btn_refresh.grid(row=0, column=3, padx=3)
+
+        # 搜索：输入即筛（250ms 防抖），回车立即生效，Esc/✕ 清空
+        sfrm = ttk.Frame(bar)
+        sfrm.grid(row=0, column=4, sticky="ew", padx=10)
+        ttk.Label(sfrm, text="🔍").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.ent_search = ttk.Entry(sfrm, textvariable=self.search_var)
+        self.ent_search.pack(side="left", fill="x", expand=True, padx=4)
+        self.search_var.trace_add("write", lambda *_a: self.on_search_changed())
+        self.ent_search.bind("<Return>", lambda e: self._apply_search(verbose=True))
+        self.btn_search_clear = ttk.Button(sfrm, text="✕", width=3, command=self.on_search_clear)
+        self.btn_search_clear.pack(side="left")
+        self.lbl_search_hit = ttk.Label(sfrm, text="", foreground="#6b7280")
+        self.lbl_search_hit.pack(side="left", padx=(6, 0))
+
+        ttk.Label(bar, text="类型:").grid(row=0, column=5, padx=(4, 2))
+        self.type_filter_var = tk.StringVar(value="全部")
+        self.cmb_type = ttk.Combobox(bar, textvariable=self.type_filter_var, state="readonly",
+                                     width=6, values=("全部", "频道", "群组"))
+        self.cmb_type.grid(row=0, column=6)
+        self.cmb_type.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
+
+        self.only_checked_var = tk.BooleanVar(value=False)
+        self.chk_only_checked = ttk.Checkbutton(bar, text="只看已勾选", variable=self.only_checked_var,
+                                                command=self.on_quick_filter_changed)
+        self.chk_only_checked.grid(row=0, column=7, padx=8)
+
+        # 统计与任务控制
+        self.btn_stats = ttk.Button(bar, text="获取 / 更新统计", command=self.on_fetch_stats, state="disabled")
+        self.btn_stats.grid(row=0, column=8, padx=3)
+        self.btn_stats_stop = ttk.Button(bar, text="停止统计", command=self.on_stop_stats, state="disabled")
+        self.btn_stats_stop.grid(row=0, column=9, padx=3)
+        self.btn_stop_all = ttk.Button(bar, text="⏹ 停止全部", command=self.on_stop_all)
+        self.btn_stop_all.grid(row=0, column=10, padx=3)
+        self.btn_log_toggle = ttk.Button(bar, text="🗒 日志", width=8, command=self.toggle_log_panel)
+        self.btn_log_toggle.grid(row=0, column=11, padx=(8, 0))
+
+        # 登录验证条：固定在界面上（不用弹窗，避免窗口被遮住时看不到输入框）
+        strip = ttk.Frame(self.root, padding=(10, 2, 10, 6))
+        strip.grid(row=1, column=0, sticky="ew")
+        self.code_prompt_var = tk.StringVar(value="尚未连接。")
+        ttk.Label(strip, textvariable=self.code_prompt_var, foreground="#c0392b").pack(side="left")
+        ttk.Label(strip, text="   验证码 / 两步密码:").pack(side="left")
+        self.code_var = tk.StringVar()
+        self.code_entry = ttk.Entry(strip, textvariable=self.code_var, width=26)
+        self.code_entry.pack(side="left", padx=4)
+        self.btn_code_submit = ttk.Button(strip, text="提交", command=self.on_submit_code, state="disabled")
+        self.btn_code_submit.pack(side="left", padx=2)
+        self.code_entry.bind("<Return>", lambda e: self.on_submit_code())
+
+    # ---------------- 主体：左设置栏 + 右主区 ----------------
+    def _build_body(self):
+        self.paned = ttk.PanedWindow(self.root, orient="horizontal")
+        self.paned.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 4))
+
+        self.panel_left = ttk.Frame(self.paned)
+        self.panel_main = ttk.Frame(self.paned)
+        self.paned.add(self.panel_left, weight=0)
+        self.paned.add(self.panel_main, weight=1)
+
+        nb = ttk.Notebook(self.panel_left)
+        nb.pack(fill="both", expand=True)
+        self.nb_settings = nb
+        self._tab_account(nb)
+        self._tab_network(nb)
+        self._tab_stats(nb)
+        self._tab_leave(nb)
+        self._tab_appearance(nb)
+
+        self._build_main_area(self.panel_main)
+
+    def _tab_account(self, nb):
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="账号")
+        f.grid_columnconfigure(1, weight=1)
+        ttk.Label(f, text="API ID").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.api_id_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.api_id_var).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(f, text="API HASH").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.api_hash_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.api_hash_var).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(f, text="手机号").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.phone_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.phone_var).grid(row=2, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(f, text="连接 / 登录", command=self.on_connect).grid(
+            row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=(10, 4))
+        ttk.Label(f, text="在 https://my.telegram.org 创建应用后获取 API ID / HASH。\n"
+                          "登录态保存在程序目录 tg_session.session，有效时无需重复输验证码。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+        self.lbl_session_info = ttk.Label(f, text="", foreground="#6b7280", wraplength=290, justify="left")
+        self.lbl_session_info.grid(row=5, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+        self.btn_clear_session = ttk.Button(f, text="删除登录态（切换账号）", command=self.on_clear_session)
+        self.btn_clear_session.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(10, 2))
+
+    def _tab_network(self, nb):
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="网络")
+        f.grid_columnconfigure(1, weight=1)
+        f.grid_columnconfigure(3, weight=1)
+        self.proxy_enabled_var = tk.BooleanVar(value=False)
+        self.chk_proxy = ttk.Checkbutton(f, text="启用代理", variable=self.proxy_enabled_var,
+                                         command=self.on_proxy_toggle)
+        self.chk_proxy.grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+
+        ttk.Label(f, text="类型").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.proxy_type_var = tk.StringVar(value="SOCKS5")
+        self.proxy_type_om = ttk.OptionMenu(f, self.proxy_type_var, "SOCKS5", "SOCKS5", "SOCKS4", "HTTP")
+        self.proxy_type_om.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(f, text="主机").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.proxy_host_var = tk.StringVar()
+        self.proxy_host_entry = ttk.Entry(f, textvariable=self.proxy_host_var)
+        self.proxy_host_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(f, text="端口").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        self.proxy_port_var = tk.StringVar()
+        self.proxy_port_entry = ttk.Entry(f, textvariable=self.proxy_port_var)
+        self.proxy_port_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(f, text="用户名").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        self.proxy_user_var = tk.StringVar()
+        self.proxy_user_entry = ttk.Entry(f, textvariable=self.proxy_user_var)
+        self.proxy_user_entry.grid(row=4, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(f, text="密码").grid(row=5, column=0, sticky="e", padx=4, pady=4)
+        self.proxy_pass_var = tk.StringVar()
+        self.proxy_pass_entry = ttk.Entry(f, textvariable=self.proxy_pass_var, show="*")
+        self.proxy_pass_entry.grid(row=5, column=1, sticky="ew", padx=4, pady=4)
+
+        self.btn_proxy_test = ttk.Button(f, text="测试代理（TCP + 出网到 Telegram）", command=self.on_proxy_test)
+        self.btn_proxy_test.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(10, 4))
+        ttk.Label(f, text="国内网络通常需要代理（如 127.0.0.1:7890）。\n"
+                          "测试会先连本地端口，再经代理访问 api.telegram.org:443。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+
+    def _tab_stats(self, nb):
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="统计")
+        f.grid_columnconfigure(1, weight=1)
+        ttk.Label(f, text="并发数").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.conc_var = tk.IntVar(value=6)
+        ttk.Spinbox(f, from_=1, to=32, textvariable=self.conc_var, width=6).grid(
+            row=0, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(f, text="缓存有效期(小时)").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.ttl_var = tk.IntVar(value=24)
+        ttk.Spinbox(f, from_=1, to=720, textvariable=self.ttl_var, width=6).grid(
+            row=1, column=1, sticky="w", padx=4, pady=4)
+        self.cache_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="使用本地统计缓存", variable=self.cache_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+        self.lbl_cache_info = ttk.Label(f, text="缓存 0 条", foreground="#6b7280", wraplength=290, justify="left")
+        self.lbl_cache_info.grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+        self.btn_clear_cache = ttk.Button(f, text="清空统计缓存", command=self.on_clear_stats_cache)
+        self.btn_clear_cache.grid(row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 2))
+        ttk.Label(f, text="「用户数 / 作品数」会对每个频道各发 1~2 次请求，\n"
+                          "并发越大越快、也越容易触发限流；命中缓存则完全不发请求。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+
+    def _tab_leave(self, nb):
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="退出")
+        f.grid_columnconfigure(1, weight=1)
+        ttk.Label(f, text="退出间隔(秒)").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.interval_var = tk.IntVar(value=2)
+        ttk.Spinbox(f, from_=1, to=120, textvariable=self.interval_var, width=6).grid(
+            row=0, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(f, text="随机抖动(秒)").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.jitter_var = tk.IntVar(value=0)
+        ttk.Spinbox(f, from_=0, to=60, textvariable=self.jitter_var, width=6).grid(
+            row=1, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(f, text="间隔 + 0~抖动 的随机等待，可降低被限流概率。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 8))
+
+        ttk.Separator(f, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(f, text="按关键词批量退\n（名称/用户名包含任一关键词即匹配，逗号或空格分隔）",
+                  wraplength=290, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", padx=4)
+        self.kw_var = tk.StringVar()
+        ttk.Entry(f, textvariable=self.kw_var).grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 4))
+        self.btn_kw_leave = ttk.Button(f, text="按关键词退出", command=self.on_kw_leave, state="disabled")
+        self.btn_kw_leave.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4)
+
+        # ---- 安全防护 ----
+        ttk.Separator(f, orient="horizontal").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        ttk.Label(f, text="安全防护", font=("", 9, "bold")).grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=4)
+        self.skip_protected_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="退出时自动跳过 白名单 / 创建者 / 管理员",
+                        variable=self.skip_protected_var).grid(
+            row=9, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+        self.detect_role_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="获取统计时顺带检测创建者 / 管理员\n（每个多 1 次请求，结果会被缓存）",
+                        variable=self.detect_role_var).grid(
+            row=10, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+        self.preview_leave_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="退出前显示待退出清单，确认后才执行",
+                        variable=self.preview_leave_var).grid(
+            row=11, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 6))
+        self.lbl_whitelist_info = ttk.Label(f, text="白名单 0 个频道（永不退出）",
+                                            foreground="#6b7280", wraplength=290, justify="left")
+        self.lbl_whitelist_info.grid(row=12, column=0, columnspan=2, sticky="w", padx=4)
+        self.btn_clear_whitelist = ttk.Button(f, text="清空白名单", command=self.clear_whitelist)
+        self.btn_clear_whitelist.grid(row=13, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 2))
+        ttk.Label(f, text="创建者 / 管理员在 Telegram 里无法直接退出（创建者需先转让或删除频道），\n"
+                          "不跳过会白跑一遍并报错。白名单用于标记「我就是要保留」的频道。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=14, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+
+    def _tab_appearance(self, nb):
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="外观")
+        f.grid_columnconfigure(0, weight=1)
+        self.dark_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="深色模式", variable=self.dark_var, command=self.on_toggle_theme).grid(
+            row=0, column=0, sticky="w", padx=4, pady=4)
+        self.remember_layout_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="记住窗口大小 / 列宽 / 面板开合", variable=self.remember_layout_var,
+                        command=self.save_config).grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self.btn_reset_layout = ttk.Button(f, text="恢复默认布局", command=self.on_reset_layout)
+        self.btn_reset_layout.grid(row=2, column=0, sticky="ew", padx=4, pady=(10, 4))
+        ttk.Label(f, text="快捷键：Ctrl+F 搜索 / Ctrl+A 全选 / 空格 勾选 / F5 刷新 / Esc 清搜索",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=3, column=0, sticky="w", padx=4, pady=(10, 2))
+
+    # ---------------- 右主区：筛选 + 表格 + 选择 + 退出 ----------------
+    def _build_main_area(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        # 1) 快捷筛选（分两行，避免窄窗口时被挤没）
+        frm_filter = ttk.LabelFrame(parent, text="快捷筛选（各条件之间是「且」的关系）", padding=7)
+        frm_filter.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self.frm_filter = frm_filter
+        row1 = ttk.Frame(frm_filter)
+        row1.pack(fill="x")
+        row2 = ttk.Frame(frm_filter)
+        row2.pack(fill="x", pady=(5, 0))
+
+        ttk.Label(row1, text="预设:").pack(side="left", padx=(2, 2))
+        self.filter_preset_var = tk.StringVar(value=FILTER_PRESETS[0][0])
+        self.filter_preset_cb = ttk.Combobox(
+            row1, textvariable=self.filter_preset_var, state="readonly", width=20,
+            values=[p[0] for p in FILTER_PRESETS] + [FILTER_CUSTOM],
+        )
+        self.filter_preset_cb.pack(side="left", padx=2)
+        self.filter_preset_cb.bind("<<ComboboxSelected>>", lambda e: self.on_filter_preset())
+
+        ttk.Label(row1, text="用户数 <").pack(side="left", padx=(12, 2))
+        self.filter_members_var = tk.StringVar()
+        ent_m = ttk.Entry(row1, textvariable=self.filter_members_var, width=7)
+        ent_m.pack(side="left", padx=2)
+        ent_m.bind("<Return>", lambda e: self.apply_filter())
+
+        ttk.Label(row1, text="作品数 <").pack(side="left", padx=(12, 2))
+        self.filter_posts_var = tk.StringVar()
+        ent_p = ttk.Entry(row1, textvariable=self.filter_posts_var, width=7)
+        ent_p.pack(side="left", padx=2)
+        ent_p.bind("<Return>", lambda e: self.apply_filter())
+
+        self.filter_unknown_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="隐藏统计未获取的行", variable=self.filter_unknown_var,
+                        command=self.apply_filter).pack(side="left", padx=12)
+
+        ttk.Button(row2, text="应用", command=self.apply_filter).pack(side="left", padx=2)
+        ttk.Button(row2, text="应用并全选", command=self.apply_filter_and_select_all).pack(side="left", padx=2)
+        ttk.Button(row2, text="清除", command=self.clear_filter).pack(side="left", padx=2)
+        ttk.Label(row2, text="提示：筛选生效时，「全选 / 反选」只作用于当前显示出来的行；"
+                            "被隐藏的勾选会用「清空全部」一并清掉。",
+                  foreground="#6b7280").pack(side="left", padx=(10, 2))
+
+        # 2) 列表（表格占满剩余空间，横向纵向都能滚）
+        frm_list = ttk.LabelFrame(parent, text="已订阅频道 / 群组（点「选择」列或按空格勾选要退出的）", padding=7)
+        frm_list.grid(row=2, column=0, sticky="nsew")
+        frm_list.grid_rowconfigure(0, weight=1)
+        frm_list.grid_columnconfigure(0, weight=1)
+
+        # 「safe」列放最后：按位置构造行值时不会挤动既有列（测试与旧代码都按前 7 个位置取值）
+        cols = ("sel", "name", "username", "type", "members", "posts", "id", "safe")
+        self.tree = ttk.Treeview(frm_list, columns=cols, show="headings", height=16, selectmode="extended")
+        self._col_titles = {"sel": "选择", "name": "名称", "username": "用户名",
+                            "type": "类型", "members": "用户数", "posts": "作品数", "id": "ID",
+                            "safe": "安全"}
+        # 受保护行的整行着色：白名单=蓝，创建者/管理员=红（一眼看出哪些不会 / 不能退出）
+        self.tree.tag_configure("wl", foreground="#185FA5")
+        self.tree.tag_configure("unleaveable", foreground="#a32d2d")
+        self._col_index = {c: i for i, c in enumerate(cols)}
+        for c, w, txt in (("sel", 50, "选择"), ("name", 220, "名称"),
+                          ("username", 160, "用户名"), ("type", 60, "类型"),
+                          ("members", 80, "用户数"), ("posts", 80, "作品数"),
+                          ("id", 110, "ID"), ("safe", 92, "安全")):
+            # 除「选择」列外，点列头即可排序（注意：ttk 不接受 command=None，需分支设置）
+            if c == "sel":
+                self.tree.heading(c, text=txt)
+            else:
+                self.tree.heading(c, text=txt, command=lambda cc=c: self.sort_by(cc))
+            self.tree.column(c, width=w, anchor="center" if c in ("sel", "type", "members", "posts", "safe") else "w")
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_click)
+
+        vsb = ttk.Scrollbar(frm_list, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(frm_list, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        # 3) 选择条
+        # 范围说明：筛选生效时「全选 / 反选」只作用于**当前显示出来的筛选结果**，
+        # 被隐藏的行既不会被勾上、也不会被反选；要连隐藏行一起清掉用「清空全部」。
+        frm_sel = ttk.Frame(parent)
+        frm_sel.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        self.btn_sel_all = ttk.Button(frm_sel, text="全选", command=self.select_all_visible)
+        self.btn_sel_all.pack(side="left", padx=3)
+        self.btn_sel_invert = ttk.Button(frm_sel, text="反选", command=self.invert)
+        self.btn_sel_invert.pack(side="left", padx=3)
+        ttk.Button(frm_sel, text="清空全部", command=lambda: self.set_all(False, scope="all")).pack(side="left", padx=3)
+        self.btn_whitelist = ttk.Button(frm_sel, text="🔒 白名单", command=self.on_toggle_whitelist_checked)
+        self.btn_whitelist.pack(side="left", padx=3)
+        self.hide_protected_var = tk.BooleanVar(value=False)
+        self.chk_hide_protected = ttk.Checkbutton(frm_sel, text="隐藏受保护项",
+                                                  variable=self.hide_protected_var,
+                                                  command=self.on_quick_filter_changed)
+        self.chk_hide_protected.pack(side="left", padx=(6, 0))
+        self.btn_export = ttk.Menubutton(frm_sel, text="导出 CSV ▾", state="disabled")
+        self._export_menu = tk.Menu(self.btn_export, tearoff=0)
+        self._export_menu.add_command(label="导出当前显示的行", command=lambda: self.on_export("visible"))
+        self._export_menu.add_command(label="导出全部（含被筛选隐藏）", command=lambda: self.on_export("all"))
+        self._export_menu.add_command(label="仅导出已勾选", command=lambda: self.on_export("checked"))
+        self.btn_export["menu"] = self._export_menu
+        self.btn_export.pack(side="left", padx=3)
+        self.lbl_count = ttk.Label(frm_sel, text="共 0 个，已选 0 个")
+        self.lbl_count.pack(side="right", padx=4)
+
+        # 4) 退出条（主操作，固定在列表下方）
+        frm_act = ttk.Frame(parent)
+        frm_act.grid(row=4, column=0, sticky="ew", pady=(5, 0))
+        self.btn_leave = ttk.Button(frm_act, text="🚪 退出选中频道", command=self.on_leave, state="disabled")
+        self.btn_leave.pack(side="left", padx=3)
+        self.lbl_pending = ttk.Label(frm_act, text="待退出 0 个")
+        self.lbl_pending.pack(side="left", padx=8)
+        ttk.Label(frm_act, text="退出间隔(秒):").pack(side="left", padx=(10, 2))
+        ttk.Spinbox(frm_act, from_=1, to=120, textvariable=self.interval_var, width=5).pack(side="left", padx=2)
+        ttk.Label(frm_act, text="随机抖动(秒):").pack(side="left", padx=(10, 2))
+        ttk.Spinbox(frm_act, from_=0, to=60, textvariable=self.jitter_var, width=5).pack(side="left", padx=2)
+
+    def _build_statusbar(self):
+        bar = ttk.Frame(self.root, padding=(10, 2, 10, 2))
+        bar.grid(row=3, column=0, sticky="ew")
+        self.progress = ttk.Progressbar(bar, mode="determinate", maximum=100, length=240)
+        self.progress.pack(side="left")
+        self.lbl_task = ttk.Label(bar, text="空闲")
+        self.lbl_task.pack(side="left", padx=8)
+        self.lbl_stats = ttk.Label(bar, text="")
+        self.lbl_stats.pack(side="right", padx=4)
+
+    def _build_log_panel(self):
+        self.frm_log = ttk.Frame(self.root, padding=(10, 2, 10, 8))
+        self.frm_log.grid(row=4, column=0, sticky="ew")
+        head = ttk.Frame(self.frm_log)
+        head.pack(fill="x")
+        ttk.Label(head, text="运行日志").pack(side="left")
+        ttk.Button(head, text="清空", width=6, command=self.on_clear_log).pack(side="left", padx=6)
+        ttk.Button(head, text="导出", width=6, command=self.on_export_log).pack(side="left")
+        self.log_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(head, text="自动滚动", variable=self.log_autoscroll_var).pack(side="left", padx=10)
+        ttk.Label(head, text="提示：退出间隔太短容易触发限流；日志区可用顶部「🗒 日志」收起。",
+                  foreground="#6b7280").pack(side="right")
+        self.log = scrolledtext.ScrolledText(self.frm_log, height=7, state="normal")
+        self.log.pack(fill="both", expand=True, pady=(3, 0))
+
+    # ---------------- 面板开合 ----------------
+    def toggle_left_panel(self):
+        self._set_left_panel(not getattr(self, "_left_visible", True))
+
+    def _left_in_paned(self):
+        """左栏是否已挂在分割窗里。
+        注意：不能用 winfo_ismapped() —— 窗口尚未完成映射时它恒为 0，
+        会导致「展开→收起」被跳过，面板看起来点不动。"""
+        try:
+            return str(self.panel_left) in set(self.paned.panes())
+        except Exception:
+            return bool(getattr(self, "_left_visible", True))
+
+    def _set_left_panel(self, visible):
+        try:
+            mounted = self._left_in_paned()
+            if visible and not mounted:
+                self.paned.insert(0, self.panel_left, weight=0)
+            elif not visible and mounted:
+                try:
+                    w = int(self.paned.sashpos(0))
+                    # 窗口尚未完成布局时 sashpos 可能返回 0/越界值，只在合理区间内才记录，
+                    # 否则会把用户拖出来的宽度覆盖成一个废值。
+                    if 200 < w < 1200:
+                        self._last_left_width = w
+                except Exception:
+                    pass
+                self.paned.forget(self.panel_left)
+        except Exception as e:
+            self.log_msg(f"❌ 切换设置栏失败: {e}")
+        self._left_visible = bool(visible)
+        try:
+            self.btn_left_toggle.configure(text="◧ 设置" if visible else "▸ 设置")
+        except Exception:
+            pass
+        if visible:
+            try:
+                w = int(self._last_left_width or 340)
+            except Exception:
+                w = 340
+            self.root.after(80, lambda: self._set_sash(max(240, min(620, w))))
+
+    def _set_sash(self, width):
+        try:
+            self.paned.sashpos(0, int(width))
+        except Exception:
+            pass
+
+    def toggle_log_panel(self):
+        self._set_log_panel(not getattr(self, "_log_visible", True))
+
+    def _set_log_panel(self, visible):
+        self._log_visible = bool(visible)
+        try:
+            if visible:
+                self.frm_log.grid()
+            else:
+                self.frm_log.grid_remove()
+            self.btn_log_toggle.configure(text="🗒 日志" if visible else "🗒 日志 ▸")
+        except Exception:
+            pass
+
+    # ---------------- 快捷键 ----------------
+    def _bind_shortcuts(self):
+        self.root.bind("<Control-a>", self._on_select_all_key)
+        self.root.bind("<Control-A>", self._on_select_all_key)
+        self.root.bind("<Control-f>", self._on_focus_search)
+        self.root.bind("<Control-F>", self._on_focus_search)
+        self.root.bind("<F5>", self._on_refresh_key)
+        self.root.bind("<Escape>", self._on_escape)
+        self.tree.bind("<space>", self._on_space_toggle)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+
+    def _on_focus_search(self, event=None):
+        try:
+            self.ent_search.focus_set()
+            self.ent_search.select_range(0, "end")
+        except Exception:
+            pass
+        return "break"
+
+    def _on_refresh_key(self, event=None):
+        self.on_refresh()
+        return "break"
+
+    def _on_escape(self, event=None):
+        if self.search_var.get():
+            self.on_search_clear()
+            return "break"
+        return None
+
+    def _on_space_toggle(self, event=None):
+        """空格：勾选 / 取消勾选当前高亮的行（支持多选）。"""
+        rows = list(self.tree.selection())
+        if not rows and self.tree.focus():
+            rows = [self.tree.focus()]
+        for iid in rows:
+            try:
+                if self.tree.exists(iid):
+                    self.tree.set(iid, "sel", "☐" if self._is_checked(iid) else "☑")
+                    self._sel_hidden.discard(iid)
+            except Exception:
+                pass
+        self.update_count()
+        self._maybe_apply_only_checked()
+        return "break"
+
+    # ---------------- 搜索 / 类型 / 只看已勾选 ----------------
+    def on_search_changed(self, *_a):
+        """输入即筛：250ms 防抖，避免每敲一个字符就重排一次表格。"""
+        try:
+            if self._search_after is not None:
+                self.root.after_cancel(self._search_after)
+        except Exception:
+            pass
+        try:
+            self._search_after = self.root.after(250, self._apply_search)
+        except Exception:
+            self._search_after = None
+
+    def _apply_search(self, verbose=False):
+        self._search_after = None
+        shown = self.apply_filter(verbose=False)
+        if verbose and self.search_var.get().strip():
+            self.log_msg(f"🔍 搜索「{self.search_var.get().strip()}」：命中 {shown} 个")
+
+    def on_search_clear(self):
+        self.search_var.set("")
+        self._apply_search()
+
+    def on_quick_filter_changed(self):
+        """类型下拉 / 只看已勾选：立即重新应用筛选。"""
+        self._only_checked = bool(self.only_checked_var.get())
+        self.apply_filter(verbose=True)
+
+    def _maybe_apply_only_checked(self):
+        """开启「只看已勾选」时，取消勾选的行应立即从视图里消失。"""
+        if getattr(self, "_only_checked", False):
+            self.apply_filter(verbose=False)
+
+    # ---------------- 任务进度 ----------------
+    def start_task(self, text):
+        self._task_start = time.time()
+        self.set_progress(0, 1, text, indeterminate=True)
+
+    def finish_task(self, text="空闲"):
+        el = ""
+        if self._task_start:
+            el = f"（耗时 {time.time() - self._task_start:.1f}s）"
+            self._task_start = None
+        self.set_progress(None, None, text + el)
+
+    def set_progress(self, done=None, total=None, text=None, indeterminate=False):
+        """更新底部进度条与任务文字。
+        total=None 或 indeterminate=True → 不确定进度（滚动条），其余按百分比。"""
+        try:
+            if indeterminate or (done is not None and total in (None, 0)):
+                if not self._progress_running:
+                    self.progress.configure(mode="indeterminate")
+                    self.progress.start(12)
+                    self._progress_running = True
+            else:
+                if self._progress_running:
+                    self.progress.stop()
+                    self._progress_running = False
+                if done is None:
+                    self.progress.configure(mode="determinate", value=0)
+                else:
+                    pct = 0 if not total else max(0, min(100, done * 100.0 / total))
+                    self.progress.configure(mode="determinate", value=pct)
+            if text is not None:
+                self.lbl_task.configure(text=text)
+        except Exception:
+            pass
+
+    def on_stop_all(self):
+        """一键停止：统计任务 + 列表分页加载。"""
+        stopped = []
+        try:
+            if self._stats_cancel is not None and not self._stats_cancel.is_set():
+                self._stats_cancel.set()
+                stopped.append("统计")
+        except Exception:
+            pass
+        try:
+            if self._list_cancel is not None and not self._list_cancel.is_set():
+                self._list_cancel.set()
+                stopped.append("列表加载")
+        except Exception:
+            pass
+        self.log_msg("⏹ 已请求停止：" + ("、".join(stopped) if stopped else "当前没有正在运行的任务。"))
+
+    # ---------------- 日志工具 ----------------
+    def on_clear_log(self):
+        try:
+            self.log.delete("1.0", "end")
+        except Exception:
+            pass
+
+    def on_export_log(self):
+        try:
+            content = self.log.get("1.0", "end").strip()
+        except Exception:
+            content = ""
+        if not content:
+            messagebox.showinfo("提示", "日志为空，无需导出。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("全部文件", "*.*")],
+            initialfile="tg_leave_log.txt",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
+            self.log_msg(f"✅ 日志已导出：{path}")
+            messagebox.showinfo("完成", f"日志已导出到：\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    # ---------------- 缓存 / 登录态 ----------------
+    def refresh_cache_info(self):
+        n = len(self._stats_cache or {})
+        size = 0
+        try:
+            size = os.path.getsize(STATS_CACHE_FILE)
+        except Exception:
+            size = 0
+        try:
+            self.lbl_cache_info.configure(text=f"本地缓存 {n} 条，文件 {size / 1024.0:.1f} KB（{STATS_CACHE_FILE}）")
+            self.btn_clear_cache.configure(state="normal" if n else "disabled")
+        except Exception:
+            pass
+        self._refresh_session_info()
+
+    def _refresh_session_info(self):
+        try:
+            p = SESSION_FILE + ".session"
+            if os.path.exists(p):
+                size = os.path.getsize(p) / 1024.0
+                self.lbl_session_info.configure(text=f"已保存登录态：{os.path.basename(p)}（{size:.0f} KB）")
+                self.btn_clear_session.configure(state="normal")
+            else:
+                self.lbl_session_info.configure(text="尚未保存登录态，首次登录需输入手机验证码。")
+                self.btn_clear_session.configure(state="disabled")
+        except Exception:
+            pass
+
+    def on_clear_stats_cache(self):
+        n = len(self._stats_cache or {})
+        if not messagebox.askyesno("确认", f"确定清空本地统计缓存（{n} 条）吗？\n清空后下次获取统计需要重新请求 Telegram。"):
+            return
+        self._stats_cache = {}
+        try:
+            if os.path.exists(STATS_CACHE_FILE):
+                os.remove(STATS_CACHE_FILE)
+        except Exception as e:
+            self.log_msg(f"⚠️ 删除缓存文件失败（不影响使用）：{e}")
+        self.refresh_cache_info()
+        self.log_msg(f"🧹 已清空统计缓存（{n} 条）。")
+
+    def on_clear_session(self):
+        p = SESSION_FILE + ".session"
+        if not os.path.exists(p):
+            messagebox.showinfo("提示", "当前没有已保存的登录态。")
+            return
+        if not messagebox.askyesno("确认", "确定删除已保存的登录态吗？\n删除后需要重新登录（会重新收到验证码）。"):
+            return
+        try:
+            if self.client is not None:
+                self.run_async(self.client.disconnect())
+        except Exception:
+            pass
+        removed = 0
+        for path in (p, SESSION_FILE + ".session-journal"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed += 1
+            except Exception as e:
+                self.log_msg(f"⚠️ 删除 {os.path.basename(path)} 失败：{e}")
+        self.refresh_cache_info()
+        self.log_msg(f"🗑 已删除登录态文件（{removed} 个）。请重新点「连接 / 登录」。")
+
+    # ---------------- 外观 / 布局 ----------------
+    def on_toggle_theme(self):
+        try:
+            self._apply_theme(bool(self.dark_var.get()))
+        except Exception as e:
+            self.log_msg(f"⚠️ 切换主题失败: {e}")
+        self.save_config()
+
+    def _apply_theme(self, dark=None):
+        """浅色保持系统原生主题；深色切到 clam 并统一配色（ttk 只有 clam 系列支持改底色）。"""
+        if dark is None:
+            dark = bool(getattr(self, "_dark", False))
+        self._dark = bool(dark)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam" if self._dark else self._default_theme)
+        except Exception:
+            pass
+        if self._dark:
+            bg, panel, fg, field, sel = "#1f2125", "#26282d", "#e8eaed", "#2c2f35", "#3a4450"
+            head, sub = "#2f3238", "#9aa0a6"
+        else:
+            bg, panel, fg, field, sel = "#f5f6f7", "#ffffff", "#1f2328", "#ffffff", "#cfe3ff"
+            head, sub = "#eaeef2", "#6b7280"
+        try:
+            style.configure(".", background=bg, foreground=fg, fieldbackground=field)
+            style.configure("TFrame", background=bg)
+            style.configure("TLabelframe", background=bg, bordercolor=head)
+            style.configure("TLabelframe.Label", background=bg, foreground=fg)
+            style.configure("TLabel", background=bg, foreground=fg)
+            style.configure("TButton", padding=(6, 3))
+            style.configure("TCheckbutton", background=bg, foreground=fg)
+            style.configure("TNotebook", background=bg, borderwidth=0)
+            style.configure("TNotebook.Tab", padding=(10, 4))
+            style.configure("TEntry", fieldbackground=field, foreground=fg)
+            style.configure("TCombobox", fieldbackground=field, foreground=fg)
+            style.configure("TSpinbox", fieldbackground=field, foreground=fg)
+            style.configure("Treeview", background=panel, fieldbackground=panel, foreground=fg, rowheight=22)
+            style.map("Treeview", background=[("selected", sel)], foreground=[("selected", fg)])
+            style.configure("Treeview.Heading", background=head, foreground=fg)
+            style.configure("Horizontal.TProgressbar", background="#3f6fb5")
+            self.root.configure(bg=bg)
+        except Exception:
+            pass
+        try:
+            self.log.configure(bg="#17191c" if self._dark else "#ffffff",
+                               fg=fg if self._dark else "#1f2328",
+                               insertbackground=fg)
+        except Exception:
+            pass
+
+    def on_reset_layout(self):
+        if not messagebox.askyesno("确认", "恢复默认布局（窗口大小 / 列宽 / 面板开合）？"):
+            return
+        cfg = self.config or {}
+        for k in ("win_geometry", "col_widths", "left_width", "left_visible", "log_visible"):
+            cfg.pop(k, None)
+        self.root.geometry("1200x780")
+        for c, w in (("sel", 50), ("name", 220), ("username", 160), ("type", 60),
+                     ("members", 80), ("posts", 80), ("id", 110), ("safe", 92)):
+            try:
+                self.tree.column(c, width=w)
+            except Exception:
+                pass
+        self._set_left_panel(True)
+        self._set_log_panel(True)
+        self.save_config()
+        self.log_msg("↩️ 已恢复默认布局。")
+
+    # ---------------- 表格右键菜单 ----------------
+    def on_tree_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid or iid not in self.channels:
+            return
+        try:
+            self.tree.selection_set(iid)
+        except Exception:
+            pass
+        self._ctx_iid = iid
+        if not hasattr(self, "_ctx_menu") or self._ctx_menu is None:
+            m = tk.Menu(self.root, tearoff=0)
+            m.add_command(label="勾选 / 取消勾选", command=self._ctx_toggle_checked)
+            m.add_command(label="加入 / 移出白名单（永不退出）", command=self._ctx_toggle_whitelist)
+            m.add_separator()
+            m.add_command(label="复制名称", command=lambda: self._ctx_copy("name"))
+            m.add_command(label="复制用户名", command=lambda: self._ctx_copy("username"))
+            m.add_command(label="复制 ID", command=lambda: self._ctx_copy("id"))
+            m.add_command(label="复制 t.me 链接", command=self._ctx_copy_link)
+            m.add_command(label="在浏览器打开", command=self._ctx_open_link)
+            m.add_separator()
+            m.add_command(label="只看该类型", command=self._ctx_filter_type)
+            m.add_command(label="搜索该名称", command=self._ctx_search_name)
+            m.add_separator()
+            m.add_command(label="只退出这一个", command=self._ctx_leave_one)
+            self._ctx_menu = m
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self._ctx_menu.grab_release()
+            except Exception:
+                pass
+
+    def _ctx_row(self):
+        iid = getattr(self, "_ctx_iid", None)
+        if not iid or not self.tree.exists(iid):
+            return None, {}
+        return iid, {c: str(self.tree.set(iid, c) or "") for c in ("name", "username", "type", "id")}
+
+    def _ctx_toggle_checked(self):
+        iid, _ = self._ctx_row()
+        if not iid:
+            return
+        self.tree.set(iid, "sel", "☐" if self._is_checked(iid) else "☑")
+        self._sel_hidden.discard(iid)
+        self.update_count()
+        self._maybe_apply_only_checked()
+
+    def _ctx_copy(self, col):
+        iid, vals = self._ctx_row()
+        if not iid:
+            return
+        text = vals.get(col, "")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log_msg(f"📋 已复制{self._col_titles.get(col, col)}: {text}")
+
+    def _tme_link(self, iid):
+        ent = self.channels.get(iid)
+        uname = str(self.tree.set(iid, "username") or "").strip().lstrip("@")
+        if uname:
+            return f"https://t.me/{uname}"
+        cid = getattr(ent, "id", None) or self.tree.set(iid, "id")
+        return f"https://t.me/c/{cid}"
+
+    def _ctx_copy_link(self):
+        iid, _ = self._ctx_row()
+        if not iid:
+            return
+        link = self._tme_link(iid)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(link)
+        self.log_msg(f"📋 已复制链接: {link}")
+
+    def _ctx_open_link(self):
+        iid, _ = self._ctx_row()
+        if not iid:
+            return
+        import webbrowser
+        link = self._tme_link(iid)
+        try:
+            webbrowser.open(link)
+            self.log_msg(f"🌐 已用浏览器打开: {link}")
+        except Exception as e:
+            self.log_msg(f"❌ 打开链接失败: {e}")
+
+    def _ctx_toggle_whitelist(self):
+        iid, _ = self._ctx_row()
+        if iid:
+            self.toggle_whitelist([iid])
+
+    def _ctx_filter_type(self):
+        iid, vals = self._ctx_row()
+        if not iid:
+            return
+        t = vals.get("type") or "全部"
+        if t not in ("频道", "群组"):
+            t = "全部"
+        self.type_filter_var.set(t)
+        self.on_quick_filter_changed()
+
+    def _ctx_search_name(self):
+        iid, vals = self._ctx_row()
+        if not iid:
+            return
+        self.search_var.set(vals.get("name", ""))
+        self._apply_search(verbose=True)
+
+    def _ctx_leave_one(self):
+        iid, vals = self._ctx_row()
+        if not iid:
+            return
+        self.leave_items([iid])
+
+    def apply_config_to_ui(self):
+        # 注意：set 这些变量会触发自动保存，而自动保存会改写 self.config。
+        # 因此先取一份本地快照，后续一律从快照读，避免"恢复过程中配置被自己覆盖"。
+        cfg = dict(self.config or {})
+        self.api_id_var.set(cfg.get("api_id", ""))
+        self.api_hash_var.set(cfg.get("api_hash", ""))
+        self.phone_var.set(cfg.get("phone", ""))
+        self.proxy_enabled_var.set(cfg.get("proxy_enabled", False))
+        self.proxy_type_var.set(cfg.get("proxy_type", "SOCKS5"))
+        self.proxy_host_var.set(cfg.get("proxy_host", ""))
+        self.proxy_port_var.set(cfg.get("proxy_port", ""))
+        self.proxy_user_var.set(cfg.get("proxy_user", ""))
+        self.proxy_pass_var.set(cfg.get("proxy_pass", ""))
+        self.conc_var.set(cfg.get("stats_concurrency", 6) or 6)
+        self.ttl_var.set(cfg.get("stats_ttl_hours", 24) or 24)
+        self.cache_var.set(cfg.get("stats_use_cache", True))
+        # 退出节奏
+        self.interval_var.set(cfg.get("leave_interval", 2) or 2)
+        self.jitter_var.set(cfg.get("leave_jitter", 0) or 0)
+        # 筛选条件（仅回填界面，列表加载后由 _append_rows 自动套用）
+        self.filter_members_var.set(str(cfg.get("filter_members_lt", "") or ""))
+        self.filter_posts_var.set(str(cfg.get("filter_posts_lt", "") or ""))
+        self.filter_unknown_var.set(bool(cfg.get("filter_hide_unknown", True)))
+        self._sync_filter_preset_name()
+        # 安全防护
+        self.skip_protected_var.set(bool(cfg.get("skip_protected", True)))
+        self.detect_role_var.set(bool(cfg.get("detect_roles", True)))
+        self.preview_leave_var.set(bool(cfg.get("preview_before_leave", True)))
+        self.hide_protected_var.set(bool(cfg.get("hide_protected", False)))
+        # 外观与布局
+        self.remember_layout_var.set(bool(cfg.get("remember_layout", True)))
+        self.dark_var.set(bool(cfg.get("dark_mode", False)))
+        self._apply_theme(bool(self.dark_var.get()))
+        self._apply_ui_layout(cfg)
+        self.refresh_cache_info()
+        self.refresh_whitelist_info()
+        self._refresh_all_safe_cells()
+
+    # ---------------- 界面状态持久化 ----------------
+    def _apply_ui_layout(self, cfg=None):
+        """恢复上次的窗口大小 / 位置 / 列宽 / 面板开合。"""
+        cfg = dict(cfg if cfg is not None else (self.config or {}))
+        if not cfg.get("remember_layout", True):
+            return
+        geo = str(cfg.get("win_geometry", "") or "")
+        if re.match(r"^\d+x\d+([+-]\d+[+-]\d+)?$", geo):
+            try:
+                self.root.geometry(geo)
+            except Exception:
+                pass
+        widths = cfg.get("col_widths") or {}
+        if isinstance(widths, dict):
+            for c, w in widths.items():
+                if c in self._col_index:
+                    try:
+                        self.tree.column(c, width=max(40, int(w)))
+                    except Exception:
+                        pass
+        try:
+            self._last_left_width = int(cfg.get("left_width", 340) or 340)
+        except Exception:
+            self._last_left_width = 340
+        self._set_left_panel(bool(cfg.get("left_visible", True)))
+        self._set_log_panel(bool(cfg.get("log_visible", True)))
+
+    def _ui_state(self):
+        """收集需要持久化的界面状态（记住布局关闭时返回空，避免写入脏数据）。"""
+        st = {}
+        if not bool(getattr(self, "remember_layout_var", None) and self.remember_layout_var.get()):
+            return st
+        try:
+            if self.root.state() == "normal":
+                st["win_geometry"] = self.root.geometry()
+                if str(st["win_geometry"]).startswith("1x1"):
+                    st.pop("win_geometry", None)   # 窗口尚未映射时 geometry() 是 1x1+0+0，忽略
+        except Exception:
+            pass
+        try:
+            st["col_widths"] = {c: int(self.tree.column(c, "width")) for c in self._col_index}
+        except Exception:
+            pass
+        try:
+            w = int(self.paned.sashpos(0)) if self._left_visible else int(self._last_left_width or 340)
+            st["left_width"] = w if 200 < w < 900 else 340
+        except Exception:
+            st["left_width"] = 340
+        st["left_visible"] = bool(self._left_visible)
+        st["log_visible"] = bool(self._log_visible)
+        return st
+
+    # ---------------- 工具方法 ----------------
+    def log_msg(self, msg):
+        # 镜像到 stderr：调试版(--console)能实时看到日志，便于定位“没反应”问题
+        if sys.stderr is not None:
+            try:
+                print(msg, file=sys.stderr, flush=True)
+            except Exception:
+                pass
+        self.root.after(0, lambda: self._log(msg))
+
+    def _log(self, msg):
+        try:
+            self.log.insert("end", msg + "\n")
+            if getattr(self, "log_autoscroll_var", None) is None or self.log_autoscroll_var.get():
+                self.log.see("end")
+            # 日志过长时裁掉最前面的旧内容，避免长时间运行后界面变卡
+            try:
+                if int(str(self.log.index("end-1c")).split(".")[0]) > 4000:
+                    self.log.delete("1.0", "1500.0")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ---------------- 登录验证（界面内嵌输入框，避免弹窗不可见）----------------
+    def enable_code_input(self, prompt_text, fut):
+        """在主线程启用验证码/密码输入框，并绑定 future 等待用户提交。"""
+        self.code_future = fut
+        self.code_prompt_var.set(prompt_text)
+        self.code_var.set("")
+        self.code_entry.configure(state="normal")
+        self.btn_code_submit.configure(state="normal")
+        self.code_entry.focus_set()
+
+    def disable_code_input(self, text="验证完成，等待下一步。"):
+        self.code_entry.configure(state="disabled")
+        self.btn_code_submit.configure(state="disabled")
+        self.code_prompt_var.set(text)
+
+    def set_status(self, text, color="#7f8c8d"):
+        """更新顶部连接状态栏（灰=未连 / 橙=连接中 / 绿=已连 / 红=失败）。"""
+        self.status_var.set(text)
+        try:
+            self.lbl_status.configure(foreground=color)
+        except Exception:
+            pass
+
+    def on_submit_code(self):
+        if self.code_future is None or self.code_future.done():
+            return
+        val = self.code_var.get().strip()
+        if not val:
+            messagebox.showwarning("提示", "请输入验证码或密码后再提交。")
+            return
+        self.code_var.set("")
+        self.disable_code_input()
+        fut = self.code_future
+        self.code_future = None
+        try:
+            self.loop.call_soon_threadsafe(fut.set_result, val)
+        except Exception as e:
+            self.log_msg(f"❌ 提交验证码失败: {e}")
+
+    def validate_inputs(self):
+        try:
+            api_id = int(self.api_id_var.get().strip())
+        except Exception:
+            messagebox.showerror("错误", "API ID 必须为数字，请在 my.telegram.org 获取。")
+            return None
+        api_hash = self.api_hash_var.get().strip()
+        phone = self.phone_var.get().strip()
+        if not api_hash or not phone:
+            messagebox.showerror("错误", "请填写 API HASH 和手机号。")
+            return None
+        return api_id, api_hash, phone
+
+    # ---------------- 事件循环线程 ----------------
+    def ensure_loop(self):
+        if self.loop is None:
+            def runner():
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                self.loop.run_forever()
+
+            threading.Thread(target=runner, daemon=True).start()
+            while self.loop is None:
+                time.sleep(0.02)
+
+    def run_async(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    # ---------------- 连接 / 登录 ----------------
+    def build_proxy(self):
+        """在主线程构建代理元组；未启用返回 None，字段非法返回 "INVALID"。
+
+        类型用字符串 socks5/socks4/http，Telethon 两种代理分支都识别。
+        """
+        if not self.proxy_enabled_var.get():
+            return None
+        host = self.proxy_host_var.get().strip()
+        try:
+            port = int(self.proxy_port_var.get().strip())
+        except Exception:
+            messagebox.showerror("错误", "代理端口必须为数字。")
+            return "INVALID"
+        if not host:
+            messagebox.showerror("错误", "请填写代理主机地址。")
+            return "INVALID"
+        ptype = PROXY_TYPES.get(self.proxy_type_var.get(), "socks5")
+        user = self.proxy_user_var.get().strip()
+        pwd = self.proxy_pass_var.get().strip()
+        if user and pwd:
+            return (ptype, host, port, user, pwd)
+        return (ptype, host, port)
+
+    def on_proxy_toggle(self):
+        state = "normal" if self.proxy_enabled_var.get() else "disabled"
+        for w in (self.proxy_type_om, self.proxy_host_entry, self.proxy_port_entry,
+                  self.proxy_user_entry, self.proxy_pass_entry, self.btn_proxy_test):
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+
+    def on_proxy_test(self):
+        if not self.proxy_enabled_var.get():
+            messagebox.showinfo("提示", "请先勾选「启用代理」再测试。")
+            return
+        proxy = self.build_proxy()
+        if proxy == "INVALID":
+            return
+        ptype, host, port = proxy[0], proxy[1], proxy[2]
+        user = proxy[3] if len(proxy) > 3 else ""
+        pwd = proxy[4] if len(proxy) > 4 else ""
+        self.btn_proxy_test.configure(state="disabled")
+        self.log_msg(f"正在测试代理 {host}:{port}（TCP 连通 + 出网到 Telegram）...")
+        self.ensure_loop()
+        self.run_async(self._test_proxy(ptype, host, port, user, pwd))
+
+    async def _test_proxy(self, ptype, host, port, user, pwd):
+        import socket
+
+        # ---- 第 1 步：本地代理端口 TCP 连通 ----
+        try:
+            def tcp_blocking():
+                s = socket.create_connection((host, port), timeout=8)
+                s.close()
+                return True
+
+            tcp_ok = await self.loop.run_in_executor(None, tcp_blocking)
+            tcp_err = ""
+        except Exception as e:
+            tcp_ok = False
+            tcp_err = str(e)
+
+        if not tcp_ok:
+            self.log_msg(f"❌ 代理 {host}:{port} TCP 不可达：{tcp_err}")
+            self.log_msg("   请确认代理软件已启动、端口填写正确（如 Clash 默认 7890）。")
+            self.root.after(0, lambda: messagebox.showerror(
+                "测试失败", f"代理端口 {host}:{port} 不可达：\n{tcp_err}\n\n请确认代理软件已启动、端口正确。"))
+            self.root.after(0, lambda: self.btn_proxy_test.configure(state="normal"))
+            return
+
+        # ---- 第 2 步：真实地经代理出网到 Telegram ----
+        try:
+            def net_blocking():
+                from python_socks.sync import Proxy
+                auth = f"{user}:{pwd}@" if user and pwd else ""
+                url = f"{ptype}://{auth}{host}:{port}"
+                p = Proxy.from_url(url)
+                sock = p.connect(dest_host="api.telegram.org", dest_port=443, timeout=12)
+                import ssl
+                ctx = ssl.create_default_context()
+                ssock = ctx.wrap_socket(sock, server_hostname="api.telegram.org")
+                ssock.sendall(
+                    b"GET / HTTP/1.1\r\nHost: api.telegram.org\r\n"
+                    b"User-Agent: tg-tool\r\nConnection: close\r\n\r\n"
+                )
+                data = b""
+                while True:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if len(data) > 1500:
+                        break
+                ssock.close()
+                return data
+
+            data = await self.loop.run_in_executor(None, net_blocking)
+            net_ok = b"HTTP" in data[:20] or len(data) > 0
+            net_err = ""
+        except Exception as e:
+            net_ok = False
+            net_err = str(e)
+
+        if net_ok:
+            self.log_msg(f"✅ 代理 {host}:{port} TCP 可连通，且能经代理访问 Telegram 外网。可以连接。")
+            self.root.after(0, lambda: messagebox.showinfo(
+                "测试结果", f"代理 {host}:{port} 可正常访问 Telegram 外网。\n可以点击「连接/登录」了。"))
+        else:
+            self.log_msg(f"❌ 代理 {host}:{port} 端口虽通，但无法经其访问 Telegram 外网：{net_err}")
+            self.log_msg("⚠ 请检查：①代理软件的节点/分流规则是否放行 Telegram；"
+                         "②在「类型」里把 SOCKS5 与 HTTP 切换后再试；③确认该节点本身能上 Telegram。")
+            self.root.after(0, lambda: messagebox.showerror(
+                "测试失败",
+                f"代理端口可连，但出网到 Telegram 失败：\n{net_err}\n\n"
+                f"请检查代理节点/规则，或把「类型」在 SOCKS5 与 HTTP 之间切换后重试。"))
+        self.root.after(0, lambda: self.btn_proxy_test.configure(state="normal"))
+
+    def schedule_auto_connect(self):
+        """启动时若「凭据完整」且「已保存登录态」，则自动连接。
+        因为 session 已存在，Telethon 会直接复用登录态，通常无需验证码。"""
+        cfg = self.config or {}
+        has_creds = bool(str(cfg.get("api_id", "")).strip()
+                         and str(cfg.get("api_hash", "")).strip()
+                         and str(cfg.get("phone", "")).strip())
+        if not has_creds:
+            self.set_status("⚪ 尚未连接（请填写 API 信息后点「连接/登录」）", "#7f8c8d")
+            return
+        if not os.path.exists(SESSION_FILE + ".session"):
+            self.set_status("⚪ 尚未连接（无登录态，点「连接/登录」后需输入验证码）", "#7f8c8d")
+            return
+        self.log_msg("检测到已保存的登录态，正在自动连接 ...（session 有效则无需输入验证码）")
+        self.set_status("⏳ 正在自动连接 ...", "#e67e22")
+        self.root.after(200, self.on_connect)
+
+    def on_connect(self):
+        v = self.validate_inputs()
+        if not v:
+            return
+        api_id, api_hash, phone = v
+        proxy = self.build_proxy()
+        if proxy == "INVALID":
+            return
+        self.save_config()
+        self.btn_connect.configure(state="disabled")
+        self.set_status("⏳ 正在连接 Telegram ...", "#e67e22")
+        if proxy:
+            self.log_msg(f"正在连接 Telegram ...（经代理 {proxy[1]}:{proxy[2]}）")
+        else:
+            self.log_msg("正在连接 Telegram ...（⚠ 未启用代理：直连可能被网络限制拦截，建议上方先配置并测试代理）")
+        self.ensure_loop()
+        future = self.run_async(self._connect(api_id, api_hash, phone, proxy))
+        future.add_done_callback(self._on_connect_done)
+
+    def _on_connect_done(self, future):
+        try:
+            future.result()
+        except OperationCancelled:
+            self.log_msg("❌ 已取消登录。")
+            self.root.after(0, lambda: self.btn_connect.configure(state="normal"))
+            self.root.after(0, lambda: self.set_status("🔴 未连接（已取消登录）", "#c0392b"))
+        except Exception as e:
+            self.log_msg(f"❌ 连接失败: {e}")
+            self.root.after(0, lambda: self.btn_connect.configure(state="normal"))
+            self.root.after(0, lambda: self.set_status(
+                f"🔴 未连接：{type(e).__name__}（点「连接/登录」可重试）", "#c0392b"))
+
+    async def _connect(self, api_id, api_hash, phone, proxy):
+        if proxy:
+            self.log_msg(f"🔌 通过代理 {proxy[1]}:{proxy[2]} 连接 Telegram ...")
+        else:
+            self.log_msg("⚠ 未启用代理：直连可能因网络限制失败，建议先配置并测试代理。")
+        client = TelegramClient(
+            SESSION_FILE, api_id, api_hash, proxy=proxy,
+            connection_retries=3, timeout=15,
+        )
+        self.log_msg("正在连接 Telegram 数据中心 ...（若长时间无响应，多为代理无法访问 Telegram 或网络限制）")
+
+        async def code_cb():
+            fut = self.loop.create_future()
+            self.root.after(0, lambda: self.enable_code_input("📩 请输入手机收到的验证码：", fut))
+            return await fut
+
+        async def pw_cb():
+            fut = self.loop.create_future()
+            self.root.after(0, lambda: self.enable_code_input("🔑 请输入两步验证密码：", fut))
+            return await fut
+
+        try:
+            await client.start(phone=phone, code_callback=code_cb, password=pw_cb)
+        except OperationCancelled:
+            raise
+        except Exception as e:
+            self.log_msg(f"❌ 连接/登录失败: {type(e).__name__} - {e}")
+            emsg = str(e)
+            if ("IncompleteReadError" in emsg or "Server closed the connection" in emsg
+                    or "0 bytes read" in emsg or "ConnectionReset" in emsg):
+                self.log_msg("⚠ 诊断：代理端口虽能连通，但无法经代理访问 Telegram 数据中心。"
+                             "常见原因与对策：")
+                self.log_msg("   1) 代理软件的节点/分流规则未放行 Telegram —— 先用浏览器或 TG 桌面端确认能上；")
+                self.log_msg("   2) 在「代理设置」里把「类型」在 SOCKS5 与 HTTP 之间切换后再连；")
+                self.log_msg("   3) 点「测试代理」确认能出网到 Telegram（新版本已支持真实出网测试）。")
+            raise
+        self.client = client
+        self.log_msg("✅ 登录成功！")
+        # 取账号信息，让状态栏显示到底登的是谁
+        who = ""
+        try:
+            me = await client.get_me()
+            who = (getattr(me, "username", None) or getattr(me, "first_name", None)
+                   or (("+" + me.phone) if getattr(me, "phone", None) else "")
+                   or str(getattr(me, "id", "")))
+        except Exception:
+            pass
+        status_text = f"🟢 已连接：{who}" if who else "🟢 已连接（登录态有效）"
+        self.root.after(0, lambda t=status_text: self.set_status(t, "#27ae60"))
+        self.root.after(0, lambda: self.disable_code_input("✅ 已登录成功，无需再输入验证码。"))
+        self.root.after(0, lambda: (
+            self.btn_refresh.configure(state="normal"),
+            self.btn_leave.configure(state="normal"),
+            self.btn_kw_leave.configure(state="normal"),
+            self.btn_export.configure(state="normal"),
+            self.on_refresh(),
+        ))
+
+    # ---------------- 刷新频道 ----------------
+    def on_refresh(self):
+        if not self.client:
+            return
+        self.log_msg("正在获取频道列表 ...")
+        self.run_async(self._refresh())
+
+    async def _refresh(self):
+        """分页拉取全部会话，每满一页就在界面追加显示（大账号也能渐进看到结果）。"""
+        self._list_cancel.clear()      # 新任务开始：清掉上一轮遗留的停止信号
+        self.root.after(0, lambda: self.start_task("正在加载频道列表…"))
+        try:
+            self.log_msg("正在获取频道 / 群组列表（分页加载）...")
+            self.root.after(0, self._begin_list)
+            page = []
+            scanned = 0
+            found = 0
+            gen = self.client.iter_dialogs(limit=None)
+            try:
+                async for d in gen:
+                    if self._list_cancel.is_set():
+                        self.log_msg(f"⏹ 已停止获取列表（已扫描 {scanned} 个会话）。")
+                        break
+                    ent = d.entity
+                    scanned += 1
+                    if isinstance(ent, Channel):
+                        title = getattr(ent, "title", "") or ""
+                        uname = getattr(ent, "username", None) or ""
+                        typ = "频道" if ent.broadcast else "群组"
+                        page.append((ent, title, uname, typ, ent.id))
+                    if len(page) >= DIALOG_PAGE:
+                        b, page = page, []
+                        found += len(b)
+                        self.root.after(0, lambda b=b, s=scanned: self._append_rows(b, s))
+                        n, s = found, scanned
+                        self.root.after(0, lambda n=n, s=s: self.set_progress(
+                            n, None, f"正在加载列表：已加载 {n} 个（已扫描 {s} 个会话）"))
+                else:
+                    if page:
+                        b, page = page, []
+                        found += len(b)
+                        self.root.after(0, lambda b=b, s=scanned: self._append_rows(b, s))
+                    self.log_msg(f"✅ 列表加载完成：扫描 {scanned} 个会话，其中频道 / 群组 {found} 个。")
+            finally:
+                # 主动关闭分页生成器，避免“coroutine was never awaited”之类的告警
+                aclose = getattr(gen, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
+        except OperationCancelled:
+            self.log_msg("⏹ 已停止获取列表。")
+        except Exception as e:
+            self.log_msg(f"❌ 获取频道失败: {e}")
+        finally:
+            self._list_cancel.clear()
+            self.root.after(0, self._finish_list)
+
+    def _begin_list(self):
+        self._tree_epoch += 1          # 废弃上一轮尚未完成的后台回填任务
+        self._sort_col, self._sort_rev = None, False   # 新列表重置排序状态
+        # 注意：被筛选隐藏的行不在 get_children() 里，必须按 channels 的键全删，避免残留幽灵项
+        for iid in list(self.channels):
+            try:
+                self.tree.delete(iid)
+            except Exception:
+                pass
+        for iid in self.tree.get_children():
+            try:
+                self.tree.delete(iid)
+            except Exception:
+                pass
+        self.channels.clear()
+        self._row_order = []
+        self._visible = set()
+        self._sel_hidden = set()
+        self._role = {}             # 行 id 变了，角色映射随之作废（白名单按频道 id 存，不受影响）
+        self.update_count()
+        self._refresh_headings()
+
+    def _tree_columns(self):
+        """真实列名元组。测试桩用的是 7 列 Treeview，按实际列构造行值可自动兼容。"""
+        try:
+            cols = self.tree.cget("columns")
+            return tuple(str(c) for c in cols) if cols else tuple(self._col_index)
+        except Exception:
+            return tuple(self._col_index)
+
+    def _row_values(self, title, uname, typ, cid, sel="☐"):
+        cell = {"sel": sel, "name": title, "username": uname, "type": typ,
+                "members": "…", "posts": "…", "id": cid, "safe": ""}
+        return tuple(cell.get(c, "") for c in self._tree_columns())
+
+    def _append_rows(self, rows, scanned=None):
+        for ent, title, uname, typ, cid in rows:
+            try:
+                vals = self._row_values(title, uname, typ, cid)
+            except Exception:
+                # 测试桩（列更少 / 无 _col_index）走这条简单回退路径
+                vals = ("☐", title, uname, typ, "…", "…", cid)
+            iid = self.tree.insert("", "end", values=vals)
+            self.channels[iid] = ent
+            self._row_order.append(iid)
+            self._visible.add(iid)
+            try:
+                # 角色缓存按频道 id 命中，插入时就能标出创建者/管理员，不必等统计跑完
+                self._prime_role(iid, ent)
+                self._refresh_safe_cell(iid)
+            except Exception:
+                pass
+        if self._filter_active:
+            self.apply_filter(verbose=False)      # 新行按当前筛选条件决定是否显示
+        else:
+            self.update_count()
+        self.lbl_stats.configure(
+            text=f"已加载 {len(self.channels)} 个" + (f"（已扫描 {scanned} 个会话）" if scanned else "")
+        )
+
+    def _finish_list(self):
+        n = len(self.channels)
+        if n == 0:
+            self.lbl_stats.configure(text="")
+            self.finish_task("空闲（列表为空）")
+            return
+        if self._filter_active and not self.tree.get_children():
+            self.log_msg("ℹ️ 当前筛选条件下暂无可显示的行：统计获取完成前多为未获取状态，"
+                         "可取消勾选「隐藏统计未获取的行」，或等统计跑完。")
+        self.finish_task(f"列表加载完成：{n} 个频道 / 群组")
+        self.log_msg(f"已加载 {n} 个频道 / 群组，开始获取用户数 / 作品数 ...")
+        self.run_async(self._fetch_stats(self._tree_epoch, force=False))
+
+    def populate(self, items):
+        """保留的兼容入口：一次性填表（供内部/测试调用）。"""
+        self._begin_list()
+        self._append_rows(items)
+        self._finish_list()
+
+    # ---------------- 安全防护：白名单 / 创建者 / 管理员 ----------------
+    # 为什么需要：
+    #   1) 创建者与管理员**退不出去**（Telegram 不允许），不提前识别就会白跑一遍并报错；
+    #   2) 有些频道虽然能退，但用户不想退 —— 白名单把它们标记为「永不退出」。
+    # 三者统一用 protected_reason() 判定：返回原因字符串即受保护，返回 None 才允许退出。
+    def _wl(self):
+        """白名单集合（对测试桩/早期调用做懒初始化）。"""
+        return whitelist_of(self)
+
+    def _cid_of(self, iid):
+        """取该行对应的频道 id（字符串）；取不到返回空串。"""
+        try:
+            cid = getattr((getattr(self, "channels", None) or {}).get(iid), "id", None)
+            if cid is None:
+                cid = self.tree.set(iid, "id")
+        except Exception:
+            cid = None
+        return str(cid).strip() if cid is not None else ""
+
+    def is_whitelisted(self, iid):
+        cid = self._cid_of(iid)
+        return bool(cid) and cid in self._wl()
+
+    def _role_of(self, iid):
+        return (getattr(self, "_role", None) or {}).get(iid, "")
+
+    def protected_reason(self, iid):
+        """该行受保护的原因（白名单 / 创建者 / 管理员）；不受保护返回 None。"""
+        if self.is_whitelisted(iid):
+            return "白名单"
+        r = self._role_of(iid)
+        return ROLE_LABEL.get(r) if r in ROLE_LABEL else None
+
+    def _prime_role(self, iid, ent):
+        """插入行时按频道 id 命中角色缓存，立刻标出创建者/管理员（不必等统计跑完）。"""
+        try:
+            c = (getattr(self, "_role_cache", None) or {}).get(str(getattr(ent, "id", "")))
+            if isinstance(c, list) and c:
+                if getattr(self, "_role", None) is None:
+                    self._role = {}
+                self._role[iid] = c[0]
+        except Exception:
+            pass
+
+    def _refresh_safe_cell(self, iid):
+        """重画「安全」列并按状态整行着色。桩树没有该列时静默跳过。"""
+        try:
+            reason = self.protected_reason(iid)
+        except Exception:
+            return
+        try:
+            if "safe" in self._tree_columns():
+                if reason == "白名单":
+                    txt = "🔒 白名单"
+                else:
+                    txt = reason or ""
+                self.tree.set(iid, "safe", txt)
+        except Exception:
+            pass
+        try:
+            if reason == "白名单":
+                self.tree.item(iid, tags=("wl",))
+            elif reason:
+                self.tree.item(iid, tags=("unleaveable",))
+            else:
+                self.tree.item(iid, tags=())
+        except Exception:
+            pass
+
+    def _refresh_all_safe_cells(self):
+        for iid in list(self.channels):
+            self._refresh_safe_cell(iid)
+
+    def set_whitelist(self, iids, on):
+        """批量加入 / 移出白名单。返回实际改动的条数。"""
+        wl = self._wl()
+        changed = 0
+        for iid in iids:
+            cid = self._cid_of(iid)
+            if not cid:
+                continue
+            if on and cid not in wl:
+                wl.add(cid)
+                changed += 1
+            elif not on and cid in wl:
+                wl.discard(cid)
+                changed += 1
+        if not changed:
+            self._refresh_all_safe_cells()
+            self.update_count()
+            return 0
+        if on:
+            # 白名单行永远不该带着勾选 —— 否则会出现「勾了却没退出」的困惑
+            for iid in iids:
+                try:
+                    self.tree.set(iid, "sel", "☐")
+                except Exception:
+                    pass
+                self._sel_hidden.discard(iid)
+        self._refresh_all_safe_cells()
+        self.save_config()
+        self.update_count()
+        if self._filter_active:
+            self.apply_filter(verbose=False)
+        return changed
+
+    def toggle_whitelist(self, iids):
+        """已全在白名单里 → 全部移出；否则全部加入。"""
+        iids = [i for i in iids if i in self.channels]
+        if not iids:
+            messagebox.showinfo("提示", "请先勾选（或右键）要加入白名单的频道。")
+            return
+        all_wl = all(self.is_whitelisted(i) for i in iids)
+        n = self.set_whitelist(iids, on=not all_wl)
+        if not all_wl:
+            self.log_msg(f"🔒 已加入白名单 {n} 个（永不退出，全选会自动跳过）")
+        else:
+            self.log_msg(f"🔓 已移出白名单 {n} 个")
+
+    def on_toggle_whitelist_checked(self):
+        """选择条按钮：对「已勾选」的行批量加入 / 移出白名单。"""
+        self.toggle_whitelist(self.selected_items())
+
+    def clear_whitelist(self):
+        wl = self._wl()
+        n = len(wl)
+        if not n:
+            messagebox.showinfo("提示", "白名单为空。")
+            return
+        if not messagebox.askyesno("确认", f"确定清空白名单（{n} 个）吗？\n清空后这些频道将不再受保护。"):
+            return
+        wl.clear()
+        self._refresh_all_safe_cells()
+        self.save_config()
+        self.update_count()
+        if self._filter_active:
+            self.apply_filter(verbose=False)
+        self.log_msg(f"🧹 已清空白名单（{n} 个）。")
+
+    def refresh_whitelist_info(self):
+        try:
+            n = len(self._wl())
+            self.lbl_whitelist_info.configure(text=f"白名单 {n} 个频道（永不退出）")
+            self.btn_clear_whitelist.configure(state="normal" if n else "disabled")
+        except Exception:
+            pass
+
+    def _set_stat(self, epoch, iid, members, posts, role=None):
+        """安全回填统计列：仅当列表代次未变、且该行仍存在时才写入。
+        避免刷新列表 / 退出频道后，后台任务对已失效的行 ID 调用 set() 抛 TclError。
+        若筛选生效，同时按新到的数值实时调整该行是否显示。"""
+        if epoch != self._tree_epoch:
+            return
+        try:
+            if not self.tree.exists(iid):
+                return
+            if role is not None:
+                self._role[iid] = role      # 先落角色再重画，后面的筛选重判才能看到它
+                self._refresh_safe_cell(iid)
+            self.tree.set(iid, "members", members)
+            self.tree.set(iid, "posts", posts)
+        except Exception:
+            return
+        if not self._filter_active:
+            return
+        self._recheck_visibility(iid)
+
+    def _apply_role(self, epoch, iid, role):
+        """只回填角色（统计已命中缓存时走这条路），不碰成员数 / 作品数两列。"""
+        if epoch != self._tree_epoch or role is None:
+            return
+        try:
+            if not self.tree.exists(iid):
+                return
+        except Exception:
+            return
+        self._role[iid] = role
+        self._refresh_safe_cell(iid)
+        if getattr(self, "_filter_active", False):
+            self._recheck_visibility(iid)
+
+    def _recheck_visibility(self, iid):
+        """筛选生效时，某行数据刚到（统计 / 角色），按新数据重新判断它该不该显示。"""
+        try:
+            keep = self._row_keep(iid, self._filter_members_lt, self._filter_posts_lt,
+                                  bool(self.filter_unknown_var.get()))
+            if keep and iid not in self._visible:
+                self._reinsert_sorted(iid)
+                self._visible.add(iid)
+                self._sel_hidden.discard(iid)
+                self.update_count()
+            elif not keep and iid in self._visible:
+                if self._is_checked(iid):
+                    self._sel_hidden.add(iid)
+                self.tree.detach(iid)
+                self._visible.discard(iid)
+                self.update_count()
+        except Exception:
+            pass
+
+    async def _detect_role(self, ent):
+        """判断当前账号在该频道的身份：creator / admin / ''（普通成员）。
+        失败返回 None（未知），此时不写缓存，下次还会再试。"""
+        try:
+            perms = await self.client.get_permissions(ent, "me")
+        except FloodWaitError as e:
+            await asyncio.sleep(int(getattr(e, "seconds", 5)) + 1)
+            try:
+                perms = await self.client.get_permissions(ent, "me")
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if perms is None:
+            return None
+        try:
+            if getattr(perms, "is_creator", False):
+                return "creator"
+            if getattr(perms, "is_admin", False):
+                return "admin"
+            return ""
+        except Exception:
+            return None
+
+    async def _fetch_stats(self, epoch, force=False):
+        """并发获取成员数(participants_count)与作品数(消息总数)，实时回填表格列。
+
+        可扩展性设计：
+        - **本地缓存**：`tg_stats_cache.json` 按频道 id 缓存结果，TTL 内不重复请求（force=True 时忽略缓存）。
+        - **快路径**：若对话实体的 `participants_count` 已有值，直接采用，省掉一次 GetFullChannel 请求。
+        - **有限并发**：信号量控制并发数（默认 6），比串行快一个数量级；分块提交任务避免一次创建上万协程。
+        - **可停止 / 可废弃**：按「停止」置位 threading.Event；用户刷新列表则 epoch 变化，本任务自行退出。
+        - **FloodWait 退避**：遇限流 sleep 后重试，而非直接失败。
+        """
+        from telethon.tl.functions.channels import GetFullChannelRequest
+
+        items = list(self.channels.items())
+        total = len(items)
+        if total == 0:
+            return
+        cancel = self._stats_cancel
+        if cancel is None or not hasattr(cancel, "clear"):
+            cancel = threading.Event()
+            self._stats_cancel = cancel
+        cancel.clear()               # 新任务开始：清掉上一轮可能遗留的停止信号
+        use_cache = bool(self.cache_var.get())
+        ttl = self._safe_int(self.ttl_var, 24, 1, 720) * 3600
+        role_ttl = ttl               # 角色与统计共用同一缓存有效期
+        detect_roles = var_bool(self, "detect_role_var", True)
+        role_cache = getattr(self, "_role_cache", None)
+        if not isinstance(role_cache, dict):
+            role_cache = {}
+            try:
+                self._role_cache = role_cache
+            except Exception:
+                pass
+        now = time.time()
+
+        todo = []
+        cached = 0
+        cached_role = 0
+        for iid, ent in items:
+            key = str(getattr(ent, "id", ""))
+            hit = None
+            if use_cache and not force:
+                c = self._stats_cache.get(key)
+                if isinstance(c, list) and len(c) >= 3 and (now - c[2]) < ttl:
+                    hit = (c[0], c[1])
+            role_hit = None
+            rc = role_cache.get(key)
+            if isinstance(rc, list) and len(rc) >= 2 and use_cache and not force and (now - rc[1]) < role_ttl:
+                role_hit = rc[0]
+            if hit is not None:
+                cached += 1
+                self.root.after(0, lambda i=iid, m=hit[0], p=hit[1], ep=epoch, r=role_hit:
+                                self._set_stat(ep, i, m, p, r))
+            if role_hit is not None:
+                cached_role += 1
+            need_stats = hit is None
+            # 白名单频道不必再花一次请求判角色（安全列已显示「🔒 白名单」）
+            need_role = detect_roles and role_hit is None and key not in whitelist_of(self)
+            if need_stats or need_role:
+                todo.append((iid, ent, need_stats, need_role))
+
+        self.log_msg(f"统计任务：共 {total} 个，命中缓存 {cached} 个"
+                     + (f"，角色已缓存 {cached_role} 个" if detect_roles else "（已关闭角色检测）")
+                     + f"，需请求 {len(todo)} 个。")
+        self.root.after(0, lambda: self._set_stats_running(True))
+        self.root.after(0, lambda: self.start_task(f"正在获取统计（{len(todo)} 个待请求）…"))
+        if not todo:
+            self.root.after(0, self.refresh_cache_info)
+        done = 0
+        failed = 0
+
+        async def worker(iid, ent, need_stats, need_role):
+            nonlocal done, failed
+            if cancel.is_set() or epoch != self._tree_epoch:
+                return
+            key = str(getattr(ent, "id", ""))
+            label = getattr(ent, "title", None) or getattr(ent, "id", "")
+            members = posts = None
+            if need_stats:
+                members = getattr(ent, "participants_count", None)
+                try:
+                    members = int(members) if members else None
+                except Exception:
+                    members = None
+                # ---- 成员数：优先用实体自带值，缺失才请求 ----
+                if members is None:
+                    members = await self._retry(lambda: self.client(GetFullChannelRequest(ent)),
+                                                lambda r: int(getattr(r.full_chat, "participants_count", 0) or 0),
+                                                f"成员数 {label}")
+                # ---- 作品数：消息总数，1 次请求 ----
+                async def _posts():
+                    msgs = await self.client.get_messages(ent, limit=1)
+                    t = getattr(msgs, "total", None)
+                    if not t:
+                        t = (msgs[-1].id if msgs else 0)
+                    return int(t or 0)
+                posts = await self._retry(_posts, lambda r: r, f"作品数 {label}")
+                if members is None:
+                    members = "?"
+                if posts is None:
+                    posts = "?"
+                if members == "?" or posts == "?":
+                    failed += 1
+                else:
+                    self._stats_cache[key] = [members, posts, time.time()]
+            # ---- 角色：创建者 / 管理员退不出去，提前识别以便跳过 ----
+            role = None
+            if need_role:
+                try:
+                    role = await self._detect_role(ent)
+                except Exception:
+                    role = None      # 检测失败只影响角色判定，绝不能连累统计回填
+                if role is not None:
+                    role_cache[key] = [role, time.time()]
+            done += 1
+            if need_stats:
+                self.root.after(0, lambda i=iid, m=members, p=posts, ep=epoch, r=role:
+                                self._set_stat(ep, i, m, p, r))
+            else:
+                self.root.after(0, lambda i=iid, ep=epoch, r=role: self._apply_role(ep, i, r))
+            if done % 25 == 0 or done == len(todo):
+                n, t = done, len(todo)
+                self.log_msg(f"已获取统计 {n}/{t}")
+                self.root.after(0, lambda n=n, t=t: self.lbl_stats.configure(text=f"统计进度 {n}/{t}"))
+                self.root.after(0, lambda n=n, t=t: self.set_progress(n, t, f"正在获取统计 {n}/{t}"))
+
+        sem = asyncio.Semaphore(max(1, self._safe_int(self.conc_var, 6, 1, 32)))
+
+        async def guarded(iid, ent, need_stats, need_role):
+            async with sem:
+                await worker(iid, ent, need_stats, need_role)
+
+        CHUNK = 100
+        try:
+            for i in range(0, len(todo), CHUNK):
+                if cancel.is_set() or epoch != self._tree_epoch:
+                    break
+                await asyncio.gather(*(guarded(*t) for t in todo[i:i + CHUNK]),
+                                     return_exceptions=True)
+        finally:
+            self.root.after(0, lambda: self._set_stats_running(False))
+            self.root.after(0, self.refresh_cache_info)
+            if cancel.is_set():
+                self.root.after(0, lambda: self.finish_task(f"统计已停止：完成 {done}/{len(todo)}"))
+                self.log_msg(f"⏹ 已停止统计：完成 {done}/{len(todo)}。")
+            elif epoch != self._tree_epoch:
+                self.root.after(0, lambda: self.finish_task("统计已废弃（列表已刷新）"))
+                self.log_msg("ℹ️ 列表已刷新，上一轮统计任务已终止。")
+            else:
+                self.root.after(0, lambda: self.finish_task(
+                    f"统计完成：成功 {done - failed} 个，失败 {failed} 个"))
+                self.log_msg(f"✅ 统计完成：成功 {done - failed} 个，失败 {failed} 个。")
+            try:
+                self.save_stats_cache()
+            except Exception:
+                pass
+            try:
+                self.save_role_cache()
+            except Exception:
+                pass
+            try:
+                self.root.after(0, self.refresh_whitelist_info)
+            except Exception:
+                pass
+
+    async def _retry(self, factory, extract, label, attempts=3):
+        """带 FloodWait 退避的重试封装；返回 None 表示失败。"""
+        for i in range(attempts):
+            try:
+                res = await factory()
+                return extract(res)
+            except FloodWaitError as e:
+                wait = int(getattr(e, "seconds", 5)) + 1
+                self.log_msg(f"⏳ 触发限流，等待 {wait}s 后重试（{label}）")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                if i == attempts - 1:
+                    self.log_msg(f"⚠️ 获取失败（{label}）: {type(e).__name__} - {e}")
+                else:
+                    await asyncio.sleep(0.5 * (i + 1))
+        return None
+
+    def _set_stats_running(self, running):
+        try:
+            self.btn_stats.configure(state="disabled" if running else "normal")
+            self.btn_stats_stop.configure(state="normal" if running else "disabled")
+        except Exception:
+            pass
+        if not running:
+            self.lbl_stats.configure(text=f"共 {len(self.channels)} 个")
+
+    def on_fetch_stats(self):
+        """手动重新获取统计：忽略缓存（用户明确要求刷新时）。"""
+        if not self.client or not self.channels:
+            messagebox.showinfo("提示", "请先连接并刷新频道列表。")
+            return
+        self.log_msg("开始重新获取统计（忽略缓存）...")
+        self.run_async(self._fetch_stats(self._tree_epoch, force=True))
+
+    def on_stop_stats(self):
+        if self._stats_cancel is not None:
+            self._stats_cancel.set()
+            self.log_msg("⏹ 正在停止统计 ...")
+
+    def _refresh_headings(self):
+        """在列头显示排序方向箭头（▲升序 / ▼降序）。"""
+        for c in self._col_index:
+            if c == "sel":
+                continue
+            txt = self._col_titles[c]
+            if c == self._sort_col:
+                txt += " ▼" if self._sort_rev else " ▲"
+            try:
+                self.tree.heading(c, text=txt)
+            except Exception:
+                pass
+
+    def _sort_key(self, col, iid):
+        """排序键：数字列按数值；文字列按字典序；未获取到的值恒排最后。"""
+        raw = self.tree.set(iid, col)
+        s = "" if raw is None else str(raw).strip()
+        try:
+            return (1, float(s), "")
+        except (TypeError, ValueError):
+            pass
+        if s in ("", "…", "?", "-"):
+            return (3, 0.0, "")
+        return (2, 0.0, s.lower())
+
+    def _apply_sort(self):
+        """按当前 _sort_col/_sort_rev 重排**可见行**（未知值恒排末尾）。"""
+        if self._sort_col:
+            col = self._sort_col
+            iids = list(self.tree.get_children())
+            known = [i for i in iids if self._sort_key(col, i)[0] != 3]
+            unknown = [i for i in iids if self._sort_key(col, i)[0] == 3]
+            known.sort(key=lambda i: self._sort_key(col, i), reverse=self._sort_rev)
+            for pos, iid in enumerate(known + unknown):
+                self.tree.move(iid, "", pos)
+        self._refresh_headings()
+
+    def sort_by(self, col):
+        """按列排序：点一次升序，再点一次降序。
+        用 tree.move 原地重排行，保持 item id 不变 —— 正在进行的统计回填与勾选状态都不受影响。
+        仅对当前可见（未被筛选隐藏）的行排序。"""
+        if col == "sel" or col not in self._col_index:
+            return
+        if self._sort_col == col:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_col, self._sort_rev = col, False
+        self._apply_sort()
+        extra = "（仅对当前筛选出的行）" if self._filter_active else ""
+        self.log_msg(f"已按「{self._col_titles[col]}」{'降序' if self._sort_rev else '升序'}排序{extra}。")
+
+    def _reinsert_sorted(self, iid):
+        """把刚恢复显示的行按当前排序列插到正确位置（未排序则追加到末尾）。"""
+        if not self._sort_col:
+            self.tree.move(iid, "", "end")
+            return
+        col = self._sort_col
+        k = self._sort_key(col, iid)
+        if k[0] == 3:                      # 未知值恒排末尾
+            self.tree.move(iid, "", "end")
+            return
+        children = [c for c in self.tree.get_children() if c != iid]
+        idx = len(children)
+        for i, c in enumerate(children):
+            kc = self._sort_key(col, c)
+            if self._sort_rev:
+                if kc < k:
+                    idx = i
+                    break
+            else:
+                if kc > k:
+                    idx = i
+                    break
+        self.tree.move(iid, "", idx)
+
+    # ---------------- 快捷筛选 ----------------
+    def _parse_threshold(self, var):
+        """把输入框解析成整数阈值；空/非法返回 None。容忍用户输入 <10 之类写法。"""
+        s = (var.get() or "").strip()
+        if not s:
+            return None
+        s = s.lstrip("<≤＜= ")
+        try:
+            return max(0, int(float(s)))
+        except (TypeError, ValueError):
+            return None
+
+    def _stat_num(self, iid, col):
+        """读取某行的统计值并转成数字；未获取（… / ? / 空）返回 None。"""
+        raw = self.tree.set(iid, col)
+        s = "" if raw is None else str(raw).strip()
+        if s in ("", "…", "?", "-"):
+            return None
+        try:
+            return int(float(s))
+        except (TypeError, ValueError):
+            return None
+
+    def _search_tokens(self):
+        try:
+            q = self.search_var.get() or ""
+        except Exception:
+            q = ""
+        q = q.replace("，", " ").replace(",", " ")
+        return [t.lower() for t in q.split() if t.strip()]
+
+    def _match_search(self, iid):
+        """名称 / 用户名 包含全部关键词（多词为 AND，忽略大小写）。"""
+        toks = self._search_tokens()
+        if not toks:
+            return True
+        try:
+            blob = (str(self.tree.set(iid, "name") or "") + "\n"
+                    + str(self.tree.set(iid, "username") or "")).lower()
+        except Exception:
+            return True
+        return all(t in blob for t in toks)
+
+    def _type_selected(self):
+        try:
+            t = self.type_filter_var.get()
+        except Exception:
+            t = "全部"
+        return t if t in ("频道", "群组") else "全部"
+
+    def _match_type(self, iid):
+        t = self._type_selected()
+        if t == "全部":
+            return True
+        try:
+            return str(self.tree.set(iid, "type") or "") == t
+        except Exception:
+            return True
+
+    def _row_keep(self, iid, m_lt, p_lt, hide_unknown):
+        """判断该行在当前筛选条件下是否应显示（多条件为 AND）。
+        维度：搜索关键词 / 类型 / 只看已勾选 / 用户数阈值 / 作品数阈值。"""
+        if not self._match_search(iid):
+            return False
+        if not self._match_type(iid):
+            return False
+        if getattr(self, "_hide_protected", False) and self.protected_reason(iid):
+            return False          # 「隐藏受保护项」：白名单 / 创建者 / 管理员不参与选择与退出
+        if getattr(self, "_only_checked", False) and not self._is_checked(iid):
+            return False
+        if m_lt is None and p_lt is None:
+            return True
+        if m_lt is not None:
+            v = self._stat_num(iid, "members")
+            if v is None:
+                return not hide_unknown
+            if not (v < m_lt):
+                return False
+        if p_lt is not None:
+            v = self._stat_num(iid, "posts")
+            if v is None:
+                return not hide_unknown
+            if not (v < p_lt):
+                return False
+        return True
+
+    def _sync_filter_preset_name(self):
+        """让预设下拉框与当前两个输入框保持一致（不匹配时显示「自定义…」）。"""
+        m_lt = self._parse_threshold(self.filter_members_var)
+        p_lt = self._parse_threshold(self.filter_posts_var)
+        for nm, m, p in FILTER_PRESETS:
+            if m == m_lt and p == p_lt:
+                self.filter_preset_var.set(nm)
+                return
+        self.filter_preset_var.set(FILTER_CUSTOM)
+
+    def on_filter_preset(self):
+        """选择预设：把预设阈值填入输入框并立即应用。"""
+        name = self.filter_preset_var.get()
+        if name == FILTER_CUSTOM:
+            return
+        for nm, m, p in FILTER_PRESETS:
+            if nm == name:
+                self.filter_members_var.set("" if m is None else str(m))
+                self.filter_posts_var.set("" if p is None else str(p))
+                break
+        self.apply_filter()
+
+    def apply_filter(self, verbose=True):
+        """按「用户数 / 作品数」阈值筛选：不满足条件的行用 detach 隐藏。
+        隐藏只影响显示，**行 ID 与数据都保留** —— 统计回填、勾选状态、排序位置都不受影响。"""
+        m_lt = self._parse_threshold(self.filter_members_var)
+        p_lt = self._parse_threshold(self.filter_posts_var)
+        hide_unknown = bool(self.filter_unknown_var.get())
+        self._only_checked = bool(getattr(self, "only_checked_var", None) and self.only_checked_var.get())
+        tsel = self._type_selected()
+        has_kw = bool(self._search_tokens())
+        self._hide_protected = var_bool(self, "hide_protected_var", False)
+        self._filter_active = (m_lt is not None or p_lt is not None
+                               or has_kw or tsel != "全部" or self._only_checked
+                               or self._hide_protected)
+        self._filter_members_lt, self._filter_posts_lt = m_lt, p_lt
+        self._sync_filter_preset_name()
+
+        attached = list(self.tree.get_children())
+        attached_set = set(attached)
+        # 保持现有可见顺序（含已排序列）；新恢复显示的行按插入顺序排在其后
+        desired = [i for i in attached
+                   if i in self.channels and self._row_keep(i, m_lt, p_lt, hide_unknown)]
+        for iid in self._row_order:
+            if iid in attached_set or iid not in self.channels:
+                continue
+            if self._row_keep(iid, m_lt, p_lt, hide_unknown):
+                desired.append(iid)
+        desired_set = set(desired)
+
+        for iid in attached:
+            if iid not in desired_set:
+                if iid in self.channels and self._is_checked(iid):
+                    self._sel_hidden.add(iid)   # 勾选保留，但退出时不会处理 → 状态栏会提示
+                try:
+                    self.tree.detach(iid)
+                except Exception:
+                    pass
+        for pos, iid in enumerate(desired):
+            try:
+                self.tree.move(iid, "", pos)
+            except Exception:
+                pass
+        self._visible = desired_set
+        # 隐藏勾选集合只保留「仍被隐藏且仍存在」的行（重新显示出来的行要移出去）
+        self._sel_hidden = {i for i in self._sel_hidden
+                            if i in self.channels and i not in desired_set}
+
+        # 筛选后重新套用当前排序，保证列头箭头与实际顺序一致（新恢复的行落到正确位置）
+        self._apply_sort()
+
+        self.update_count()
+        if verbose:
+            total = len(self.channels)
+            if self._filter_active:
+                cond = []
+                if m_lt is not None:
+                    cond.append(f"用户数<{m_lt}")
+                if p_lt is not None:
+                    cond.append(f"作品数<{p_lt}")
+                if has_kw:
+                    cond.append(f"搜索「{self.search_var.get().strip()}」")
+                if tsel != "全部":
+                    cond.append(f"类型={tsel}")
+                if self._only_checked:
+                    cond.append("只看已勾选")
+                if getattr(self, "_hide_protected", False):
+                    cond.append("隐藏受保护项")
+                extra = "" if hide_unknown else "（统计未获取的行也一并保留）"
+                if self._sel_hidden:
+                    extra += f" ⚠️ {len(self._sel_hidden)} 个已勾选的行被隐藏，退出时不会处理"
+                self.log_msg(f"🔍 筛选「{' 且 '.join(cond)}」：显示 {len(desired)} / 共 {total} 个{extra}")
+            else:
+                self.log_msg(f"已清除筛选：显示全部 {total} 个。")
+        return len(desired)
+
+    def clear_filter(self):
+        self.filter_members_var.set("")
+        self.filter_posts_var.set("")
+        # 搜索 / 类型 / 只看已勾选 也一并复位，避免「清除」后仍有隐藏原因看不出来
+        try:
+            self.search_var.set("")
+            self.type_filter_var.set("全部")
+            self.only_checked_var.set(False)
+            self.hide_protected_var.set(False)
+        except Exception:
+            pass
+        self._only_checked = False
+        self._hide_protected = False
+        self.apply_filter()
+
+    # ---------------- 选择逻辑 ----------------
+    # 约定：「全选 / 反选」的范围 = 当前**显示中**的行（筛选生效时就是筛选结果）；
+    #       被筛选隐藏的行勾选状态会被保留，但退出时不会处理 —— 用 _sel_hidden 追踪并提示。
+    def _is_checked(self, iid):
+        try:
+            return self.tree.set(iid, "sel") == "☑"
+        except Exception:
+            return False
+
+    def on_tree_click(self, event):
+        item = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if item and col == "#1":
+            self.tree.set(item, "sel", "☐" if self._is_checked(item) else "☑")
+            self._sel_hidden.discard(item)   # 点击的必然是可见行
+            self.update_count()
+            self._maybe_apply_only_checked()  # 「只看已勾选」时，取消勾选应立即消失
+
+    def _visible_ids(self):
+        return list(self.tree.get_children())
+
+    def set_all(self, val, scope="visible"):
+        """勾选 / 取消勾选。
+        scope="visible"：仅当前显示中的行（筛选生效时即「筛选结果」）；
+        scope="all"    ：含被筛选隐藏的行（用于彻底清空，避免隐藏行残留勾选）。
+        全选时会**自动跳过受保护行**（白名单 / 创建者 / 管理员）—— 它们不是退不掉就是不该退。
+        取消勾选（val=False）不跳，永远能一键清干净。"""
+        mark = "☑" if val else "☐"
+        if scope == "all":
+            iids = list(self.channels)
+        else:
+            iids = self._visible_ids()
+        skip = bool(val) and var_bool(self, "skip_protected_var", True)
+        skipped = 0
+        for iid in iids:
+            if skip and self.protected_reason(iid):
+                skipped += 1
+                try:
+                    self.tree.set(iid, "sel", "☐")   # 确保受保护行绝不带着勾选
+                except Exception:
+                    pass
+                self._sel_hidden.discard(iid)
+                continue
+            try:
+                self.tree.set(iid, "sel", mark)
+            except Exception:
+                pass
+        if scope == "all":
+            self._sel_hidden = set() if not val else (set(self.channels) - set(self._visible_ids()))
+        else:
+            # 只动了可见行，隐藏行的勾选保持不变
+            pass
+        self.update_count()
+        return skipped
+        if getattr(self, "_only_checked", False) and not val:
+            self.apply_filter(verbose=False)
+            self.log_msg("ℹ️ 「只看已勾选」已开启：勾选被清空后列表为空，点「清除」可恢复显示。")
+
+    def select_all_visible(self):
+        """全选当前显示的行（筛选生效时=全选筛选结果），隐藏行不受影响。"""
+        shown = len(self.tree.get_children())
+        if shown == 0:
+            messagebox.showinfo("提示", "当前没有可勾选的行：可能筛选后为空，或列表尚未加载。")
+            return
+        self.set_all(True, scope="visible")
+        scope = "筛选结果" if (self._filter_active or shown != len(self.channels)) else "全部"
+        picked = len(self.selected_items())
+        extra = f"，跳过 {shown - picked} 个受保护项" if shown > picked else ""
+        self.log_msg(f"☑ 已全选{scope} {picked} 个{extra}。")
+
+    def apply_filter_and_select_all(self):
+        """应用筛选条件并立即全选筛选结果 —— 一步到位，便于按条件批量退出。
+        受保护行同样会被跳过，因此日志里报的是**实际勾上**的数量。"""
+        shown = self.apply_filter(verbose=True)
+        if not shown:
+            messagebox.showinfo("提示", "当前筛选条件下没有可显示的行，未执行全选。")
+            return
+        self.set_all(True, scope="visible")
+        picked = len(self.selected_items())
+        if picked:
+            self.log_msg(f"☑ 已全选筛选结果 {picked} 个，可直接点「退出选中频道」。")
+        else:
+            messagebox.showinfo("提示", "筛选结果全部受保护（白名单 / 创建者 / 管理员），没有可勾选的行。")
+
+    def invert(self):
+        """反选当前显示的行（隐藏行的勾选状态不变）。受保护行不参与反选，保持未勾选。"""
+        skip = var_bool(self, "skip_protected_var", True)
+        for iid in self.tree.get_children():
+            if skip and self.protected_reason(iid):
+                try:
+                    self.tree.set(iid, "sel", "☐")
+                except Exception:
+                    pass
+                continue
+            try:
+                self.tree.set(iid, "sel", "☐" if self._is_checked(iid) else "☑")
+            except Exception:
+                pass
+        self.update_count()
+
+    def selected_items(self):
+        """当前显示中被勾选的行 —— 退出/导出以此为准（隐藏行不会被处理）。"""
+        return [iid for iid in self.tree.get_children() if self._is_checked(iid)]
+
+    def selected_items_all(self):
+        """所有行中被勾选的数量（含被筛选隐藏的）。"""
+        return self.selected_items() + [i for i in self.channels if i in self._sel_hidden]
+
+    def update_count(self):
+        total = len(self.channels)
+        shown = len(self.tree.get_children())
+        sel = len(self.selected_items())
+        # getattr 兜底：本方法可能被加载流程早期/测试桩调用，缺属性时不应打断列表加载
+        hidden_sel = len(getattr(self, "_sel_hidden", ()) or ())
+        protected = 0
+        blocked = 0
+        # 没有任何防护数据时直接跳过整表扫描（本方法在统计回填时会被高频调用）
+        if getattr(self, "_whitelist", None) or getattr(self, "_role", None):
+            try:
+                for iid in self.tree.get_children():
+                    if self.protected_reason(iid):
+                        protected += 1
+                        if self._is_checked(iid):
+                            blocked += 1
+            except Exception:
+                pass
+        if self._filter_active or shown != total:
+            txt = f"显示 {shown} / 共 {total} 个，已选 {sel} 个"
+        else:
+            txt = f"共 {total} 个，已选 {sel} 个"
+        if hidden_sel:
+            txt += f"（另有 {hidden_sel} 个勾选被筛选隐藏）"
+        if blocked:
+            txt += f"（其中 {blocked} 个受保护，退出会跳过）"
+        self.lbl_count.configure(text=txt)
+        # 搜索命中数 / 待退出数（新布局里的实时反馈）
+        try:
+            if self._search_tokens() or self._type_selected() != "全部":
+                self.lbl_search_hit.configure(text=f"命中 {shown}")
+            else:
+                self.lbl_search_hit.configure(text="")
+        except Exception:
+            pass
+        try:
+            effective = max(0, sel - blocked)
+            ptxt = f"待退出 {effective} 个"
+            if blocked:
+                ptxt += f"（{blocked} 个受保护将跳过）"
+            elif hidden_sel:
+                ptxt += f"（另 {hidden_sel} 个被隐藏）"
+            self.lbl_pending.configure(text=ptxt)
+        except Exception:
+            pass
+        # 按钮文案随范围变化，避免「全选」到底选了什么产生歧义
+        filtered = self._filter_active or shown != total
+        try:
+            self.btn_sel_all.configure(text=f"全选筛选结果({shown})" if filtered else f"全选({shown})")
+            self.btn_sel_invert.configure(text="反选筛选结果" if filtered else "反选")
+        except Exception:
+            pass
+        try:
+            self.btn_whitelist.configure(text=f"🔒 白名单({sel})" if sel else "🔒 白名单")
+        except Exception:
+            pass
+        try:
+            self.refresh_whitelist_info()   # 测试桩可能没有该方法，不能让它打断列表加载
+        except Exception:
+            pass
+
+    def _on_select_all_key(self, event=None):
+        """Ctrl+A：全选当前显示的行。"""
+        self.select_all_visible()
+        return "break"
+
+    # ---------------- 退出 ----------------
+    # ---------------- 安全防护：退出前预览与跳过 ----------------
+    def _row_snapshot(self, iid):
+        def g(c):
+            try:
+                return str(self.tree.set(iid, c) or "")
+            except Exception:
+                return ""
+        return {"iid": iid, "name": g("name") or self._cid_of(iid) or "(未知)",
+                "username": g("username"), "type": g("type"),
+                "members": g("members"), "posts": g("posts"), "id": g("id")}
+
+    def build_leave_plan(self, iids):
+        """把待处理清单拆成「将退出」与「受保护跳过」两组。
+        「退出时跳过受保护项」关闭时不做跳过，全部照退（用户明确要求时才有意义）。"""
+        skip = var_bool(self, "skip_protected_var", True)
+        to_leave, blocked, seen = [], [], set()
+        for iid in iids:
+            if iid in seen:
+                continue
+            seen.add(iid)
+            try:
+                if not self.tree.exists(iid):
+                    continue
+            except Exception:
+                continue
+            snap = self._row_snapshot(iid)
+            reason = self.protected_reason(iid) if skip else None
+            if reason:
+                snap["reason"] = reason
+                blocked.append(snap)
+            else:
+                to_leave.append(snap)
+        return to_leave, blocked
+
+    def confirm_leave(self, to_leave, blocked, notes=""):
+        """退出前确认。默认弹「待退出清单」预览窗；关掉预览选项后退化为普通确认框。
+        返回 True 表示用户确认执行。"""
+        reason_txt = ""
+        if blocked:
+            reason_txt = f"\n\n将跳过 {len(blocked)} 个受保护项（白名单 / 创建者 / 管理员）。"
+        if not var_bool(self, "preview_leave_var", True):
+            msg = f"确定要退出选中的 {len(to_leave)} 个频道 / 群组吗？{reason_txt}"
+            if notes:
+                msg += "\n\n" + notes
+            return bool(messagebox.askyesno("确认", msg))
+        return self._preview_leave_dialog(to_leave, blocked, notes)
+
+    def _preview_leave_dialog(self, to_leave, blocked, notes=""):
+        """待退出清单预览窗：左右两栏分别列出「将退出」与「已跳过（受保护）」。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("退出前确认")
+        dlg.transient(self.root)
+        try:
+            dlg.geometry("680x470")
+        except Exception:
+            pass
+
+        outer = ttk.Frame(dlg, padding=10)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=f"确定要退出选中的 {len(to_leave)} 个频道 / 群组？",
+                  font=("", 10, "bold")).pack(anchor="w")
+        if blocked:
+            ttk.Label(outer, text=f"另有 {len(blocked)} 个受保护项将被跳过（白名单 / 创建者 / 管理员）。",
+                      foreground="#a32d2d").pack(anchor="w", pady=(3, 0))
+        if notes:
+            ttk.Label(outer, text=notes, foreground="#6b7280",
+                      wraplength=640, justify="left").pack(anchor="w", pady=(3, 0))
+
+        nb = ttk.Notebook(outer)
+        nb.pack(fill="both", expand=True, pady=8)
+        nb.add(self._plan_tree(nb, to_leave, check_col=False),
+               text=f"将退出（{len(to_leave)}）")
+        if blocked:
+            nb.add(self._plan_tree(nb, blocked, check_col=True),
+                   text=f"已跳过 · 受保护（{len(blocked)}）")
+
+        chk = tk.BooleanVar(value=var_bool(self, "preview_leave_var", True))
+        ttk.Checkbutton(outer, text="以后不再显示此清单", variable=chk).pack(anchor="w")
+
+        result = {"ok": False}
+
+        def on_ok():
+            result["ok"] = True
+            try:
+                self.preview_leave_var.set(bool(chk.get()))
+                self.save_config()
+            except Exception:
+                pass
+            dlg.destroy()
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(6, 0))
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=4)
+        ttk.Button(bar, text=f"确认退出 {len(to_leave)} 个", command=on_ok).pack(side="right", padx=4)
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.bind("<Return>", lambda e: on_ok())
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.wait_window()
+        return result["ok"]
+
+    def _plan_tree(self, parent, rows, check_col=False):
+        """清单里的小表格：名称 / 用户名 / 类型 / 用户数 / 作品数 / ID（+ 跳过原因）。"""
+        wrap = ttk.Frame(parent)
+        cols = ("name", "username", "type", "members", "posts", "id")
+        titles = ("名称", "用户名", "类型", "用户数", "作品数", "ID")
+        if check_col:
+            cols = cols + ("reason",)
+            titles = titles + ("跳过原因",)
+        tv = ttk.Treeview(wrap, columns=cols, show="headings", height=10)
+        for c, t in zip(cols, titles):
+            tv.heading(c, text=t)
+            tv.column(c, width=110 if c == "name" else 80, anchor="w")
+        for r in rows:
+            vals = [r.get(c, "") for c in cols]
+            tv.insert("", "end", values=vals)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vsb.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        return wrap
+
+    def leave_items(self, iids, auto_confirm=False):
+        if not iids:
+            if self._sel_hidden:
+                messagebox.showinfo(
+                    "提示",
+                    f"当前显示中没有勾选的行，但有 {len(self._sel_hidden)} 个勾选项被筛选隐藏了。\n"
+                    "如需退出它们：点「清除」筛选后再「全选」。",
+                )
+            else:
+                messagebox.showinfo("提示", "没有可退出的频道。")
+            return
+        to_leave, blocked = self.build_leave_plan(iids)
+        notes = ""
+        if self._sel_hidden:
+            notes = (f"另有 {len(self._sel_hidden)} 个勾选项被当前筛选隐藏，本次不会退出。"
+                     "（要一并退出请先点「清除」筛选，再「全选」）")
+        elif self._filter_active:
+            notes = "仅处理当前筛选显示出来的行。"
+        if not to_leave:
+            names = "、".join(b["name"] for b in blocked[:6])
+            more = f"，另有 {len(blocked) - 6} 个" if len(blocked) > 6 else ""
+            messagebox.showinfo(
+                "提示",
+                f"勾选的 {len(iids)} 个全部受保护，没有可退出的频道。\n\n"
+                f"受保护项：{names}{more}\n"
+                "（白名单可右键或点「🔒 白名单」移出；创建者 / 管理员在 Telegram 里无法退出）",
+            )
+            self.log_msg(f"⏭ 勾选的 {len(iids)} 个全部受保护，已跳过。")
+            return
+        if not auto_confirm and not self.confirm_leave(to_leave, blocked, notes):
+            self.log_msg("已取消退出。")
+            return
+        if blocked:
+            self.log_msg(f"⏭ 受保护跳过 {len(blocked)} 个："
+                         + "、".join(f"{b['name']}（{b['reason']}）" for b in blocked[:8])
+                         + ("…" if len(blocked) > 8 else ""))
+        interval = max(1, int(self.interval_var.get()))
+        try:
+            jitter = max(0, int(self.jitter_var.get()))
+        except Exception:
+            jitter = 0
+        self.btn_leave.configure(state="disabled")
+        self.btn_kw_leave.configure(state="disabled")
+        self.run_async(self._leave([x["iid"] for x in to_leave], interval, jitter))
+
+    def on_leave(self):
+        self.leave_items(self.selected_items())
+
+    def on_kw_leave(self):
+        kw_text = self.kw_var.get().strip()
+        if not kw_text:
+            messagebox.showinfo("提示", "请先输入关键词。")
+            return
+        kws = [k.strip().lower() for k in re.split(r"[,，\s]+", kw_text) if k.strip()]
+        if not kws:
+            return
+        matched = []
+        for iid in self.tree.get_children():
+            name = (self.tree.set(iid, "name") or "").lower()
+            uname = (self.tree.set(iid, "username") or "").lower()
+            if any(k in name or k in uname for k in kws):
+                matched.append(iid)
+        if not matched:
+            messagebox.showinfo("提示", "没有名称 / 用户名匹配关键词的频道。")
+            return
+        self.log_msg(f"🔍 关键词匹配到 {len(matched)} 个频道，准备退出。")
+        self.leave_items(matched)
+
+    def on_export(self, mode="visible"):
+        """导出 CSV：visible=当前显示的行（筛选结果） / all=全部（含被隐藏） / checked=已勾选。"""
+        if mode == "all":
+            iids = [i for i in self.channels if self.tree.exists(i)]
+            label = "全部"
+        elif mode == "checked":
+            iids = [i for i in self.selected_items_all() if self.tree.exists(i)]
+            label = "已勾选"
+        else:
+            iids = list(self.tree.get_children())
+            label = "当前显示"
+        rows = []
+        for iid in iids:
+            try:
+                rows.append((
+                    self.tree.set(iid, "name"),
+                    self.tree.set(iid, "username"),
+                    self.tree.set(iid, "type"),
+                    self.tree.set(iid, "members"),
+                    self.tree.set(iid, "posts"),
+                    self.tree.set(iid, "id"),
+                    self.protected_reason(iid) or "",
+                ))
+            except Exception:
+                pass
+        if not rows:
+            messagebox.showinfo("提示", f"没有可导出的行（范围：{label}）。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("全部文件", "*.*")],
+            initialfile={"visible": "tg_channels_visible.csv",
+                         "all": "tg_channels_all.csv",
+                         "checked": "tg_channels_checked.csv"}.get(mode, "tg_channels.csv"),
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["名称", "用户名", "类型", "用户数", "作品数", "ID", "安全防护"])
+                w.writerows(rows)
+            self.log_msg(f"✅ 已导出{label} {len(rows)} 条到 {path}")
+            messagebox.showinfo("完成", f"已导出{label} {len(rows)} 条到：\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    async def _leave(self, sel, interval, jitter=0):
+        def _safe_delete(iid):
+            try:
+                if self.tree.exists(iid):
+                    self.tree.delete(iid)
+            except Exception:
+                pass
+            self.channels.pop(iid, None)          # 同步清理映射，避免统计仍去请求已退出的频道
+            self._visible.discard(iid)
+            self._sel_hidden.discard(iid)
+            self._role.pop(iid, None)
+            try:
+                self._row_order.remove(iid)
+            except ValueError:
+                pass
+
+        total = len(sel)
+        done = 0
+        self.root.after(0, lambda: self.start_task(f"正在退出频道（共 {total} 个）…"))
+
+        async def _do_leave(ent, name):
+            """执行一次退出，返回 (是否成功, 日志文案)。"""
+            status, note = await leave_entity(self.client, ent)
+            if status == LEAVE_BLOCKED:
+                return False, f"⛔ 无法退出（{note}）: {name}"
+            if status == LEAVE_GONE:
+                return True, f"➖ 无需退出（{note}）: {name}"
+            return True, f"✅ 已退出: {name}"
+
+        ok = fail = 0
+        for iid in sel:
+            ent = self.channels.get(iid)
+            if not ent:
+                done += 1
+                continue
+            name = self.tree.set(iid, "name") or str(ent.id)
+            try:
+                success, line = await _do_leave(ent, name)
+                self.log_msg(line)
+                if success:
+                    ok += 1
+                    self.root.after(0, lambda i=iid: _safe_delete(i))
+                else:
+                    fail += 1
+            except FloodWaitError as e:
+                self.log_msg(f"⏳ 触发限流，等待 {e.seconds} 秒后重试: {name}")
+                secs = int(e.seconds)
+                n, t = done + 1, total
+                self.root.after(0, lambda n=n, t=t, s=secs: self.set_progress(
+                    n, t, f"限流等待 {s}s 后重试（{n}/{t}）"))
+                try:
+                    await asyncio.sleep(e.seconds)
+                    success, line = await _do_leave(ent, name)
+                    self.log_msg(f"{line}（限流重试）")
+                    if success:
+                        ok += 1
+                        self.root.after(0, lambda i=iid: _safe_delete(i))
+                    else:
+                        fail += 1
+                except Exception as e2:
+                    fail += 1
+                    self.log_msg(f"❌ 退出失败: {name} -> {e2}")
+            except Exception as e:
+                fail += 1
+                self.log_msg(f"❌ 退出失败: {name} -> {e}")
+            done += 1
+            n, t = done, total
+            self.root.after(0, lambda n=n, t=t: self.set_progress(n, t, f"正在退出 {n}/{t}"))
+            if done < total:
+                wait = interval + (random.uniform(0, jitter) if jitter > 0 else 0)
+                await asyncio.sleep(max(1.0, wait))
+        self.log_msg(f"🏁 完成：成功 {ok} 个，失败 {fail} 个。")
+        self.root.after(0, lambda o=ok, f=fail: self.finish_task(f"退出完成：成功 {o} 个，失败 {f} 个"))
+        self.root.after(0, lambda: self.btn_leave.configure(state="normal"))
+        self.root.after(0, lambda: self.btn_kw_leave.configure(state="normal"))
+        self.root.after(0, self.update_count)
+
+    # ---------------- 关闭 ----------------
+    def on_close(self):
+        try:
+            # 先把界面状态（窗口大小/列宽/面板开合/主题）刷进配置，再销毁窗口
+            self.save_config()
+        except Exception:
+            pass
+        try:
+            if self._stats_cancel is not None:
+                self._stats_cancel.set()   # 关窗时停止仍在跑的统计任务
+            if self._list_cancel is not None:
+                self._list_cancel.set()    # 关窗时停止仍在跑的分页加载
+        except Exception:
+            pass
+        try:
+            self.save_stats_cache()
+            self.save_role_cache()
+        except Exception:
+            pass
+        try:
+            if self.code_future is not None and not self.code_future.done():
+                self.loop.call_soon_threadsafe(self.code_future.cancel)
+        except Exception:
+            pass
+        try:
+            if self.client is not None:
+                self.run_async(self.client.disconnect())
+            if self.loop is not None:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+def _show_crash(msg):
+    """把启动/运行错误以系统弹窗 + 日志文件两种方式兜底展示（不依赖 tkinter）。"""
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.user32.MessageBoxW(0, msg, "TG 频道批量退出工具 - 错误", 0x10)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(BASE_DIR, "tg_crash.log"), "w", encoding="utf-8") as f:
+            f.write(msg)
+    except Exception:
+        pass
+
+
+def _report_callback_exception(exc, val, tb):
+    """tkinter 回调（按钮点击等）里抛出的异常默认会被吞掉且静默退出，这里改成弹窗+日志。
+    同一类错误短时间内重复发生时只记日志、不再反复弹窗，避免连环弹窗刷屏。"""
+    import traceback as _tb
+
+    msg = "界面操作出错（已被捕获，程序继续运行）：\n\n" + "".join(_tb.format_exception(exc, val, tb))
+    key = f"{exc.__name__}: {val}"
+    now = time.time()
+    if key == _report_callback_exception._last_key and now - _report_callback_exception._last_time < 5:
+        pass  # 重复错误：仅写日志
+    else:
+        _report_callback_exception._last_key = key
+        _report_callback_exception._last_time = now
+        try:
+            messagebox.showerror("界面错误", msg)
+        except Exception:
+            _show_crash(msg)
+    try:
+        with open(os.path.join(BASE_DIR, "tg_crash.log"), "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+_report_callback_exception._last_key = ""
+_report_callback_exception._last_time = 0.0
+
+
+def main():
+    import sys
+
+    print("[启动] 正在初始化界面 ...", file=sys.stderr, flush=True)
+    try:
+        root = tk.Tk()
+        # 任何按钮/界面回调里的异常都弹窗显示，而不是静默崩溃
+        root.report_callback_exception = _report_callback_exception
+        App(root)
+        print("[启动] 主窗口已创建，进入主循环", file=sys.stderr, flush=True)
+        root.mainloop()
+    except Exception:
+        import traceback
+
+        tb = traceback.format_exc()
+        print("[致命错误]\n" + tb, file=sys.stderr, flush=True)
+        _show_crash("程序启动/运行出错：\n\n" + tb)
+        raise
+
+
+if __name__ == "__main__":
+    main()
