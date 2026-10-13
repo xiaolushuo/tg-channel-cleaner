@@ -43,7 +43,11 @@ Telegram 免费账号能加入的**频道 + 群组**上限是 **500** 个（Prem
 
 ## 下载使用
 
-到 [Releases](../../releases) 或直接下载仓库中的 `dist/TG频道批量退出工具.exe`，双击运行。**Windows，绿色单文件，不需要安装 Python。**
+**方式一（推荐）**：到 [Releases](https://github.com/xiaolushuo/tg-channel-cleaner/releases/latest) 下载 `TG-Channel-Cleaner-v1.0.0.exe`。
+
+**方式二**：直接下载仓库里的 `dist/TG频道批量退出工具.exe`（两者是同一个文件）。
+
+双击运行即可。**Windows，绿色单文件，不需要安装 Python。**
 
 ## 使用步骤
 
