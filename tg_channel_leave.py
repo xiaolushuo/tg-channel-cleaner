@@ -22,6 +22,7 @@ TG 频道批量退出工具 (GUI 版)
 
 import asyncio
 import csv
+import datetime
 import json
 import os
 import random
@@ -207,21 +208,331 @@ async def leave_entity(client, ent):
         return LEAVE_OK, ""
 
 
+# ---------------- 会话类型（一处判定，界面列 / 筛选 / 请求分派共用） ----------------
+# 为什么要单独抽出来：同一个「类型」至少要喂给 5 个地方 ——
+#   类型列显示、类型筛选、统计请求分派（GetFullChannel 只对 Channel 有效）、
+#   角色检测（对 User 调 get_permissions 必失败）、退出/删除能力判断。
+# 分散判定必然漂移，例如把超级群误当频道去请求，或对 450 个私聊各做 3 次无效重试。
+KIND_CHANNEL = "频道"      # Channel, broadcast=True
+KIND_GROUP = "群组"        # Channel(broadcast=False，即超级群) 或 Chat(普通群)
+KIND_USER = "私聊"         # User, bot=False
+KIND_BOT = "机器人"        # User, bot=True
+KIND_GONE = "已不在"       # ChatForbidden / ChannelForbidden：已被移出或频道已失效
+KIND_OTHER = "其它"
+# 下拉框取值顺序
+TYPE_CHOICES = ("全部", KIND_CHANNEL, KIND_GROUP, KIND_USER, KIND_BOT, KIND_GONE)
+# 私聊 / 机器人 / 已不在：没有「成员数」概念，也没有创建者/管理员，更不能「退出」
+NOT_APPLICABLE = "-"
+
+# 分组（Telegram 里叫 dialog filter，UI 上是会话列表顶部的分页标签）
+FOLDER_ALL = "全部分组"
+FOLDER_NONE = "未分组"
+# ⚠️ 与「归档」区分：归档是 peer folder 的 folder_id=1，不在 dialog filter 里。
+# 一个会话可以同时属于多个自定义分组，因此「分组」列可能显示多个名字。
+
+# ---------------- 活跃（最后一条消息距今多少天） ----------------
+# 「活跃」列里放**纯数字**（表头写明单位是「天前」），这样点表头能按数值正确排序；
+# 无消息 / 不适用 / 未知各给固定文案，_sort_key 会把「无消息」当最大天数处理。
+ACTIVE_NONE = "无消息"       # 取过了，这个会话一条消息都没有
+ACTIVE_UNKNOWN = "…"        # 还没取过（统计未跑）
+ACTIVE_NEVER = 10 ** 9       # 筛选用：把「无消息」当成「久到无法更久」
+
+# 缓存里 last_ts 的三种取值：数字=时间戳；None=确认无消息；"-"=不适用（已不在）
+# 注意缓存必须存**时间戳**而不是天数 —— 存天数的话隔天就永久偏小了。
+
+
+def active_text(last_ts, now_ts=None):
+    """把缓存的「最后消息时间戳」渲染成「活跃」列文本。"""
+    if last_ts == NOT_APPLICABLE:
+        return NOT_APPLICABLE          # 已不在的会话，消息根本取不到
+    if last_ts is None:
+        return ACTIVE_NONE
+    try:
+        ts = float(last_ts)
+    except (TypeError, ValueError):
+        return ACTIVE_UNKNOWN          # 还没取过
+    if ts <= 0:
+        return ACTIVE_NONE
+    now = time.time() if now_ts is None else float(now_ts)
+    # 服务器时间可能略超前于本地时钟，算出负数一律归零
+    return str(max(0, int((now - ts) // 86400)))
+
+
+UNSET = object()      # 哨兵：区分「本次不更新该列」与「明确置空」
+
+
+# ---------------- 分组（Telegram 里叫 dialog filter） ----------------
+# 三个必须分清的事实（都是查官方文档/实测确认的，别想当然）：
+# 1) ⚠️ folders.editPeerFolders **只能**设 folder_id 0（主列表）/ 1（归档）。
+#    官方文档原文："no other folder_id is allowed at the moment" ——
+#    它**不能**把会话放进自定义分组！自定义分组必须走
+#    messages.getDialogFilters 读 + messages.updateDialogFilter 整表写回。
+# 2) updateDialogFilter 是**整表替换**：提交的 include_peers 就是该分组之后的完整手写列表，
+#    所以必须先读最新状态再改；并且要**在服务器返回的对象上原地改字段**（而不是自己 new 一个），
+#    否则 Telethon 不认识的字段（如 color / title_noanimate）会被悄悄丢掉。
+# 3) 分组还能靠**自动规则**匹配（groups / broadcasts / bots / contacts /
+#    exclude_read / exclude_muted / exclude_archived）。只按 include_peers 反查，
+#    会把靠规则进来的会话漏掉 —— 必须在本地复现规则，才能和客户端看到的一致。
+FOLDER_RULE_FLAGS = ("contacts", "non_contacts", "groups", "broadcasts", "bots",
+                     "exclude_muted", "exclude_read", "exclude_archived")
+FOLDER_TYPE_FLAGS = ("contacts", "non_contacts", "groups", "broadcasts", "bots")
+# Telegram 对「一个分组手工容纳多少会话」有限制，超过就提示（不阻止，由服务端最终裁决）
+FOLDER_SOFT_LIMIT = 100
+
+
+def peer_key_of(ent):
+    """会话的分组归属键。**必须带类型**：channel_id / chat_id / user_id 的数值空间会重叠，
+    只按数字匹配会把不同会话混成一个。"""
+    try:
+        eid = int(getattr(ent, "id", None))
+    except (TypeError, ValueError):
+        return None
+    if isinstance(ent, tl_types.Channel):
+        return ("channel", eid)
+    if isinstance(ent, tl_types.Chat):
+        return ("chat", eid)
+    if isinstance(ent, tl_types.User):
+        return ("user", eid)
+    return None
+
+
+def input_peer_key(p):
+    """inputPeerChannel / inputPeerChat / inputPeerUser -> 与 peer_key_of 一致的键。"""
+    for attr, tag in (("channel_id", "channel"), ("chat_id", "chat"), ("user_id", "user")):
+        v = getattr(p, attr, None)
+        if v:
+            try:
+                return (tag, int(v))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def folder_title(f):
+    t = getattr(f, "title", None)
+    if isinstance(t, tl_types.TextWithEntities):
+        t = t.text
+    return str(t or "").strip()
+
+
+def is_real_folder(f):
+    """是否是用户自建的分组。DialogFilterDefault 是「全部聊天」默认视图（id=None），不能改。"""
+    return getattr(f, "id", None) is not None and type(f).__name__ != "DialogFilterDefault"
+
+
+def manual_peer_keys(f):
+    """分组里「手工加入」的会话键集合（pinned 也算 —— pinned 只是置顶显示）。"""
+    keys = set()
+    for attr in ("pinned_peers", "include_peers"):
+        for p in (getattr(f, attr, None) or []):
+            keys.add(input_peer_key(p))
+    keys.discard(None)
+    return keys
+
+
+def folder_rules_on(f):
+    return [n for n in FOLDER_RULE_FLAGS if getattr(f, n, None)]
+
+
+def filter_matches(f, key, state):
+    """本地复现「这个会话属不属于该分组」。规则语义：
+    - exclude_peers 命中 -> 不属于（最高优先级）
+    - 手工加入（include/pinned）-> 属于，不再看规则
+    - 没有规则 -> 纯手工分组，不自动匹配任何会话
+    - 有规则 -> 必须命中至少一个**类型**规则（只设 exclude_* 而无类型规则时不自动匹配）
+      再依次套用 exclude_muted / exclude_read / exclude_archived
+    """
+    try:
+        for p in (getattr(f, "exclude_peers", None) or []):
+            if input_peer_key(p) == key:
+                return False
+        if key in manual_peer_keys(f):
+            return True
+        if not folder_rules_on(f):
+            return False
+        matched_type = False
+        for name in FOLDER_TYPE_FLAGS:
+            if not getattr(f, name, None):
+                continue
+            if name == "contacts" and state.get("contact"):
+                matched_type = True
+            elif name == "non_contacts" and not state.get("contact"):
+                matched_type = True
+            elif name == "groups" and state.get("kind") == KIND_GROUP:
+                matched_type = True
+            elif name == "broadcasts" and state.get("kind") == KIND_CHANNEL:
+                matched_type = True
+            elif name == "bots" and state.get("kind") == KIND_BOT:
+                matched_type = True
+        if not matched_type:
+            return False
+        if getattr(f, "exclude_muted", None) and state.get("muted"):
+            return False
+        if getattr(f, "exclude_read", None) and not (state.get("unread") or 0):
+            return False
+        if getattr(f, "exclude_archived", None) and state.get("archived"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def dialog_state(d, kind, ent):
+    """取本地复现分组规则所需的状态（Telethon 的 Dialog 没有 muted 属性，要钻到 notify_settings）。"""
+    st = {"kind": kind, "contact": bool(getattr(ent, "contact", False)),
+          "muted": False, "unread": 0, "archived": False}
+    try:
+        st["unread"] = int(getattr(d, "unread_count", 0) or 0)
+    except Exception:
+        st["unread"] = 0
+    try:
+        st["archived"] = bool(getattr(d, "folder_id", None))
+    except Exception:
+        st["archived"] = False
+    try:
+        ns = getattr(getattr(d, "dialog", None), "notify_settings", None)
+        mu = getattr(ns, "mute_until", None)
+        if mu is not None:
+            try:
+                st["muted"] = mu.timestamp() > time.time()
+            except Exception:
+                st["muted"] = bool(mu)
+    except Exception:
+        st["muted"] = False
+    return st
+
+
+def session_kind(ent):
+    """判定会话实体的类型（所有地方都必须走这一个函数）。"""
+    try:
+        if isinstance(ent, tl_types.Channel):
+            return KIND_CHANNEL if getattr(ent, "broadcast", False) else KIND_GROUP
+        if isinstance(ent, tl_types.Chat):
+            return KIND_GROUP
+        if isinstance(ent, tl_types.User):
+            return KIND_BOT if getattr(ent, "bot", False) else KIND_USER
+        if isinstance(ent, (tl_types.ChatForbidden, tl_types.ChannelForbidden)):
+            return KIND_GONE
+    except Exception:
+        pass
+    return KIND_OTHER
+
+
+def is_member_kind(kind):
+    """是否「有成员、可退出」的类型 —— 只有频道/群组有成员数、
+    有创建者/管理员概念、需要也才能够做角色检测。"""
+    return kind in (KIND_CHANNEL, KIND_GROUP)
+
+
+# ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
+# ⚠️ 三个概念必须分清楚，混用会做出「以为删了、其实只是退出了」或者相反的功能：
+#
+#   退出       channels.LeaveChannelRequest / messages.DeleteChatUserRequest(revoke_history=True)
+#              -> 不再是成员。对频道/群组有效；创建者/管理员**退不出去**。
+#
+#   删除会话   messages.DeleteHistoryRequest(revoke=False)
+#              -> 只从**我这边**的会话列表移除并清空聊天记录，其他成员完全不知情。
+#                 对**所有类型**（私聊 / 机器人 / 频道 / 群组）都适用。
+#              ⚠️ 对频道/群组它只是本地隐藏：你仍是成员，对方再发消息会话就会重新出现。
+#                 想彻底不再看到，必须用「退出」。
+#
+#   销毁       channels.DeleteChannelRequest（频道 / 超级群，对所有成员生效、不可恢复）
+#              messages.DeleteChatRequest（普通群，同上）
+#              -> 只有**创建者**能调用，调用后频道/群对所有人消失，且无法撤销。
+#
+# 注意 Telethon 1.45 里发的是 channels.DeleteChannelRequest（单个），
+# **没有** DeleteChannelsRequest —— 后者是旧版别的层里的名字，import 会直接 ImportError。
+DEL_OK = "ok"              # 成功
+DEL_GONE = "gone"          # 已经不存在 / 不可访问（等价于已完成）
+DEL_BLOCKED = "blocked"    # 没权限（例如非创建者去销毁）
+
+# 销毁属于「不可恢复」操作，除确认清单外还要求在输入框里手打这个词
+DESTROY_CONFIRM_WORD = "删除"
+
+
+def build_delete_history_request(ent):
+    """构造「删除会话（含聊天记录）」请求。
+
+    revoke=False 是不可省的：它明确表示「不动对方那份记录」，
+    这正是「删除会话」的默认语义，也是这三条破坏性操作里最温和的一条。
+    max_id=0 表示删除该会话的全部消息（不只是当前已加载的那批）。"""
+    return tl_messages.DeleteHistoryRequest(
+        peer=ent, max_id=0, just_clear=False, revoke=False)
+
+
+def build_destroy_request(ent):
+    """构造「销毁自己创建的群组 / 频道」请求。普通群与超级群走的是不同接口，
+    按实体类型分派；未知类型**显式报错**，避免构造出必然失败的请求把错因盖住。"""
+    if isinstance(ent, tl_types.Chat):
+        return tl_messages.DeleteChatRequest(ent.id)
+    if isinstance(ent, tl_types.Channel):
+        return tl_channels.DeleteChannelRequest(ent)
+    raise ValueError(
+        "不支持的会话类型，无法删除：%s（只有你创建的频道 / 群组可以删除）"
+        % type(ent).__name__)
+
+
+def can_destroy_kind(kind):
+    """只有频道 / 群组才谈得上「被创建者销毁」。私聊、机器人、已不在都不行。"""
+    return kind in (KIND_CHANNEL, KIND_GROUP)
+
+
+async def delete_history_entity(client, ent):
+    """删除会话（含聊天记录），返回 (状态, 说明)。"""
+    try:
+        await client(build_delete_history_request(ent))
+        return DEL_OK, ""
+    except (telethon_errors.ChannelPrivateError,
+            telethon_errors.UserNotParticipantError):
+        return DEL_GONE, "会话已不存在或已不可访问"
+    except telethon_errors.PeerIdInvalidError:
+        # 实体缓存过期：退化到高层接口，它会先解析实体再删
+        await client.delete_dialog(ent)
+        return DEL_OK, ""
+    except telethon_errors.ChatAdminRequiredError:
+        return DEL_BLOCKED, "没有权限删除该会话的聊天记录"
+
+
+async def destroy_entity(client, ent):
+    """销毁自己创建的群组 / 频道（对所有成员生效、不可恢复），返回 (状态, 说明)。"""
+    try:
+        await client(build_destroy_request(ent))
+        return DEL_OK, ""
+    except telethon_errors.ChatAdminRequiredError:
+        return DEL_BLOCKED, "你不是该频道 / 群组的创建者，无法删除"
+    except (telethon_errors.ChannelPrivateError,
+            telethon_errors.UserNotParticipantError):
+        return DEL_GONE, "已经不在该频道 / 群组中，无需删除"
+    except telethon_errors.PeerIdInvalidError:
+        await client.delete_dialog(ent)
+        return DEL_OK, ""
+
+
 # 列表分页：每拉满一页就在界面追加显示，避免大账号长时间“没反应”
 DIALOG_PAGE = 200
 
-# 快捷筛选预设：(显示名, 用户数上限(<), 作品数上限(<))；None 表示该条件不启用
+# 快捷筛选预设：(显示名, 用户数上限(<), 作品数上限(<), 活跃天数下限(>))；None = 该条件不启用
+# 「活跃」用的是「最后一条消息距今多少天」，所以下限越大 = 越久没消息 = 越值得清理。
+# 「无消息」的会话按 ACTIVE_NEVER（极大值）参与比较，会被「活跃 > N 天」一并捞出来。
 FILTER_PRESETS = [
-    ("不筛选（显示全部）", None, None),
-    ("用户数 < 10", 10, None),
-    ("用户数 < 50", 50, None),
-    ("用户数 < 100", 100, None),
-    ("作品数 < 10", None, 10),
-    ("作品数 < 50", None, 50),
-    ("作品数 < 100", None, 100),
-    ("用户数<10 且 作品数<10", 10, 10),
-    ("用户数<100 且 作品数<10", 100, 10),
-    ("用户数<10 且 作品数<100", 10, 100),
+    ("不筛选（显示全部）", None, None, None),
+    ("用户数 < 10", 10, None, None),
+    ("用户数 < 50", 50, None, None),
+    ("用户数 < 100", 100, None, None),
+    ("作品数 < 10", None, 10, None),
+    ("作品数 < 50", None, 50, None),
+    ("作品数 < 100", None, 100, None),
+    # 休眠会话：按「多久没消息」挑 —— 这是「退掉也不可惜」最直接的判据
+    ("活跃 > 30 天没消息", None, None, 30),
+    ("活跃 > 90 天没消息", None, None, 90),
+    ("活跃 > 180 天没消息", None, None, 180),
+    ("活跃 > 365 天没消息", None, None, 365),
+    ("用户数<10 且 作品数<10", 10, 10, None),
+    ("用户数<100 且 作品数<10", 100, 10, None),
+    ("用户数<10 且 作品数<100", 10, 100, None),
+    # 组合：又小又死的频道
+    ("用户数<50 且 活跃>90 天", 50, None, 90),
+    ("作品数<10 且 活跃>180 天", None, 10, 180),
 ]
 FILTER_CUSTOM = "自定义…"
 
@@ -298,6 +609,11 @@ class App:
         self._role_cache = self.load_role_cache()
         # 白名单是「按频道 id」而不是行 id 存的 —— 刷新列表后行 id 会变，频道 id 不变
         self._whitelist = {str(x) for x in (self.config.get("whitelist") or []) if str(x).strip()}
+        # 分组（dialog filter）：每次刷新列表时重新拉取一次（成本 1 个请求）。
+        # _dlg_state 存本地复现分组规则所需的状态（免打扰 / 未读 / 归档 / 是否联系人）。
+        self._filters = []          # 服务器返回的 DialogFilter 列表（原样保留，回写时要用）
+        self._dlg_state = {}        # peer_key -> 规则判定所需状态
+        self._folder_names = []     # 用户自建分组名（进下拉框与菜单）
 
         self.build_ui()
         self.apply_config_to_ui()
@@ -472,24 +788,32 @@ class App:
         ttk.Label(bar, text="类型:").grid(row=0, column=5, padx=(4, 2))
         self.type_filter_var = tk.StringVar(value="全部")
         self.cmb_type = ttk.Combobox(bar, textvariable=self.type_filter_var, state="readonly",
-                                     width=6, values=("全部", "频道", "群组"))
+                                     width=7, values=TYPE_CHOICES)
         self.cmb_type.grid(row=0, column=6)
         self.cmb_type.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
+
+        # 分组筛选：取值在连上账号、读到 dialog filters 后填充（见 refresh_folders）
+        ttk.Label(bar, text="分组:").grid(row=0, column=7, padx=(10, 2))
+        self.folder_filter_var = tk.StringVar(value=FOLDER_ALL)
+        self.cmb_folder = ttk.Combobox(bar, textvariable=self.folder_filter_var, state="readonly",
+                                       width=12, values=(FOLDER_ALL, FOLDER_NONE))
+        self.cmb_folder.grid(row=0, column=8)
+        self.cmb_folder.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
         self.only_checked_var = tk.BooleanVar(value=False)
         self.chk_only_checked = ttk.Checkbutton(bar, text="只看已勾选", variable=self.only_checked_var,
                                                 command=self.on_quick_filter_changed)
-        self.chk_only_checked.grid(row=0, column=7, padx=8)
+        self.chk_only_checked.grid(row=0, column=9, padx=8)
 
         # 统计与任务控制
         self.btn_stats = ttk.Button(bar, text="获取 / 更新统计", command=self.on_fetch_stats, state="disabled")
-        self.btn_stats.grid(row=0, column=8, padx=3)
+        self.btn_stats.grid(row=0, column=10, padx=3)
         self.btn_stats_stop = ttk.Button(bar, text="停止统计", command=self.on_stop_stats, state="disabled")
-        self.btn_stats_stop.grid(row=0, column=9, padx=3)
+        self.btn_stats_stop.grid(row=0, column=11, padx=3)
         self.btn_stop_all = ttk.Button(bar, text="⏹ 停止全部", command=self.on_stop_all)
-        self.btn_stop_all.grid(row=0, column=10, padx=3)
+        self.btn_stop_all.grid(row=0, column=12, padx=3)
         self.btn_log_toggle = ttk.Button(bar, text="🗒 日志", width=8, command=self.toggle_log_panel)
-        self.btn_log_toggle.grid(row=0, column=11, padx=(8, 0))
+        self.btn_log_toggle.grid(row=0, column=13, padx=(8, 0))
 
         # 登录验证条：固定在界面上（不用弹窗，避免窗口被遮住时看不到输入框）
         strip = ttk.Frame(self.root, padding=(10, 2, 10, 6))
@@ -698,7 +1022,7 @@ class App:
         ttk.Label(row1, text="预设:").pack(side="left", padx=(2, 2))
         self.filter_preset_var = tk.StringVar(value=FILTER_PRESETS[0][0])
         self.filter_preset_cb = ttk.Combobox(
-            row1, textvariable=self.filter_preset_var, state="readonly", width=20,
+            row1, textvariable=self.filter_preset_var, state="readonly", width=22,
             values=[p[0] for p in FILTER_PRESETS] + [FILTER_CUSTOM],
         )
         self.filter_preset_cb.pack(side="left", padx=2)
@@ -716,6 +1040,13 @@ class App:
         ent_p.pack(side="left", padx=2)
         ent_p.bind("<Return>", lambda e: self.apply_filter())
 
+        # 活跃：只给「大于」方向 —— 清理时真正想知道的是「多久没动静了」
+        ttk.Label(row1, text="活跃(天) >").pack(side="left", padx=(12, 2))
+        self.filter_active_var = tk.StringVar()
+        ent_a = ttk.Entry(row1, textvariable=self.filter_active_var, width=7)
+        ent_a.pack(side="left", padx=2)
+        ent_a.bind("<Return>", lambda e: self.apply_filter())
+
         self.filter_unknown_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="隐藏统计未获取的行", variable=self.filter_unknown_var,
                         command=self.apply_filter).pack(side="left", padx=12)
@@ -728,16 +1059,18 @@ class App:
                   foreground="#6b7280").pack(side="left", padx=(10, 2))
 
         # 2) 列表（表格占满剩余空间，横向纵向都能滚）
-        frm_list = ttk.LabelFrame(parent, text="已订阅频道 / 群组（点「选择」列或按空格勾选要退出的）", padding=7)
+        frm_list = ttk.LabelFrame(parent, text="全部会话（频道 / 群组 / 私聊 / 机器人）—— 点「选择」列或按空格勾选", padding=7)
         frm_list.grid(row=2, column=0, sticky="nsew")
         frm_list.grid_rowconfigure(0, weight=1)
         frm_list.grid_columnconfigure(0, weight=1)
 
-        # 「safe」列放最后：按位置构造行值时不会挤动既有列（测试与旧代码都按前 7 个位置取值）
-        cols = ("sel", "name", "username", "type", "members", "posts", "id", "safe")
+        # 「id」「safe」保持在末尾：按位置构造行值的既有代码/测试不受影响，
+        # 新增列一律插在 posts 之后、id 之前。
+        cols = ("sel", "name", "username", "type", "members", "posts", "active", "folder", "id", "safe")
         self.tree = ttk.Treeview(frm_list, columns=cols, show="headings", height=16, selectmode="extended")
         self._col_titles = {"sel": "选择", "name": "名称", "username": "用户名",
-                            "type": "类型", "members": "用户数", "posts": "作品数", "id": "ID",
+                            "type": "类型", "members": "用户数", "posts": "作品数",
+                            "active": "活跃", "folder": "分组", "id": "ID",
                             "safe": "安全"}
         # 受保护行的整行着色：白名单=蓝，创建者/管理员=红（一眼看出哪些不会 / 不能退出）
         self.tree.tag_configure("wl", foreground="#185FA5")
@@ -746,13 +1079,16 @@ class App:
         for c, w, txt in (("sel", 50, "选择"), ("name", 220, "名称"),
                           ("username", 160, "用户名"), ("type", 60, "类型"),
                           ("members", 80, "用户数"), ("posts", 80, "作品数"),
+                          ("active", 72, "活跃"),
+                          ("folder", 120, "分组"),
                           ("id", 110, "ID"), ("safe", 92, "安全")):
             # 除「选择」列外，点列头即可排序（注意：ttk 不接受 command=None，需分支设置）
             if c == "sel":
                 self.tree.heading(c, text=txt)
             else:
                 self.tree.heading(c, text=txt, command=lambda cc=c: self.sort_by(cc))
-            self.tree.column(c, width=w, anchor="center" if c in ("sel", "type", "members", "posts", "safe") else "w")
+            self.tree.column(c, width=w,
+                             anchor="center" if c in ("sel", "type", "members", "posts", "active", "safe") else "w")
         self.tree.bind("<ButtonRelease-1>", self.on_tree_click)
 
         vsb = ttk.Scrollbar(frm_list, orient="vertical", command=self.tree.yview)
@@ -774,6 +1110,12 @@ class App:
         ttk.Button(frm_sel, text="清空全部", command=lambda: self.set_all(False, scope="all")).pack(side="left", padx=3)
         self.btn_whitelist = ttk.Button(frm_sel, text="🔒 白名单", command=self.on_toggle_whitelist_checked)
         self.btn_whitelist.pack(side="left", padx=3)
+        # 分组操作：对勾选的行批量加入 / 移出分组（只改归属，不退出也不删除）
+        self.btn_folder = ttk.Menubutton(frm_sel, text="📁 分组 ▾")
+        self._folder_menu = tk.Menu(self.btn_folder, tearoff=0)
+        self.btn_folder["menu"] = self._folder_menu
+        self.btn_folder.pack(side="left", padx=3)
+        self._rebuild_folder_menu()
         self.hide_protected_var = tk.BooleanVar(value=False)
         self.chk_hide_protected = ttk.Checkbutton(frm_sel, text="隐藏受保护项",
                                                   variable=self.hide_protected_var,
@@ -794,6 +1136,21 @@ class App:
         frm_act.grid(row=4, column=0, sticky="ew", pady=(5, 0))
         self.btn_leave = ttk.Button(frm_act, text="🚪 退出选中频道", command=self.on_leave, state="disabled")
         self.btn_leave.pack(side="left", padx=3)
+        # 删除类操作收进下拉菜单：破坏性高、使用频率低，
+        # 平铺在主按钮旁边反而容易连同「退出」一起误点。
+        self.btn_destroy = ttk.Menubutton(frm_act, text="🗑 删除 ▾", state="disabled")
+        self._destroy_menu = tk.Menu(self.btn_destroy, tearoff=0)
+        self._destroy_menu.add_command(label="删除会话（含聊天记录）…",
+                                      command=self.on_delete_dialogs)
+        self._destroy_menu.add_separator()
+        self._destroy_menu.add_command(
+            label="删除我创建的频道（不可恢复）…",
+            command=lambda: self.on_destroy_created(KIND_CHANNEL))
+        self._destroy_menu.add_command(
+            label="删除我创建的群组（不可恢复）…",
+            command=lambda: self.on_destroy_created(KIND_GROUP))
+        self.btn_destroy["menu"] = self._destroy_menu
+        self.btn_destroy.pack(side="left", padx=3)
         self.lbl_pending = ttk.Label(frm_act, text="待退出 0 个")
         self.lbl_pending.pack(side="left", padx=8)
         ttk.Label(frm_act, text="退出间隔(秒):").pack(side="left", padx=(10, 2))
@@ -1171,7 +1528,8 @@ class App:
             cfg.pop(k, None)
         self.root.geometry("1200x780")
         for c, w in (("sel", 50), ("name", 220), ("username", 160), ("type", 60),
-                     ("members", 80), ("posts", 80), ("id", 110), ("safe", 92)):
+                     ("members", 80), ("posts", 80), ("active", 72), ("folder", 120),
+                     ("id", 110), ("safe", 92)):
             try:
                 self.tree.column(c, width=w)
             except Exception:
@@ -1206,6 +1564,9 @@ class App:
             m.add_command(label="搜索该名称", command=self._ctx_search_name)
             m.add_separator()
             m.add_command(label="只退出这一个", command=self._ctx_leave_one)
+            m.add_separator()
+            m.add_command(label="只删除这一个会话（含聊天记录）", command=self._ctx_delete_one)
+            m.add_command(label="只删除这一个（仅当我是创建者）", command=self._ctx_destroy_one)
             self._ctx_menu = m
         try:
             self._ctx_menu.tk_popup(event.x_root, event.y_root)
@@ -1295,6 +1656,35 @@ class App:
         if not iid:
             return
         self.leave_items([iid])
+
+    def _ctx_delete_one(self):
+        """右键单行删除会话：走与批量完全相同的确认与执行链路（不做任何快捷后门）。"""
+        iid, vals = self._ctx_row()
+        if not iid:
+            return
+        to_del, blocked = self.build_delete_plan([iid])
+        if not to_del:
+            reason = blocked[0]["reason"] if blocked else "未知原因"
+            messagebox.showinfo("提示", f"该行受保护，未删除（{reason}）。")
+            self.log_msg(f"⏭ 该行受保护，已跳过删除（{reason}）。")
+            return
+        if not self._confirm_delete_dialogs(to_del, blocked, ""):
+            self.log_msg("已取消删除。")
+            return
+        self._set_run_buttons_disabled()
+        self.run_async(self._delete_dialogs([iid], self._interval(), self._jitter()))
+
+    def _ctx_destroy_one(self):
+        """右键单行销毁：类型由该行自身决定，仍然是「类型 + 创建者 + 手打确认词」三道闸。"""
+        iid, vals = self._ctx_row()
+        if not iid:
+            return
+        ent = self.channels.get(iid)
+        want_kind = session_kind(ent) if ent is not None else ""
+        if not can_destroy_kind(want_kind):
+            messagebox.showinfo("提示", "只有你创建的频道 / 群组才能被删除。")
+            return
+        self._destroy_entry([iid], want_kind)
 
     def apply_config_to_ui(self):
         # 注意：set 这些变量会触发自动保存，而自动保存会改写 self.config。
@@ -1699,6 +2089,7 @@ class App:
             self.btn_refresh.configure(state="normal"),
             self.btn_leave.configure(state="normal"),
             self.btn_kw_leave.configure(state="normal"),
+            self.btn_destroy.configure(state="normal"),
             self.btn_export.configure(state="normal"),
             self.on_refresh(),
         ))
@@ -1716,10 +2107,12 @@ class App:
         self.root.after(0, lambda: self.start_task("正在加载频道列表…"))
         try:
             self.log_msg("正在获取频道 / 群组列表（分页加载）...")
+            await self._load_folders()      # 先取分组，行插入时就能立刻填「分组」列
             self.root.after(0, self._begin_list)
             page = []
             scanned = 0
             found = 0
+            kinds = {}          # 类型 -> 个数，加载完打一行分布，便于确认没漏类型
             gen = self.client.iter_dialogs(limit=None)
             try:
                 async for d in gen:
@@ -1728,11 +2121,24 @@ class App:
                         break
                     ent = d.entity
                     scanned += 1
-                    if isinstance(ent, Channel):
-                        title = getattr(ent, "title", "") or ""
-                        uname = getattr(ent, "username", None) or ""
-                        typ = "频道" if ent.broadcast else "群组"
-                        page.append((ent, title, uname, typ, ent.id))
+                    if ent is None:
+                        continue
+                    typ = session_kind(ent)
+                    title = (getattr(ent, "title", None)
+                             or getattr(ent, "first_name", None) or "")
+                    uname = getattr(ent, "username", None) or ""
+                    if typ in (KIND_USER, KIND_BOT) or not title:
+                        # 私聊/机器人的实体名可能为空，用 Dialog 的显示名更准（含你给的联系人备注名）
+                        title = (d.name or title or str(getattr(ent, "id", "")))
+                    page.append((ent, title, uname, typ, getattr(ent, "id", "")))
+                    kinds[typ] = kinds.get(typ, 0) + 1
+                    # 记下规则判定所需状态（免打扰/未读/归档/是否联系人），供「分组」列使用
+                    try:
+                        pk = peer_key_of(ent)
+                        if pk is not None:
+                            self._dlg_state[pk] = dialog_state(d, typ, ent)
+                    except Exception:
+                        pass
                     if len(page) >= DIALOG_PAGE:
                         b, page = page, []
                         found += len(b)
@@ -1745,7 +2151,9 @@ class App:
                         b, page = page, []
                         found += len(b)
                         self.root.after(0, lambda b=b, s=scanned: self._append_rows(b, s))
-                    self.log_msg(f"✅ 列表加载完成：扫描 {scanned} 个会话，其中频道 / 群组 {found} 个。")
+                    dist = "、".join(f"{k} {v}" for k, v in kinds.items())
+                    self.log_msg(f"✅ 列表加载完成：扫描 {scanned} 个会话，全部收下 {found} 个"
+                                 + (f"（{dist}）" if dist else "。"))
             finally:
                 # 主动关闭分页生成器，避免“coroutine was never awaited”之类的告警
                 aclose = getattr(gen, "aclose", None)
@@ -1785,16 +2193,26 @@ class App:
         self._refresh_headings()
 
     def _tree_columns(self):
-        """真实列名元组。测试桩用的是 7 列 Treeview，按实际列构造行值可自动兼容。"""
+        """真实列名元组。真实界面永远走 tree.cget("columns")；
+        测试桩（既没有 cget 也不暴露 columns）退回**历史 7 列** ——
+        这样按位置构造行值、按位置取值的老桩仍然对齐，不会因为中间插入
+        active / folder 两列而整体错位一格。"""
         try:
             cols = self.tree.cget("columns")
-            return tuple(str(c) for c in cols) if cols else tuple(self._col_index)
+            return tuple(str(c) for c in cols) if cols else ("sel", "name", "username",
+                                                             "type", "members", "posts", "id")
         except Exception:
-            return tuple(self._col_index)
+            return ("sel", "name", "username", "type", "members", "posts", "id")
 
     def _row_values(self, title, uname, typ, cid, sel="☐"):
+        # 私聊 / 机器人 没有「成员数」，「已不在」连消息都取不到 ——
+        # 这类列直接给「-」，否则会被 _stat_num 当成「未获取」，白白发一轮必然失败的请求。
+        members0 = "…" if is_member_kind(typ) else NOT_APPLICABLE
+        posts0 = NOT_APPLICABLE if typ == KIND_GONE else "…"
+        active0 = NOT_APPLICABLE if typ == KIND_GONE else "…"
         cell = {"sel": sel, "name": title, "username": uname, "type": typ,
-                "members": "…", "posts": "…", "id": cid, "safe": ""}
+                "members": members0, "posts": posts0, "active": active0,
+                "folder": "", "id": cid, "safe": ""}
         return tuple(cell.get(c, "") for c in self._tree_columns())
 
     def _append_rows(self, rows, scanned=None):
@@ -1814,6 +2232,10 @@ class App:
                 self._refresh_safe_cell(iid)
             except Exception:
                 pass
+            try:
+                self._fill_folder_cell(iid, ent)   # 分组归属（filters 已在加载前拉好）
+            except Exception:
+                pass
         if self._filter_active:
             self.apply_filter(verbose=False)      # 新行按当前筛选条件决定是否显示
         else:
@@ -1831,8 +2253,8 @@ class App:
         if self._filter_active and not self.tree.get_children():
             self.log_msg("ℹ️ 当前筛选条件下暂无可显示的行：统计获取完成前多为未获取状态，"
                          "可取消勾选「隐藏统计未获取的行」，或等统计跑完。")
-        self.finish_task(f"列表加载完成：{n} 个频道 / 群组")
-        self.log_msg(f"已加载 {n} 个频道 / 群组，开始获取用户数 / 作品数 ...")
+        self.finish_task(f"列表加载完成：{n} 个会话")
+        self.log_msg(f"已加载 {n} 个会话，开始获取用户数 / 作品数 / 活跃时间 ...")
         self.run_async(self._fetch_stats(self._tree_epoch, force=False))
 
     def populate(self, items):
@@ -1866,6 +2288,12 @@ class App:
 
     def _role_of(self, iid):
         return (getattr(self, "_role", None) or {}).get(iid, "")
+
+    def role_known(self, iid):
+        """角色是否**已检测过**。_role 里存 "" 表示「检测过、是普通成员」，
+        键不存在才是「还没检测」—— 两者用 _role_of 读会得到同一个 ""，
+        不区分的话「删除我创建的频道」会把所有未检测的行当成非创建者整批跳过。"""
+        return iid in (getattr(self, "_role", None) or {})
 
     def protected_reason(self, iid):
         """该行受保护的原因（白名单 / 创建者 / 管理员）；不受保护返回 None。"""
@@ -1988,10 +2416,255 @@ class App:
         except Exception:
             pass
 
-    def _set_stat(self, epoch, iid, members, posts, role=None):
+    # ---------------- 分组（dialog filter） ----------------
+    async def _load_folders(self):
+        """拉取分组列表。失败不影响主流程 —— 只是分组列 / 分组筛选用不了。"""
+        try:
+            res = await self.client(tl_messages.GetDialogFiltersRequest())
+        except Exception as e:
+            self._filters = []
+            self.log_msg(f"ℹ️ 未能读取分组列表（{type(e).__name__}: {e}），分组列与分组筛选暂不可用。")
+            self.root.after(0, self.apply_folders_to_ui)
+            return
+        self._filters = list(getattr(res, "filters", res) or [])
+        names, ruled = [], 0
+        for f in self._filters:
+            if not is_real_folder(f):
+                continue
+            t = folder_title(f)
+            if not t:
+                continue
+            if t not in names:
+                names.append(t)
+            if folder_rules_on(f):
+                ruled += 1
+        self._folder_names = names
+        self.log_msg(f"✅ 已读取 {len(names)} 个分组"
+                     + (f"（{len(names) - ruled} 个纯手工、{ruled} 个带自动规则）" if names else "")
+                     + ("：" + "、".join(names) if names else "。"))
+        self.root.after(0, self.apply_folders_to_ui)
+
+    def apply_folders_to_ui(self):
+        """把分组名单填进筛选下拉与操作菜单。"""
+        vals = (FOLDER_ALL, FOLDER_NONE) + tuple(getattr(self, "_folder_names", []) or [])
+        try:
+            self.cmb_folder.configure(values=vals)
+        except Exception:
+            pass
+        try:
+            if self.folder_filter_var.get() not in vals:
+                # 选中的分组已被删除（在 Telegram 里改过）—— 回落到「全部分组」，
+                # 真正的显隐重算交给随后必然执行的 apply_filter
+                self.folder_filter_var.set(FOLDER_ALL)
+        except Exception:
+            pass
+        self._rebuild_folder_menu()
+
+    def _folder_names_of(self, ent):
+        """该会话所属的分组名（可能多个 —— 一个会话可以同时在几个分组里）。"""
+        key = peer_key_of(ent)
+        if key is None or not getattr(self, "_filters", None):
+            return []
+        st = (getattr(self, "_dlg_state", None) or {}).get(key) or {}
+        out = []
+        for f in self._filters:
+            try:
+                if not is_real_folder(f):
+                    continue
+                t = folder_title(f)
+                if t and t not in out and filter_matches(f, key, st):
+                    out.append(t)
+            except Exception:
+                continue
+        return out
+
+    def _fill_folder_cell(self, iid, ent):
+        try:
+            names = self._folder_names_of(ent)
+            self.tree.set(iid, "folder", "、".join(names))
+        except Exception:
+            pass
+
+    def _refresh_folder_cells(self):
+        """分组数据变化后，重刷所有行的「分组」列（分组筛选生效时还要重算显隐）。"""
+        for iid, ent in list(getattr(self, "channels", {}).items()):
+            self._fill_folder_cell(iid, ent)
+        if getattr(self, "_filter_active", False):
+            self.apply_filter(verbose=False)
+
+    def _match_folder(self, iid):
+        want = getattr(self, "_filter_folder", FOLDER_ALL)
+        if not want or want == FOLDER_ALL:
+            return True
+        try:
+            txt = str(self.tree.set(iid, "folder") or "").strip()
+        except Exception:
+            return True
+        if want == FOLDER_NONE:
+            return not txt
+        return want in [x.strip() for x in txt.split("、") if x.strip()]
+
+    def _active_num(self, iid):
+        """活跃天数：数字=天数；「无消息」= 极大值（永远算「很久没动」）；未知=None。"""
+        try:
+            s = str(self.tree.set(iid, "active") or "").strip()
+        except Exception:
+            return None
+        if s == ACTIVE_NONE:
+            return ACTIVE_NEVER
+        if s in ("", ACTIVE_UNKNOWN, NOT_APPLICABLE, "?"):
+            return None
+        try:
+            return int(float(s))
+        except (TypeError, ValueError):
+            return None
+
+    def _rebuild_folder_menu(self):
+        m = getattr(self, "_folder_menu", None)
+        if m is None:
+            return
+        try:
+            m.delete(0, "end")
+        except Exception:
+            pass
+        names = list(getattr(self, "_folder_names", []) or [])
+        if names:
+            sub_add = tk.Menu(m, tearoff=0)
+            sub_del = tk.Menu(m, tearoff=0)
+            for nm in names:
+                sub_add.add_command(label=nm, command=lambda n=nm: self.on_folder_action(True, n))
+                sub_del.add_command(label=nm, command=lambda n=nm: self.on_folder_action(False, n))
+            m.add_cascade(label="加入分组（勾选的行）", menu=sub_add)
+            m.add_cascade(label="移出分组（勾选的行）", menu=sub_del)
+        else:
+            m.add_command(label="（尚未连接或还没有分组）", state="disabled")
+        m.add_separator()
+        m.add_command(label="重新读取分组列表", command=self.on_reload_folders)
+
+    def on_reload_folders(self):
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接账号。")
+            return
+        self.run_async(self._reload_folders())
+
+    async def _reload_folders(self):
+        await self._load_folders()
+        self.root.after(0, self._refresh_folder_cells)
+
+    def on_folder_action(self, add=True, folder_name=None):
+        name = folder_name or self.folder_filter_var.get()
+        if name in (FOLDER_ALL, FOLDER_NONE):
+            messagebox.showinfo("提示", "请先在顶部「分组」下拉里选中一个具体分组，再执行这个操作。")
+            return
+        iids = self.selected_items_all()
+        if not iids:
+            messagebox.showinfo("提示", "还没有勾选任何行。先在列表里勾选，再来操作分组。")
+            return
+        verb = "加入" if add else "移出"
+        if not messagebox.askyesno("确认", f"把已勾选的 {len(iids)} 个会话{verb}分组「{name}」？\n"
+                                          "（只改分组归属，不会退出或删除任何会话）"):
+            return
+        self.run_async(self._set_folder_membership(iids, name, add))
+
+    async def _set_folder_membership(self, iids, folder_name, add=True):
+        """把勾选的会话加入 / 移出指定分组。
+
+        ⚠️ updateDialogFilter 是**整表替换**，两个硬要求：
+        1) 每次现读现改，不能用缓存的快照 —— 否则会把你在 Telegram 客户端的改动覆盖掉；
+        2) 在服务器返回的 DialogFilter 对象上**原地改字段**后原样回传。
+           自己 new 一个 DialogFilter 再逐字段填，会丢掉 Telethon 这个版本不认识的字段
+           （例如 color / title_noanimate），把分组的颜色和样式悄悄清掉。
+        """
+        self.root.after(0, lambda: self.start_task(
+            f"正在{'加入' if add else '移出'}分组「{folder_name}」…"))
+        try:
+            res = await self.client(tl_messages.GetDialogFiltersRequest())
+            target = None
+            for f in list(getattr(res, "filters", res) or []):
+                if is_real_folder(f) and folder_title(f) == folder_name:
+                    target = f
+                    break
+            if target is None:
+                self.log_msg(f"❌ 分组「{folder_name}」已不存在（可能刚在 Telegram 里改过），请重新读取分组。")
+                self.root.after(0, lambda: self.finish_task("分组不存在"))
+                return
+            peers, bad = [], 0
+            for iid in iids:
+                ent = self.channels.get(iid)
+                if ent is None:
+                    continue
+                try:
+                    peers.append(await self.client.get_input_entity(ent))
+                except Exception:
+                    bad += 1
+            keys = {input_peer_key(p) for p in peers}
+            keys.discard(None)
+            if not keys:
+                self.log_msg("❌ 没有可操作的会话（实体全部解析失败）。")
+                self.root.after(0, lambda: self.finish_task("无可用会话"))
+                return
+
+            if add:
+                # ⚠️ 加入时**什么都不删**。绝不能把已经在 pinned_peers 里的项挪进
+                # include_peers —— 那等于顺手把用户的置顶取消了（pinned 只是置顶显示，
+                # 但它一旦被挪走，客户端里的置顶就没了）。
+                keep = list(getattr(target, "include_peers", None) or [])
+                keep_pin = list(getattr(target, "pinned_peers", None) or [])
+                have = {input_peer_key(p) for p in keep}
+                have |= {input_peer_key(p) for p in keep_pin}
+                have.discard(None)
+                for p in peers:
+                    k = input_peer_key(p)
+                    if k is not None and k not in have:
+                        keep.append(p)
+                        have.add(k)
+            else:
+                # 移出：include_peers 与 pinned_peers 两处都要摘干净，
+                # 否则从分组里「移出」了、却还留在置顶列表里。
+                keep = [p for p in (getattr(target, "include_peers", None) or [])
+                        if input_peer_key(p) not in keys]
+                keep_pin = [p for p in (getattr(target, "pinned_peers", None) or [])
+                            if input_peer_key(p) not in keys]
+            if not keep and not keep_pin:
+                # 服务端会直接报 FILTER_INCLUDE_EMPTY，提前拦下来并说清原因
+                self.log_msg(f"⛔ 这样会把分组「{folder_name}」清空 —— Telegram 不允许 include_peers 为空，"
+                             "已跳过。若确实不再需要这个分组，请在 Telegram 客户端里删除它。")
+                self.root.after(0, lambda: self.finish_task("已跳过（会清空分组）"))
+                return
+            if len(keep) > FOLDER_SOFT_LIMIT:
+                self.log_msg(f"⚠️ 分组「{folder_name}」将有 {len(keep)} 个手工会话，"
+                             f"超过常见上限 {FOLDER_SOFT_LIMIT}，服务端可能拒绝。")
+
+            target.include_peers = keep
+            target.pinned_peers = keep_pin
+            await self.client(tl_messages.UpdateDialogFilterRequest(id=target.id, filter=target))
+
+            # 顺手把本地那份 _filters 里对应的对象换成刚提交的这份。
+            # 不换的话，「分组」列会一直显示改动**之前**的归属 —— 明明加进去了却还是空的，
+            # 直到用户再手动「重新读取分组列表」才对上。
+            for idx, f in enumerate(getattr(self, "_filters", None) or []):
+                if is_real_folder(f) and getattr(f, "id", None) == target.id:
+                    self._filters[idx] = target
+                    break
+
+            msg = f"✅ 已把 {len(keys)} 个会话{'加入' if add else '移出'}分组「{folder_name}」"
+            if bad:
+                msg += f"（{bad} 个会话实体解析失败，已跳过）"
+            self.log_msg(msg)
+            self.root.after(0, lambda: self.finish_task(f"分组操作完成：{len(keys)} 个"))
+            self.root.after(0, self._refresh_folder_cells)
+        except FloodWaitError as e:
+            self.log_msg(f"⏳ 触发限流：需要等待 {e.seconds} 秒，请稍后重试。")
+            self.root.after(0, lambda: self.finish_task("限流等待"))
+        except Exception as e:
+            self.log_msg(f"❌ 分组操作失败: {type(e).__name__}: {e}")
+            self.root.after(0, lambda: self.finish_task("分组操作失败"))
+
+    def _set_stat(self, epoch, iid, members, posts, role=None, active_ts=UNSET):
         """安全回填统计列：仅当列表代次未变、且该行仍存在时才写入。
         避免刷新列表 / 退出频道后，后台任务对已失效的行 ID 调用 set() 抛 TclError。
-        若筛选生效，同时按新到的数值实时调整该行是否显示。"""
+        若筛选生效，同时按新到的数值实时调整该行是否显示。
+        active_ts 传 UNSET 表示「本次不动活跃列」（旧调用点与测试桩的 7 列表格没有该列）。"""
         if epoch != self._tree_epoch:
             return
         try:
@@ -2004,6 +2677,12 @@ class App:
             self.tree.set(iid, "posts", posts)
         except Exception:
             return
+        # 活跃列单独兜异常：测试桩的 Treeview 没有这一列，不能因此跳过下面的筛选重判
+        if active_ts is not UNSET:
+            try:
+                self.tree.set(iid, "active", active_text(active_ts))
+            except Exception:
+                pass
         if not self._filter_active:
             return
         self._recheck_visibility(iid)
@@ -2104,24 +2783,35 @@ class App:
         cached_role = 0
         for iid, ent in items:
             key = str(getattr(ent, "id", ""))
+            kind = session_kind(ent)
             hit = None
             if use_cache and not force:
                 c = self._stats_cache.get(key)
-                if isinstance(c, list) and len(c) >= 3 and (now - c[2]) < ttl:
-                    hit = (c[0], c[1])
+                if isinstance(c, list) and len(c) >= 3:
+                    # 新格式 [members, posts, last_ts, 写入时间]；旧格式 [members, posts, 写入时间]
+                    if len(c) >= 4:
+                        saved_ts, last_ts = c[3], c[2]
+                    else:
+                        saved_ts, last_ts = c[2], UNSET
+                    if (now - saved_ts) < ttl:
+                        hit = (c[0], c[1], last_ts)
             role_hit = None
             rc = role_cache.get(key)
             if isinstance(rc, list) and len(rc) >= 2 and use_cache and not force and (now - rc[1]) < role_ttl:
                 role_hit = rc[0]
             if hit is not None:
                 cached += 1
-                self.root.after(0, lambda i=iid, m=hit[0], p=hit[1], ep=epoch, r=role_hit:
-                                self._set_stat(ep, i, m, p, r))
+                self.root.after(0, lambda i=iid, m=hit[0], p=hit[1], a=hit[2], ep=epoch, r=role_hit:
+                                self._set_stat(ep, i, m, p, r, a))
             if role_hit is not None:
                 cached_role += 1
             need_stats = hit is None
-            # 白名单频道不必再花一次请求判角色（安全列已显示「🔒 白名单」）
-            need_role = detect_roles and role_hit is None and key not in whitelist_of(self)
+            # 白名单频道不必再花一次请求判角色（安全列已显示「🔒 白名单」）；
+            # 并且只有频道/群组才有创建者/管理员概念 —— 对 User 调 get_permissions 必然失败，
+            # 450 个私聊/机器人各重试 3 次会直接把自己送进 FloodWait。
+            need_role = (detect_roles and role_hit is None
+                         and is_member_kind(kind)
+                         and key not in whitelist_of(self))
             if need_stats or need_role:
                 todo.append((iid, ent, need_stats, need_role))
 
@@ -2140,27 +2830,52 @@ class App:
             if cancel.is_set() or epoch != self._tree_epoch:
                 return
             key = str(getattr(ent, "id", ""))
-            label = getattr(ent, "title", None) or getattr(ent, "id", "")
+            kind = session_kind(ent)
+            label = (getattr(ent, "title", None) or getattr(ent, "first_name", None)
+                     or getattr(ent, "id", ""))
             members = posts = None
+            last_ts = UNSET
             if need_stats:
-                members = getattr(ent, "participants_count", None)
-                try:
-                    members = int(members) if members else None
-                except Exception:
-                    members = None
-                # ---- 成员数：优先用实体自带值，缺失才请求 ----
-                if members is None:
-                    members = await self._retry(lambda: self.client(GetFullChannelRequest(ent)),
-                                                lambda r: int(getattr(r.full_chat, "participants_count", 0) or 0),
-                                                f"成员数 {label}")
-                # ---- 作品数：消息总数，1 次请求 ----
-                async def _posts():
-                    msgs = await self.client.get_messages(ent, limit=1)
-                    t = getattr(msgs, "total", None)
-                    if not t:
-                        t = (msgs[-1].id if msgs else 0)
-                    return int(t or 0)
-                posts = await self._retry(_posts, lambda r: r, f"作品数 {label}")
+                # ---- 成员数：只有频道 / 群组才有这个概念 ----
+                if not is_member_kind(kind):
+                    members = NOT_APPLICABLE          # 私聊 / 机器人 / 已不在
+                else:
+                    members = getattr(ent, "participants_count", None)
+                    try:
+                        members = int(members) if members else None
+                    except Exception:
+                        members = None
+                    # GetFullChannelRequest 只对 Channel 有效；
+                    # 普通群（Chat）自带 participants_count，取不到就不取，别发注定失败的请求。
+                    if members is None and isinstance(ent, tl_types.Channel):
+                        members = await self._retry(lambda: self.client(GetFullChannelRequest(ent)),
+                                                    lambda r: int(getattr(r.full_chat, "participants_count", 0) or 0),
+                                                    f"成员数 {label}")
+                # ---- 作品数 + 活跃：同一个请求顺手拿两个值，不额外增加请求数 ----
+                if kind == KIND_GONE:
+                    posts, last_ts = NOT_APPLICABLE, NOT_APPLICABLE
+                else:
+                    async def _posts():
+                        msgs = await self.client.get_messages(ent, limit=1)
+                        t = getattr(msgs, "total", None)
+                        if not t:
+                            t = (msgs[-1].id if msgs else 0)
+                        when = None
+                        try:
+                            if len(msgs) and msgs[0].date is not None:
+                                when = msgs[0].date
+                                if when.tzinfo is None:
+                                    when = when.replace(tzinfo=datetime.timezone.utc)
+                                when = when.timestamp()
+                        except Exception:
+                            when = None
+                        return int(t or 0), when
+
+                    got = await self._retry(_posts, lambda r: r, f"作品数 {label}")
+                    if got is None:
+                        posts, last_ts = None, UNSET
+                    else:
+                        posts, last_ts = got
                 if members is None:
                     members = "?"
                 if posts is None:
@@ -2168,7 +2883,8 @@ class App:
                 if members == "?" or posts == "?":
                     failed += 1
                 else:
-                    self._stats_cache[key] = [members, posts, time.time()]
+                    # 存时间戳而不是天数：天数隔天就永久偏小，必须在显示时才换算
+                    self._stats_cache[key] = [members, posts, last_ts, time.time()]
             # ---- 角色：创建者 / 管理员退不出去，提前识别以便跳过 ----
             role = None
             if need_role:
@@ -2180,8 +2896,8 @@ class App:
                     role_cache[key] = [role, time.time()]
             done += 1
             if need_stats:
-                self.root.after(0, lambda i=iid, m=members, p=posts, ep=epoch, r=role:
-                                self._set_stat(ep, i, m, p, r))
+                self.root.after(0, lambda i=iid, m=members, p=posts, ep=epoch, r=role, a=last_ts:
+                                self._set_stat(ep, i, m, p, r, a))
             else:
                 self.root.after(0, lambda i=iid, ep=epoch, r=role: self._apply_role(ep, i, r))
             if done % 25 == 0 or done == len(todo):
@@ -2285,6 +3001,10 @@ class App:
         """排序键：数字列按数值；文字列按字典序；未获取到的值恒排最后。"""
         raw = self.tree.set(iid, col)
         s = "" if raw is None else str(raw).strip()
+        if s == ACTIVE_NONE:
+            # 「无消息」= 比任何天数都久，按数值参与排序（升序排最后、降序排最前），
+            # 否则它会掉进下面的文字分支，跟「久没动静」的语义对不上。
+            return (1, float(ACTIVE_NEVER), "")
         try:
             return (1, float(s), "")
         except (TypeError, ValueError):
@@ -2391,50 +3111,80 @@ class App:
             t = self.type_filter_var.get()
         except Exception:
             t = "全部"
-        return t if t in ("频道", "群组") else "全部"
+        return t if t in TYPE_CHOICES else "全部"
+
+    def _type_of(self, iid):
+        """读某行「类型」列的文本。"""
+        try:
+            return str(self.tree.set(iid, "type") or "")
+        except Exception:
+            return ""
 
     def _match_type(self, iid):
         t = self._type_selected()
         if t == "全部":
             return True
-        try:
-            return str(self.tree.set(iid, "type") or "") == t
-        except Exception:
-            return True
+        row = self._type_of(iid)
+        if not row:
+            return True          # 读不到类型（桩 / 异常）时不误伤，宁可多显示
+        return row == t
 
     def _row_keep(self, iid, m_lt, p_lt, hide_unknown):
         """判断该行在当前筛选条件下是否应显示（多条件为 AND）。
-        维度：搜索关键词 / 类型 / 只看已勾选 / 用户数阈值 / 作品数阈值。"""
+        维度：搜索关键词 / 类型 / 分组 / 只看已勾选 / 用户数 / 作品数 / 活跃天数。"""
         if not self._match_search(iid):
             return False
         if not self._match_type(iid):
+            return False
+        if not self._match_folder(iid):
             return False
         if getattr(self, "_hide_protected", False) and self.protected_reason(iid):
             return False          # 「隐藏受保护项」：白名单 / 创建者 / 管理员不参与选择与退出
         if getattr(self, "_only_checked", False) and not self._is_checked(iid):
             return False
-        if m_lt is None and p_lt is None:
+        a_gt = getattr(self, "_filter_active_gt", None)
+        if m_lt is None and p_lt is None and a_gt is None:
             return True
         if m_lt is not None:
-            v = self._stat_num(iid, "members")
-            if v is None:
-                return not hide_unknown
-            if not (v < m_lt):
-                return False
+            # 「用户数」只对频道/群组有意义：私聊、机器人、已不在一律不参与该条件，
+            # 否则一勾「隐藏统计未获取的行」就会把所有私聊整批藏掉。
+            if is_member_kind(self._type_of(iid)):
+                v = self._stat_num(iid, "members")
+                if v is None:
+                    return not hide_unknown
+                if not (v < m_lt):
+                    return False
         if p_lt is not None:
             v = self._stat_num(iid, "posts")
             if v is None:
                 return not hide_unknown
             if not (v < p_lt):
                 return False
+        if a_gt is not None:
+            v = self._active_num(iid)
+            if v is None:
+                return not hide_unknown
+            if not (v > a_gt):        # 「活跃天数 > N」= 超过 N 天没有任何消息
+                return False
         return True
 
+    def _threshold_of(self, attr):
+        """安全解析某个阈值输入框（属性可能不存在 —— 测试桩只有部分控件）。"""
+        var = getattr(self, attr, None)
+        if var is None:
+            return None
+        try:
+            return self._parse_threshold(var)
+        except Exception:
+            return None
+
     def _sync_filter_preset_name(self):
-        """让预设下拉框与当前两个输入框保持一致（不匹配时显示「自定义…」）。"""
+        """让预设下拉框与当前几个输入框保持一致（不匹配时显示「自定义…」）。"""
         m_lt = self._parse_threshold(self.filter_members_var)
         p_lt = self._parse_threshold(self.filter_posts_var)
-        for nm, m, p in FILTER_PRESETS:
-            if m == m_lt and p == p_lt:
+        a_gt = self._threshold_of("filter_active_var")
+        for nm, m, p, a in FILTER_PRESETS:
+            if m == m_lt and p == p_lt and a == a_gt:
                 self.filter_preset_var.set(nm)
                 return
         self.filter_preset_var.set(FILTER_CUSTOM)
@@ -2444,26 +3194,37 @@ class App:
         name = self.filter_preset_var.get()
         if name == FILTER_CUSTOM:
             return
-        for nm, m, p in FILTER_PRESETS:
+        for nm, m, p, a in FILTER_PRESETS:
             if nm == name:
                 self.filter_members_var.set("" if m is None else str(m))
                 self.filter_posts_var.set("" if p is None else str(p))
+                try:
+                    self.filter_active_var.set("" if a is None else str(a))
+                except Exception:
+                    pass
                 break
         self.apply_filter()
 
     def apply_filter(self, verbose=True):
-        """按「用户数 / 作品数」阈值筛选：不满足条件的行用 detach 隐藏。
+        """按「用户数 / 作品数 / 活跃天数 / 类型 / 分组」筛选：不满足条件的行用 detach 隐藏。
         隐藏只影响显示，**行 ID 与数据都保留** —— 统计回填、勾选状态、排序位置都不受影响。"""
         m_lt = self._parse_threshold(self.filter_members_var)
         p_lt = self._parse_threshold(self.filter_posts_var)
+        a_gt = self._threshold_of("filter_active_var")
         hide_unknown = bool(self.filter_unknown_var.get())
         self._only_checked = bool(getattr(self, "only_checked_var", None) and self.only_checked_var.get())
         tsel = self._type_selected()
         has_kw = bool(self._search_tokens())
         self._hide_protected = var_bool(self, "hide_protected_var", False)
-        self._filter_active = (m_lt is not None or p_lt is not None
+        try:
+            folder = self.folder_filter_var.get() or FOLDER_ALL
+        except Exception:
+            folder = FOLDER_ALL
+        self._filter_folder = folder
+        self._filter_active_gt = a_gt
+        self._filter_active = (m_lt is not None or p_lt is not None or a_gt is not None
                                or has_kw or tsel != "全部" or self._only_checked
-                               or self._hide_protected)
+                               or self._hide_protected or folder != FOLDER_ALL)
         self._filter_members_lt, self._filter_posts_lt = m_lt, p_lt
         self._sync_filter_preset_name()
 
@@ -2509,10 +3270,14 @@ class App:
                     cond.append(f"用户数<{m_lt}")
                 if p_lt is not None:
                     cond.append(f"作品数<{p_lt}")
+                if a_gt is not None:
+                    cond.append(f"活跃>{a_gt}天")
                 if has_kw:
                     cond.append(f"搜索「{self.search_var.get().strip()}」")
                 if tsel != "全部":
                     cond.append(f"类型={tsel}")
+                if folder != FOLDER_ALL:
+                    cond.append(f"分组={folder}")
                 if self._only_checked:
                     cond.append("只看已勾选")
                 if getattr(self, "_hide_protected", False):
@@ -2528,16 +3293,21 @@ class App:
     def clear_filter(self):
         self.filter_members_var.set("")
         self.filter_posts_var.set("")
-        # 搜索 / 类型 / 只看已勾选 也一并复位，避免「清除」后仍有隐藏原因看不出来
+        # 搜索 / 类型 / 分组 / 活跃 / 只看已勾选 也一并复位，
+        # 避免「清除」之后仍有行被隐藏、却看不出隐藏原因
         try:
             self.search_var.set("")
             self.type_filter_var.set("全部")
             self.only_checked_var.set(False)
             self.hide_protected_var.set(False)
+            self.filter_active_var.set("")
+            self.folder_filter_var.set(FOLDER_ALL)
         except Exception:
             pass
         self._only_checked = False
         self._hide_protected = False
+        self._filter_active_gt = None
+        self._filter_folder = FOLDER_ALL
         self.apply_filter()
 
     # ---------------- 选择逻辑 ----------------
@@ -2762,62 +3532,103 @@ class App:
             return bool(messagebox.askyesno("确认", msg))
         return self._preview_leave_dialog(to_leave, blocked, notes)
 
-    def _preview_leave_dialog(self, to_leave, blocked, notes=""):
-        """待退出清单预览窗：左右两栏分别列出「将退出」与「已跳过（受保护）」。"""
+    def _plan_dialog(self, title, headline, to_do, blocked, notes="",
+                     ok_text=None, blocked_tab=None, danger=False,
+                     remember_attr=None, confirm_word=None):
+        """通用「执行前清单」预览窗：左右两页分别列出「将执行」与「已跳过」。
+
+        - remember_attr="preview_leave_var" -> 显示「以后不再显示此清单」（退出用）
+        - confirm_word="删除"              -> 额外要求**手打确认词**，且确认按钮
+          初始为不可点（销毁用）。这是不可恢复操作的最后一道闸，不存在绕过开关。
+        """
         dlg = tk.Toplevel(self.root)
-        dlg.title("退出前确认")
+        dlg.title(title)
         dlg.transient(self.root)
         try:
-            dlg.geometry("680x470")
+            dlg.geometry("680x520" if confirm_word else "680x470")
         except Exception:
             pass
 
         outer = ttk.Frame(dlg, padding=10)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text=f"确定要退出选中的 {len(to_leave)} 个频道 / 群组？",
-                  font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(outer, text=headline, font=("", 10, "bold")).pack(anchor="w")
         if blocked:
-            ttk.Label(outer, text=f"另有 {len(blocked)} 个受保护项将被跳过（白名单 / 创建者 / 管理员）。",
+            ttk.Label(outer, text=f"另有 {len(blocked)} 个将被跳过（原因见第二个标签页）。",
                       foreground="#a32d2d").pack(anchor="w", pady=(3, 0))
         if notes:
             ttk.Label(outer, text=notes, foreground="#6b7280",
                       wraplength=640, justify="left").pack(anchor="w", pady=(3, 0))
+        if danger:
+            ttk.Label(outer, text="⚠️ 不可恢复：删除后所有成员都再也看不到它。",
+                      foreground="#a32d2d").pack(anchor="w", pady=(3, 0))
 
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True, pady=8)
-        nb.add(self._plan_tree(nb, to_leave, check_col=False),
-               text=f"将退出（{len(to_leave)}）")
+        nb.add(self._plan_tree(nb, to_do, check_col=False),
+               text=f"将执行（{len(to_do)}）")
         if blocked:
             nb.add(self._plan_tree(nb, blocked, check_col=True),
-                   text=f"已跳过 · 受保护（{len(blocked)}）")
+                   text=blocked_tab or f"已跳过（{len(blocked)}）")
 
-        chk = tk.BooleanVar(value=var_bool(self, "preview_leave_var", True))
-        ttk.Checkbutton(outer, text="以后不再显示此清单", variable=chk).pack(anchor="w")
+        remember_var = None
+        if remember_attr:
+            remember_var = tk.BooleanVar(value=var_bool(self, remember_attr, True))
+            ttk.Checkbutton(outer, text="以后不再显示此清单",
+                            variable=remember_var).pack(anchor="w")
 
         result = {"ok": False}
+        ok_btn = ttk.Button(outer, text=ok_text or f"确认执行 {len(to_do)} 个",
+                            state="disabled" if confirm_word else "normal")
+
+        if confirm_word:
+            row = ttk.Frame(outer)
+            row.pack(fill="x", pady=(8, 0))
+            ttk.Label(row, text=f"确认无误，请输入「{confirm_word}」：").pack(side="left")
+            word_var = tk.StringVar()
+            entry = ttk.Entry(row, textvariable=word_var, width=10)
+            entry.pack(side="left", padx=6)
+            entry.focus_set()
+
+            def _sync(*_a):
+                ok_btn.configure(
+                    state="normal" if word_var.get().strip() == confirm_word else "disabled")
+            word_var.trace_add("write", _sync)
 
         def on_ok():
             result["ok"] = True
-            try:
-                self.preview_leave_var.set(bool(chk.get()))
-                self.save_config()
-            except Exception:
-                pass
+            if remember_var is not None:
+                try:
+                    getattr(self, remember_attr).set(bool(remember_var.get()))
+                    self.save_config()
+                except Exception:
+                    pass
             dlg.destroy()
 
+        ok_btn.configure(command=on_ok)
         bar = ttk.Frame(outer)
         bar.pack(fill="x", pady=(6, 0))
         ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=4)
-        ttk.Button(bar, text=f"确认退出 {len(to_leave)} 个", command=on_ok).pack(side="right", padx=4)
+        ok_btn.pack(side="right", padx=4)
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
-        dlg.bind("<Return>", lambda e: on_ok())
+        if not confirm_word:
+            dlg.bind("<Return>", lambda e: on_ok())
         try:
             dlg.grab_set()
         except Exception:
             pass
         dlg.wait_window()
         return result["ok"]
+
+    def _preview_leave_dialog(self, to_leave, blocked, notes=""):
+        """待退出清单预览窗：左右两栏分别列出「将退出」与「已跳过（受保护）」。"""
+        return self._plan_dialog(
+            "退出前确认",
+            f"确定要退出选中的 {len(to_leave)} 个频道 / 群组？",
+            to_leave, blocked, notes,
+            ok_text=f"确认退出 {len(to_leave)} 个",
+            blocked_tab=f"已跳过 · 受保护（{len(blocked)}）",
+            remember_attr="preview_leave_var")
 
     def _plan_tree(self, parent, rows, check_col=False):
         """清单里的小表格：名称 / 用户名 / 类型 / 用户数 / 作品数 / ID（+ 跳过原因）。"""
@@ -2842,22 +3653,10 @@ class App:
 
     def leave_items(self, iids, auto_confirm=False):
         if not iids:
-            if self._sel_hidden:
-                messagebox.showinfo(
-                    "提示",
-                    f"当前显示中没有勾选的行，但有 {len(self._sel_hidden)} 个勾选项被筛选隐藏了。\n"
-                    "如需退出它们：点「清除」筛选后再「全选」。",
-                )
-            else:
-                messagebox.showinfo("提示", "没有可退出的频道。")
+            self._warn_no_selection("没有可退出的频道。")
             return
         to_leave, blocked = self.build_leave_plan(iids)
-        notes = ""
-        if self._sel_hidden:
-            notes = (f"另有 {len(self._sel_hidden)} 个勾选项被当前筛选隐藏，本次不会退出。"
-                     "（要一并退出请先点「清除」筛选，再「全选」）")
-        elif self._filter_active:
-            notes = "仅处理当前筛选显示出来的行。"
+        notes = self._scope_notes("本次不会退出")
         if not to_leave:
             names = "、".join(b["name"] for b in blocked[:6])
             more = f"，另有 {len(blocked) - 6} 个" if len(blocked) > 6 else ""
@@ -2881,9 +3680,27 @@ class App:
             jitter = max(0, int(self.jitter_var.get()))
         except Exception:
             jitter = 0
-        self.btn_leave.configure(state="disabled")
-        self.btn_kw_leave.configure(state="disabled")
+        self._set_run_buttons_disabled()
         self.run_async(self._leave([x["iid"] for x in to_leave], interval, jitter))
+
+    # ---- 破坏性操作共用的提示文案（退出 / 删除会话 / 销毁 三处一致，避免口径漂移）----
+    def _warn_no_selection(self, empty_msg="没有勾选任何会话。"):
+        if self._sel_hidden:
+            messagebox.showinfo(
+                "提示",
+                f"当前显示中没有勾选的行，但有 {len(self._sel_hidden)} 个勾选项被筛选隐藏了。\n"
+                "如需处理它们：点「清除」筛选后再「全选」。",
+            )
+        else:
+            messagebox.showinfo("提示", empty_msg)
+
+    def _scope_notes(self, verb="本次不会处理"):
+        if self._sel_hidden:
+            return (f"另有 {len(self._sel_hidden)} 个勾选项被当前筛选隐藏，{verb}。"
+                    "（要一并处理请先点「清除」筛选，再「全选」）")
+        if self._filter_active:
+            return "仅处理当前筛选显示出来的行。"
+        return ""
 
     def on_leave(self):
         self.leave_items(self.selected_items())
@@ -2928,6 +3745,8 @@ class App:
                     self.tree.set(iid, "type"),
                     self.tree.set(iid, "members"),
                     self.tree.set(iid, "posts"),
+                    self.tree.set(iid, "active"),
+                    self.tree.set(iid, "folder"),
                     self.tree.set(iid, "id"),
                     self.protected_reason(iid) or "",
                 ))
@@ -2948,41 +3767,27 @@ class App:
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["名称", "用户名", "类型", "用户数", "作品数", "ID", "安全防护"])
+                w.writerow(["名称", "用户名", "类型", "用户数", "作品数", "活跃(天前)",
+                            "分组", "ID", "安全防护"])
                 w.writerows(rows)
             self.log_msg(f"✅ 已导出{label} {len(rows)} 条到 {path}")
             messagebox.showinfo("完成", f"已导出{label} {len(rows)} 条到：\n{path}")
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
-    async def _leave(self, sel, interval, jitter=0):
-        def _safe_delete(iid):
-            try:
-                if self.tree.exists(iid):
-                    self.tree.delete(iid)
-            except Exception:
-                pass
-            self.channels.pop(iid, None)          # 同步清理映射，避免统计仍去请求已退出的频道
-            self._visible.discard(iid)
-            self._sel_hidden.discard(iid)
-            self._role.pop(iid, None)
-            try:
-                self._row_order.remove(iid)
-            except ValueError:
-                pass
+    async def _run_destructive(self, sel, interval, jitter, do_one, verb,
+                               task_label=None, progress_verb=None):
+        """退出 / 删除会话 / 销毁 三种破坏性批量操作的**公共执行器**。
 
+        统一处理：限流退避重试、进度上报、成功行的行清理、按钮复位、结果汇总。
+        do_one(ent, name) -> (是否成功, 日志文案)。
+        抽出来的理由：这三条链路的失败处理必须完全一致 —— 任何一份漏了
+        `_drop_row`，统计任务都会继续去请求一个已经不存在的会话。"""
+        pv = progress_verb or verb
         total = len(sel)
         done = 0
-        self.root.after(0, lambda: self.start_task(f"正在退出频道（共 {total} 个）…"))
-
-        async def _do_leave(ent, name):
-            """执行一次退出，返回 (是否成功, 日志文案)。"""
-            status, note = await leave_entity(self.client, ent)
-            if status == LEAVE_BLOCKED:
-                return False, f"⛔ 无法退出（{note}）: {name}"
-            if status == LEAVE_GONE:
-                return True, f"➖ 无需退出（{note}）: {name}"
-            return True, f"✅ 已退出: {name}"
+        if task_label:
+            self.root.after(0, lambda t=task_label: self.start_task(t))
 
         ok = fail = 0
         for iid in sel:
@@ -2992,11 +3797,11 @@ class App:
                 continue
             name = self.tree.set(iid, "name") or str(ent.id)
             try:
-                success, line = await _do_leave(ent, name)
+                success, line = await do_one(ent, name)
                 self.log_msg(line)
                 if success:
                     ok += 1
-                    self.root.after(0, lambda i=iid: _safe_delete(i))
+                    self.root.after(0, lambda i=iid: self._drop_row(i))
                 else:
                     fail += 1
             except FloodWaitError as e:
@@ -3007,30 +3812,368 @@ class App:
                     n, t, f"限流等待 {s}s 后重试（{n}/{t}）"))
                 try:
                     await asyncio.sleep(e.seconds)
-                    success, line = await _do_leave(ent, name)
+                    success, line = await do_one(ent, name)
                     self.log_msg(f"{line}（限流重试）")
                     if success:
                         ok += 1
-                        self.root.after(0, lambda i=iid: _safe_delete(i))
+                        self.root.after(0, lambda i=iid: self._drop_row(i))
                     else:
                         fail += 1
                 except Exception as e2:
                     fail += 1
-                    self.log_msg(f"❌ 退出失败: {name} -> {e2}")
+                    self.log_msg(f"❌ {verb}失败: {name} -> {e2}")
             except Exception as e:
                 fail += 1
-                self.log_msg(f"❌ 退出失败: {name} -> {e}")
+                self.log_msg(f"❌ {verb}失败: {name} -> {e}")
             done += 1
             n, t = done, total
-            self.root.after(0, lambda n=n, t=t: self.set_progress(n, t, f"正在退出 {n}/{t}"))
+            self.root.after(0, lambda n=n, t=t: self.set_progress(n, t, f"正在{pv} {n}/{t}"))
             if done < total:
                 wait = interval + (random.uniform(0, jitter) if jitter > 0 else 0)
                 await asyncio.sleep(max(1.0, wait))
         self.log_msg(f"🏁 完成：成功 {ok} 个，失败 {fail} 个。")
-        self.root.after(0, lambda o=ok, f=fail: self.finish_task(f"退出完成：成功 {o} 个，失败 {f} 个"))
-        self.root.after(0, lambda: self.btn_leave.configure(state="normal"))
-        self.root.after(0, lambda: self.btn_kw_leave.configure(state="normal"))
+        self.root.after(0, lambda o=ok, f=fail, v=verb: self.finish_task(
+            f"{v}完成：成功 {o} 个，失败 {f} 个"))
+        self.root.after(0, self._set_run_buttons_normal)
         self.root.after(0, self.update_count)
+
+    def _drop_row(self, iid):
+        """删掉一行并同步清理所有引用它的映射 —— 漏掉任何一处，
+        统计任务都还会去请求一个已经不存在的会话。"""
+        try:
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
+        except Exception:
+            pass
+        self.channels.pop(iid, None)
+        self._visible.discard(iid)
+        self._sel_hidden.discard(iid)
+        self._role.pop(iid, None)
+        try:
+            self._row_order.remove(iid)
+        except ValueError:
+            pass
+
+    def _set_run_buttons(self, normal):
+        for name in ("btn_leave", "btn_kw_leave", "btn_destroy"):
+            try:
+                getattr(self, name).configure(state="normal" if normal else "disabled")
+            except Exception:
+                pass
+
+    def _set_run_buttons_normal(self):
+        self._set_run_buttons(True)
+
+    def _set_run_buttons_disabled(self):
+        self._set_run_buttons(False)
+
+    async def _leave(self, sel, interval, jitter=0):
+        """退出选中频道 / 群组（对私聊 / 机器人无意义，见 build_leave_request）。"""
+        async def _do_leave(ent, name):
+            status, note = await leave_entity(self.client, ent)
+            if status == LEAVE_BLOCKED:
+                return False, f"⛔ 无法退出（{note}）: {name}"
+            if status == LEAVE_GONE:
+                return True, f"➖ 无需退出（{note}）: {name}"
+            return True, f"✅ 已退出: {name}"
+
+        await self._run_destructive(
+            sel, interval, jitter, _do_leave, "退出",
+            task_label=f"正在退出频道（共 {len(sel)} 个）…")
+
+
+    # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
+    def _roles_missing(self, iids):
+        """勾选范围里是否还有「角色未检测」且属于频道/群组的行 —— 决定要不要先补一次检测。"""
+        for iid in iids:
+            ent = self.channels.get(iid)
+            if ent is None or not is_member_kind(session_kind(ent)):
+                continue
+            if not self.role_known(iid):
+                return True
+        return False
+
+    async def _ensure_roles(self, iids):
+        """破坏性操作前补齐创建者身份：只对「角色未知且属于频道/群组」的行发请求。
+
+        没有这一步，用户刚刷完列表就点「删除我创建的频道」，会因为角色还没检测
+        而整批被跳过，看起来像功能坏了。"""
+        need, seen = [], set()
+        for iid in iids:
+            if iid in seen:
+                continue
+            seen.add(iid)
+            ent = self.channels.get(iid)
+            if ent is None or not is_member_kind(session_kind(ent)):
+                continue
+            if self.role_known(iid):
+                continue
+            need.append((iid, ent))
+        if not need:
+            return 0
+        self.log_msg(f"正在识别 {len(need)} 个候选的创建者身份（决定能否删除）…")
+        role_cache = getattr(self, "_role_cache", None)
+        if not isinstance(role_cache, dict):
+            role_cache = {}
+            self._role_cache = role_cache
+        sem = asyncio.Semaphore(max(1, self._safe_int(self.conc_var, 6, 1, 32)))
+        done = 0
+
+        async def one(iid, ent):
+            nonlocal done
+            async with sem:
+                role = None
+                try:
+                    role = await self._detect_role(ent)
+                except Exception:
+                    role = None
+                if role is not None:
+                    role_cache[str(getattr(ent, "id", ""))] = [role, time.time()]
+                    ep = self._tree_epoch
+                    self.root.after(0, lambda i=iid, r=role, e=ep: self._apply_role(e, i, r))
+                done += 1
+                n, t = done, len(need)
+                self.root.after(0, lambda n=n, t=t: self.set_progress(
+                    n, t, f"识别创建者身份 {n}/{t}"))
+
+        try:
+            await asyncio.gather(*(one(i, e) for i, e in need), return_exceptions=True)
+        finally:
+            try:
+                self.save_role_cache()
+            except Exception:
+                pass
+        return len(need)
+
+    def delete_protect_reason(self, iid):
+        """「删除会话」的跳过理由：**只看白名单**。
+
+        不能直接复用 protected_reason —— 那个还会把「创建者 / 管理员」也算成受保护，
+        而创建者恰恰**退不出去**（见 LEAVE_BLOCKED），删除会话是他们把该会话
+        从列表里清掉的唯一手段。用 protected_reason 去拦，等于把最需要这个功能的人
+        挡在门外。白名单则不同：它承诺的是「永不退出」，而删除会话会永久清掉
+        本地聊天记录，对白名单里的频道同样是不可逆损失，所以仍然跳过。
+        """
+        return "白名单" if self.is_whitelisted(iid) else None
+
+    def build_delete_plan(self, iids):
+        """「删除会话（含聊天记录）」的执行清单：**任何类型**都能删（私聊/机器人也行）。
+
+        受保护项按「退出时跳过受保护项」开关处理，但判定走 delete_protect_reason
+        （只认白名单，不认创建者/管理员）。
+        """
+        skip = var_bool(self, "skip_protected_var", True)
+        to_del, blocked, seen = [], [], set()
+        for iid in iids:
+            if iid in seen:
+                continue
+            seen.add(iid)
+            try:
+                if not self.tree.exists(iid):
+                    continue
+            except Exception:
+                continue
+            snap = self._row_snapshot(iid)
+            reason = self.delete_protect_reason(iid) if skip else None
+            if reason:
+                snap["reason"] = reason
+                blocked.append(snap)
+            else:
+                to_del.append(snap)
+        return to_del, blocked
+
+    def build_destroy_plan(self, iids, want_kind):
+        """「删除我创建的频道 / 群组」的执行清单。
+
+        门禁是**类型 + 创建者身份**，刻意不套用 protected_reason：
+        - 只能处理 want_kind 这一种类型 —— 否则「想删频道」可能把群组一起带走；
+        - 角色必须是 creator —— Telegram 侧也这么要求，提前过滤掉必然失败的请求；
+        - ⚠️ **不用保护名单拦**：创建者本来就不允许退出，白名单 + 自己创建等于
+          永久卡死，销毁恰恰是唯一出路。真正的门禁是上面的类型 + creator，
+          外加确认窗里那道「必须手打确认词」。
+        """
+        to_del, blocked, seen = [], [], set()
+        for iid in iids:
+            if iid in seen:
+                continue
+            seen.add(iid)
+            try:
+                if not self.tree.exists(iid):
+                    continue
+            except Exception:
+                continue
+            snap = self._row_snapshot(iid)
+            typ = self._type_of(iid)
+            role = self._role_of(iid)
+            if not can_destroy_kind(typ):
+                snap["reason"] = f"类型不符（{typ} 没有创建者，本操作只处理{want_kind}）"
+                blocked.append(snap)
+            elif typ != want_kind:
+                snap["reason"] = f"类型不符（{typ}，本操作只处理{want_kind}）"
+                blocked.append(snap)
+            elif not self.role_known(iid):
+                snap["reason"] = "创建者身份未检测（可先「获取统计」再试）"
+                blocked.append(snap)
+            elif role != "creator":
+                snap["reason"] = f"你不是创建者（{ROLE_LABEL.get(role) or '普通成员'}）"
+                blocked.append(snap)
+            else:
+                to_del.append(snap)
+        return to_del, blocked
+
+    # ---- 删除会话（含聊天记录）----
+    def on_delete_dialogs(self):
+        """删除会话（含聊天记录）：从**我这边**的列表移除并清空本地聊天记录。"""
+        iids = self.selected_items()
+        if not iids:
+            self._warn_no_selection()
+            return
+        to_del, blocked = self.build_delete_plan(iids)
+        if not to_del:
+            names = "、".join(b["name"] for b in blocked[:6])
+            more = f"，另有 {len(blocked) - 6} 个" if len(blocked) > 6 else ""
+            messagebox.showinfo(
+                "提示",
+                f"勾选的 {len(iids)} 个会话全部受保护，没有可删除的。\n\n"
+                f"受保护项：{names}{more}\n"
+                "（白名单可右键或点「🔒 白名单」移出；也可关掉「退出时跳过受保护项」）")
+            self.log_msg(f"⏭ 勾选的 {len(iids)} 个全部受保护，已跳过删除。")
+            return
+        notes = self._scope_notes("本次不会删除")
+        if not self._confirm_delete_dialogs(to_del, blocked, notes):
+            self.log_msg("已取消删除。")
+            return
+        self.log_msg(f"🗑 开始删除 {len(to_del)} 个会话（含聊天记录）"
+                     + (f"，跳过 {len(blocked)} 个受保护项" if blocked else ""))
+        self._set_run_buttons_disabled()
+        self.run_async(self._delete_dialogs([x["iid"] for x in to_del],
+                                            self._interval(), self._jitter()))
+
+    def _confirm_delete_dialogs(self, to_del, blocked, notes=""):
+        """删除会话前确认：同样出清单预览，但**不给**「以后不再显示」的选项 ——
+        这是会永久清掉本地聊天记录的不可恢复操作，不值得为省一次点击留后门。"""
+        note = "说明：只清掉【你这边】的会话与聊天记录，对方及其他成员完全不受影响，且不可恢复。"
+        return self._plan_dialog(
+            "删除会话前确认",
+            f"确定要删除选中的 {len(to_del)} 个会话（含聊天记录）？",
+            to_del, blocked, (notes + "\n" if notes else "") + note,
+            ok_text=f"确认删除 {len(to_del)} 个",
+            blocked_tab=f"已跳过 · 受保护（{len(blocked)}）")
+
+    async def _delete_dialogs(self, sel, interval, jitter):
+        kinds = {}
+        for iid in sel:
+            ent = self.channels.get(iid)
+            k = session_kind(ent) if ent is not None else KIND_OTHER
+            kinds[k] = kinds.get(k, 0) + 1
+        chan_like = sum(v for k, v in kinds.items() if is_member_kind(k))
+
+        async def _do(ent, name):
+            status, note = await delete_history_entity(self.client, ent)
+            if status == DEL_BLOCKED:
+                return False, f"⛔ 无法删除（{note}）: {name}"
+            if status == DEL_GONE:
+                return True, f"➖ 无需删除（{note}）: {name}"
+            return True, f"🗑 已删除会话: {name}"
+
+        await self._run_destructive(
+            sel, interval, jitter, _do, "删除",
+            task_label=f"正在删除会话（共 {len(sel)} 个）…")
+        if chan_like:
+            self.log_msg(
+                f"ℹ️ 其中 {chan_like} 个是频道 / 群组：删除会话只清掉了本地记录，你仍是成员，"
+                "对方再发消息它就会重新出现。要彻底不再看到请改用「🚪 退出选中频道」。")
+
+    # ---- 销毁自己创建的频道 / 群组 ----
+    def on_destroy_created(self, want_kind):
+        """删除【我创建的】频道 / 群组（对所有成员生效、不可恢复）。"""
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接并刷新列表。")
+            return
+        iids = self.selected_items()
+        if not iids:
+            self._warn_no_selection()
+            return
+        self._destroy_entry(list(iids), want_kind)
+
+    def _destroy_entry(self, iids, want_kind):
+        """销毁入口的公共前半段：角色没检测就先补（async），再交回主线程出清单。"""
+        if self._roles_missing(iids):
+            self.log_msg("ℹ️ 有候选项的创建者身份尚未检测，先识别再列清单…")
+            self.run_async(self._destroy_after_roles(iids, want_kind))
+        else:
+            self._destroy_confirm_ui(iids, want_kind)
+
+    async def _destroy_after_roles(self, iids, want_kind):
+        self.root.after(0, lambda: self.start_task("正在识别创建者身份…"))
+        try:
+            await self._ensure_roles(iids)
+        finally:
+            self.root.after(0, lambda: self.finish_task("空闲"))
+        self.root.after(0, lambda: self._destroy_confirm_ui(iids, want_kind))
+
+    def _destroy_confirm_ui(self, iids, want_kind):
+        """在主线程出清单并弹确认窗 —— Tk 的 Toplevel 只能在主线程开，
+        所以角色检测（async）与确认窗（Tk）之间必须用 root.after 交回主线程。"""
+        to_del, blocked = self.build_destroy_plan(iids, want_kind)
+        if not to_del:
+            reasons = {}
+            for b in blocked:
+                reasons[b["reason"]] = reasons.get(b["reason"], 0) + 1
+            detail = "\n".join(f"· {k}：{v} 个" for k, v in reasons.items())
+            messagebox.showinfo(
+                "提示",
+                f"勾选的 {len(iids)} 个里没有可删除的{want_kind}。\n\n{detail}\n\n"
+                f"「删除我创建的{want_kind}」只处理【你本人创建】的{want_kind}；"
+                "其它会话请用「🗑 删除会话（含聊天记录）」或「🚪 退出选中频道」。")
+            self.log_msg("⏭ 「删除自建%s」无可执行项（" % want_kind
+                         + "；".join(f"{k} {v} 个" for k, v in reasons.items()) + "）")
+            return
+        if not self._destroy_dialog(to_del, blocked, want_kind):
+            self.log_msg("已取消删除。")
+            return
+        self.log_msg(f"🔥 开始删除自建{want_kind} {len(to_del)} 个"
+                     + (f"，跳过 {len(blocked)} 个" if blocked else "")
+                     + "（不可恢复，已手打确认词）")
+        self._set_run_buttons_disabled()
+        self.run_async(self._destroy([x["iid"] for x in to_del], self._interval(),
+                                     self._jitter(), want_kind))
+
+    def _destroy_dialog(self, to_del, blocked, want_kind):
+        """销毁确认窗：清单 + **必须手打确认词**。不可恢复操作的最后一道闸。"""
+        return self._plan_dialog(
+            f"危险操作 · 删除我创建的{want_kind}",
+            f"确定要彻底删除这 {len(to_del)} 个{want_kind}吗？",
+            to_del, blocked,
+            f"这些{want_kind}会从【所有成员】的列表里消失，聊天记录一并清除，且无法恢复。",
+            ok_text=f"确认删除 {len(to_del)} 个{want_kind}",
+            blocked_tab=f"已跳过（{len(blocked)}）",
+            danger=True, confirm_word=DESTROY_CONFIRM_WORD)
+
+    async def _destroy(self, sel, interval, jitter, want_kind):
+        async def _do(ent, name):
+            status, note = await destroy_entity(self.client, ent)
+            if status == DEL_BLOCKED:
+                return False, f"⛔ 无法删除（{note}）: {name}"
+            if status == DEL_GONE:
+                return True, f"➖ 无需删除（{note}）: {name}"
+            return True, f"🔥 已彻底删除{want_kind}: {name}"
+
+        await self._run_destructive(
+            sel, interval, jitter, _do, "删除",
+            task_label=f"正在删除自建{want_kind}（共 {len(sel)} 个）…")
+
+    def _interval(self):
+        try:
+            return max(1, int(self.interval_var.get()))
+        except Exception:
+            return 2
+
+    def _jitter(self):
+        try:
+            return max(0, int(self.jitter_var.get()))
+        except Exception:
+            return 0
 
     # ---------------- 关闭 ----------------
     def on_close(self):
@@ -3112,9 +4255,121 @@ _report_callback_exception._last_key = ""
 _report_callback_exception._last_time = 0.0
 
 
+# ---------------- 自检（打包后冒烟用：exe --selftest） ----------------
+# 存在的理由：窗口版 exe 没有控制台，「双击打不开」时只能靠猜。
+# 这个入口把「解释器 / tkinter / telethon 有没有被正确打进包里」以及几条关键
+# 请求构造、UI 骨架能否建起来，变成一次可脚本化的**退出码**检查（0=通过）。
+# 结果同时写进 tg_selftest.log（万一没有可用的标准输出）。
+SELFTEST_LOG = os.path.join(BASE_DIR, "tg_selftest.log")
+
+
+def _selftest_say(lines, text):
+    lines.append(text)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.write(text + "\n")
+                stream.flush()
+        except Exception:
+            pass
+
+
+def selftest():
+    """打包后冒烟自检。返回退出码：0=通过，1=失败。"""
+    global CONFIG_FILE, SESSION_FILE, STATS_CACHE_FILE, ROLE_CACHE_FILE
+    lines, ok = [], True
+    try:
+        _selftest_say(lines, "python %s  frozen=%s" % (
+            sys.version.split()[0], getattr(sys, "frozen", False)))
+        _selftest_say(lines, "exe = %s" % sys.executable)
+
+        import telethon
+        _selftest_say(lines, "telethon %s" % telethon.__version__)
+
+        # 关键请求类必须在包里（少一个就是「打包漏了 hidden-import」）
+        for cls in (tl_channels.LeaveChannelRequest, tl_channels.DeleteChannelRequest,
+                    tl_messages.DeleteHistoryRequest, tl_messages.DeleteChatRequest,
+                    tl_messages.DeleteChatUserRequest, tl_messages.GetDialogFiltersRequest,
+                    tl_messages.UpdateDialogFilterRequest):
+            assert cls is not None, cls
+
+        ch = tl_types.Channel(id=1, title="t", photo=None, date=None, broadcast=True)
+        gp = tl_types.Chat(id=2, title="g", photo=None, participants_count=1,
+                           date=None, version=0)
+        usr = tl_types.User(id=3, is_self=False, access_hash=1, first_name="u")
+        assert isinstance(build_leave_request(ch), tl_channels.LeaveChannelRequest)
+        assert isinstance(build_leave_request(gp), tl_messages.DeleteChatUserRequest)
+        assert isinstance(build_destroy_request(ch), tl_channels.DeleteChannelRequest)
+        assert isinstance(build_destroy_request(gp), tl_messages.DeleteChatRequest)
+        for bad in (usr, tl_types.InputUserSelf()):
+            try:
+                build_destroy_request(bad)
+                raise AssertionError("未知类型应当报错而不是兜底")
+            except ValueError:
+                pass
+        dh = build_delete_history_request(ch)
+        assert dh.max_id == 0 and dh.just_clear is False and dh.revoke is False
+
+        # 类型 / 分组键 / 活跃天数：三条最容易在重构中被打断的纯逻辑
+        assert session_kind(ch) == KIND_CHANNEL
+        assert session_kind(tl_types.Channel(id=9, title="g", photo=None, date=None,
+                                            broadcast=False)) == KIND_GROUP
+        assert session_kind(usr) == KIND_USER
+        assert (peer_key_of(ch), peer_key_of(gp), peer_key_of(usr)) == (
+            ("channel", 1), ("chat", 2), ("user", 3))
+        assert active_text(None) == ACTIVE_NONE
+        assert active_text(NOT_APPLICABLE) == NOT_APPLICABLE
+        assert active_text(time.time() - 3 * 86400) == "3"
+
+        flt = tl_types.DialogFilter(id=1, title="x", pinned_peers=[], include_peers=[],
+                                    exclude_peers=[], broadcasts=True)
+        assert is_real_folder(flt) and not is_real_folder(tl_types.DialogFilterDefault())
+        assert folder_title(flt) == "x"
+        assert filter_matches(flt, ("channel", 1), {
+            "kind": KIND_CHANNEL, "contact": False, "muted": False,
+            "unread": 0, "archived": False}) is True
+        assert DESTROY_CONFIRM_WORD
+        _selftest_say(lines, "请求构造 / 类型判定 / 分组规则 / 活跃换算 OK")
+
+        # 界面骨架：真的建一次主窗口再销毁 —— 有些精简包能 import tkinter 但建窗就崩，
+        # 只 import 是测不出来的。用临时目录接管四个数据文件，确保**不碰**用户的
+        # 登录态与配置（自检绝不能动真实账号数据）。
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tg_selftest_")
+        CONFIG_FILE = os.path.join(tmpdir, "cfg.json")
+        SESSION_FILE = os.path.join(tmpdir, "tg_session")
+        STATS_CACHE_FILE = os.path.join(tmpdir, "stats.json")
+        ROLE_CACHE_FILE = os.path.join(tmpdir, "role.json")
+        r = tk.Tk()
+        r.withdraw()
+        try:
+            app = App(r)
+            r.update_idletasks()
+            cols = tuple(str(c) for c in app.tree.cget("columns"))
+            assert cols == ("sel", "name", "username", "type", "members",
+                            "posts", "active", "folder", "id", "safe"), cols
+            assert app.btn_leave is not None and app.btn_destroy is not None
+            assert app.cmb_folder is not None
+        finally:
+            r.destroy()
+        _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
+    except Exception:
+        ok = False
+        _selftest_say(lines, "[自检失败]\n" + __import__("traceback").format_exc())
+    _selftest_say(lines, "SELFTEST " + ("PASS" if ok else "FAIL"))
+    try:
+        with open(SELFTEST_LOG, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+    return 0 if ok else 1
+
+
 def main():
     import sys
 
+    if "--selftest" in sys.argv:
+        return sys.exit(selftest())
     print("[启动] 正在初始化界面 ...", file=sys.stderr, flush=True)
     try:
         root = tk.Tk()

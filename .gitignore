@@ -8,6 +8,10 @@ tg_cleaner_config.json
 tg_stats_cache.json
 tg_role_cache.json
 
+# 运行时产生的日志（无斜杠的写法在任意层级都匹配，dist/ 下的也一并拦掉）
+tg_selftest.log
+tg_crash.log
+
 # dist 目录里除可执行文件外的运行时数据（含 api_id / api_hash / 手机号 / 登录态）
 dist/*.json
 dist/*.session
