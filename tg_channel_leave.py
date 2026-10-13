@@ -131,9 +131,148 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "tg_cleaner_config.json")
-SESSION_FILE = os.path.join(BASE_DIR, "tg_session")
-STATS_CACHE_FILE = os.path.join(BASE_DIR, "tg_stats_cache.json")
-ROLE_CACHE_FILE = os.path.join(BASE_DIR, "tg_role_cache.json")
+
+# ---------------- 多账号：数据文件命名 ----------------
+# v1.1.x 是单账号，session / 缓存直接躺在 BASE_DIR 根下。v1.2.0 起每个账号一套：
+#   tg_session_<key>.session     登录态（= 授权，删掉就要重新收验证码）
+#   tg_stats_cache_<key>.json    统计缓存
+#   tg_role_cache_<key>.json     角色缓存
+#   config 里的 per_account[key] 白名单 + 抓取配置
+# 下面这组 LEGACY_* 只用于「把旧数据升级成第一个账号」，新代码不要再直接引用。
+LEGACY_SESSION_FILE = os.path.join(BASE_DIR, "tg_session")
+LEGACY_STATS_CACHE_FILE = os.path.join(BASE_DIR, "tg_stats_cache.json")
+LEGACY_ROLE_CACHE_FILE = os.path.join(BASE_DIR, "tg_role_cache.json")
+# 兼容旧名字（--selftest 会整体重定向这几个路径）
+SESSION_FILE = LEGACY_SESSION_FILE
+STATS_CACHE_FILE = LEGACY_STATS_CACHE_FILE
+ROLE_CACHE_FILE = LEGACY_ROLE_CACHE_FILE
+
+DEFAULT_ACCOUNT_KEY = "default"
+ACCOUNT_SESSION_PREFIX = "tg_session_"
+
+
+def account_key_from_phone(phone):
+    """手机号 -> 稳定的账号 key。
+
+    只保留字母数字：一是文件名安全，二是**同一号码永远算出同一个 key**，
+    所以重复添加同号码会命中同一个 session，直接复用登录态、不用再收验证码。
+    """
+    digits = re.sub(r"[^0-9A-Za-z]", "", str(phone or ""))
+    return digits or DEFAULT_ACCOUNT_KEY
+
+
+def account_session_base(acc):
+    """账号的 session 基名（不含 .session）。acc 可以是记录 dict 或 key 字符串。"""
+    if isinstance(acc, dict):
+        name = str(acc.get("session") or "").strip()
+        if name:
+            return os.path.join(BASE_DIR, name)
+        return os.path.join(BASE_DIR, ACCOUNT_SESSION_PREFIX + str(acc.get("key") or DEFAULT_ACCOUNT_KEY))
+    return os.path.join(BASE_DIR, ACCOUNT_SESSION_PREFIX + str(acc or DEFAULT_ACCOUNT_KEY))
+
+
+def account_cache_file(kind, key):
+    """账号私有的数据文件。kind: 'stats_cache' / 'role_cache'。"""
+    return os.path.join(BASE_DIR, "tg_%s_%s.json" % (kind, str(key or DEFAULT_ACCOUNT_KEY)))
+
+
+def account_label(acc):
+    """账号在界面上的显示名：优先昵称 / @用户名，兜底手机号 / key。
+
+    头部已经用了手机号或 key 时不再重复补一段尾巴 ——
+    否则会出现「+8613800138000 · 8613800138000」这种看着像 bug 的重复。
+    """
+    if not isinstance(acc, dict):
+        return str(acc)
+    name = str(acc.get("label") or "").strip()
+    uname = str(acc.get("username") or "").strip()
+    phone = str(acc.get("phone") or "").strip()
+    key = str(acc.get("key") or "")
+    if name and uname:
+        head = "%s (@%s)" % (name, uname)
+    elif name:
+        head = name
+    elif uname:
+        head = "@" + uname
+    elif phone:
+        head = phone
+    else:
+        head = key
+    tail = ""
+    if head not in (phone, key):
+        tail = phone or key
+    return "%s · %s" % (head, tail) if tail else head
+
+
+def write_config_file(data, path=None):
+    """把 config 落盘（模块级：__init__ 早期就要能写，那时 UI 变量还没建）。"""
+    try:
+        with open(path or CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def migrate_legacy_account(config):
+    """把 v1.1.x 的单账号数据升级成「第一个账号」。
+
+    旧布局：tg_session.session + tg_stats_cache.json + config 顶层 whitelist/phone。
+    新布局：accounts[0]（session 仍指向旧文件）+ tg_stats_cache_<key>.json + per_account[key]。
+
+    ⚠️ 刻意**不重命名 session 文件**：登录态丢了要重新收验证码，为了文件名好看去赌
+    一次 rename 不值得（rename 失败 = 用户被登出）。账户记录里写明 session 基名即可。
+    幂等：config 里已有 accounts 时原样返回。
+    """
+    cfg = config if isinstance(config, dict) else {}
+    existing = cfg.get("accounts")
+    if existing:
+        return list(existing), False
+
+    # 路径一律从 BASE_DIR 现算（而不是读 LEGACY_* 常量）——
+    # 常量是在 import 时定死的，测试重定向 BASE_DIR 后它们不会跟着变。
+    legacy_session = os.path.join(BASE_DIR, "tg_session")
+    legacy_stats = os.path.join(BASE_DIR, "tg_stats_cache.json")
+    legacy_role = os.path.join(BASE_DIR, "tg_role_cache.json")
+
+    phone = str(cfg.get("phone") or "").strip()
+    has_old_session = os.path.exists(legacy_session + ".session")
+    if not has_old_session and not phone and not cfg.get("whitelist"):
+        return [], False          # 全新用户，没有历史数据要迁
+
+    key = account_key_from_phone(phone)
+    accs = [{
+        "key": key,
+        "phone": phone,
+        "label": "",
+        "username": "",
+        "user_id": None,
+        "session": os.path.basename(legacy_session),
+    }]
+
+    # 缓存文件按账号改名（rename 而不是复制：统计缓存可能上千条，没必要存两份）
+    for kind, src in (("stats_cache", legacy_stats),
+                      ("role_cache", legacy_role)):
+        if os.path.exists(src):
+            dst = account_cache_file(kind, key)
+            if not os.path.exists(dst):
+                try:
+                    os.replace(src, dst)
+                except Exception:
+                    pass
+
+    # 顶层 whitelist -> 该账号的 per_account
+    pa = dict(cfg.get("per_account") or {})
+    st = dict(pa.get(key) or {})
+    if cfg.get("whitelist") and not st.get("whitelist"):
+        st["whitelist"] = list(cfg["whitelist"])
+    pa[key] = st
+    cfg["per_account"] = pa
+    cfg.pop("whitelist", None)    # 已迁走，免得下次又被当成全局白名单读回来
+
+    return accs, True
+
+
 # 身份标识 → 界面文案。创建者/管理员退不出去（Telegram 不允许），必须提前识别并跳过。
 ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 
@@ -141,11 +280,19 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.1.2"
+APP_VERSION = "v1.2.0"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.2.0", "2026-10-13", [
+        "**多账号**：可添加多个账号随时切换，**切换时不会退出登录**"
+        "——每个账号的登录态各自保留，切回来直接可用，不需要再收验证码",
+        "每个账号有**独立的数据**：白名单、统计缓存、角色缓存、筛选条件与抓取配置互不干扰",
+        "列表上方新增账号下拉框，选中即切换，并自动重新加载该账号的会话列表",
+        "「账号」页升级为账号管理：添加账号 / 切换 / 删除账号，可单独删除某个账号的登录态",
+        "旧版单账号数据自动升级为第一个账号，登录态与缓存原样保留，不用重新登录",
+    ]),
     ("v1.1.2", "2026-10-13", [
         "「退出 / 删除选中」现在能处理**全部会话类型**：频道 / 群组真的退出，"
         "私聊 / 机器人没有「退出」这个概念，自动改为删除会话"
@@ -694,16 +841,21 @@ FILTER_CUSTOM = "自定义…"
 
 def migrate_legacy_data():
     """旧版 onefile 把 session/config 写进了 PyInstaller 临时解压目录(_MEI*)，
-    程序一关就被清理，导致登录态/配置丢失。启动时把它们迁移到 BASE_DIR（exe 旁）。
-    仅在目标文件缺失时才迁移；若临时目录已被清理则静默跳过。"""
+    程序一关就被清理，导致登录态/配置丢失。启动时把它们迁移到数据目录。
+    仅在目标文件缺失时才迁移；若临时目录已被清理则静默跳过。
+
+    ⚠️ 目标目录从 **CONFIG_FILE 所在目录**推导，而不是直接读 BASE_DIR 常量 ——
+    这样测试只要重定向 CONFIG_FILE 就不会往真实目录写东西。
+    """
     import glob
     import shutil
     import tempfile
+    base = os.path.dirname(CONFIG_FILE) or BASE_DIR
     temp = tempfile.gettempdir()
     mappings = {
         "tg_cleaner_config.json": CONFIG_FILE,
-        "tg_session.session": SESSION_FILE + ".session",
-        "tg_session.session-journal": SESSION_FILE + ".session-journal",
+        "tg_session.session": os.path.join(base, "tg_session.session"),
+        "tg_session.session-journal": os.path.join(base, "tg_session.session-journal"),
     }
     for src_name, dst in mappings.items():
         if os.path.exists(dst):
@@ -737,7 +889,9 @@ class App:
         self._tree_epoch = 0        # 列表代次：刷新/清空时递增，用于废弃过期后台回填任务
         self._sort_col = None       # 当前排序列
         self._sort_rev = False      # 是否倒序
-        self._stats_cache = {}      # {频道id: [成员数, 作品数, 时间戳]} —— 避免重复请求
+        self._stats_cache = {}      # {频道id: [成员数, 作品数, 时间戳]} —— 载入见 _init_accounts
+        self._role_cache = {}       # {频道id: [角色, 时间戳]} —— 载入见 _init_accounts
+        self._whitelist = set()     # 白名单：频道 id（字符串），永不退出，全选自动跳过（按账号）
         self._stats_cancel = threading.Event()   # 持久化取消事件：「停止」按钮始终作用于当前任务
         self._list_cancel = threading.Event()    # 列表分页加载的取消事件（「停止全部」可中断）
         self._row_order = []        # 行 id 的插入顺序（筛选隐藏行后用于按原顺序恢复显示）
@@ -754,16 +908,17 @@ class App:
         self._log_visible = True
         self._last_left_width = 340
         self._dark = False
+        self._suppress_save = False  # 恢复配置期间屏蔽变量 trace 触发的自动保存（见 _auto_save）
         self._default_theme = None  # 系统默认 ttk 主题（浅色时恢复回去）
         self._role = {}             # iid -> "creator"/"admin"/""（本会话检测结果，随列表刷新重建）
-        self._role_cache = {}       # {频道id: [角色, 时间戳]} —— 角色很少变，缓存后不重复请求
-        self._whitelist = set()     # 白名单：频道 id（字符串），永不退出，全选自动跳过
         migrate_legacy_data()       # 把旧版临时目录里的 session/config 救回 exe 旁
         self.config = self.load_config()
-        self._stats_cache = self.load_stats_cache()
-        self._role_cache = self.load_role_cache()
-        # 白名单是「按频道 id」而不是行 id 存的 —— 刷新列表后行 id 会变，频道 id 不变
-        self._whitelist = {str(x) for x in (self.config.get("whitelist") or []) if str(x).strip()}
+        # 多账号：切走的账号的 client 留在这个池里，**不 disconnect** ——
+        # 这就是「切换账号不退出、登录态一直保持」的实现方式。
+        self._clients = {}          # key -> TelegramClient
+        self._accounts = []         # 账号注册表（config["accounts"] 的规范化副本）
+        self._current_key = None    # 当前账号 key
+        self._init_accounts()       # 迁移旧单账号数据 + 定当前账号 + 载入该账号的缓存/白名单
         # 分组（dialog filter）：每次刷新列表时重新拉取一次（成本 1 个请求）。
         # _dlg_state 存本地复现分组规则所需的状态（免打扰 / 未读 / 归档 / 是否联系人）。
         self._filters = []          # 服务器返回的 DialogFilter 列表（原样保留，回写时要用）
@@ -778,6 +933,136 @@ class App:
         # 启动后自动尝试用已保存的登录态连接（无需每次手动连、手动输验证码）
         self.root.after(300, self.schedule_auto_connect)
 
+    # ---------------- 多账号 ----------------
+    # 「属于某个账号」的设置项：(存盘 key, 界面变量名, 类型, 默认值)
+    # 白名单也在其中，但它存在 _whitelist 而非变量里，由 _account_state 单独处理。
+    ACCOUNT_STATE_FIELDS = (
+        ("filter_members_lt", "filter_members_var", "str", ""),
+        ("filter_posts_lt", "filter_posts_var", "str", ""),
+        ("filter_active_gt", "filter_active_var", "str", ""),
+        ("filter_hide_unknown", "filter_unknown_var", "bool", True),
+        ("stats_concurrency", "conc_var", "int", 6),
+        ("stats_use_cache", "cache_var", "bool", True),
+        ("stats_ttl_hours", "ttl_var", "int", 24),
+        ("leave_interval", "interval_var", "int", 2),
+        ("leave_jitter", "jitter_var", "int", 0),
+        ("detect_roles", "detect_role_var", "bool", True),
+        ("skip_protected", "skip_protected_var", "bool", True),
+        ("hide_protected", "hide_protected_var", "bool", False),
+        ("preview_before_leave", "preview_leave_var", "bool", True),
+    )
+
+    def _init_accounts(self):
+        """初始化账号注册表：迁移旧单账号数据 -> 定当前账号 -> 载入该账号的缓存与白名单。
+
+        只在 __init__ 里调用一次。此时 UI 变量还没建，所以只能走「内存 + 落盘」，
+        绝不能碰 save_config（它要读界面变量）。
+        """
+        accs, changed = migrate_legacy_account(self.config)
+        norm = []
+        for a in accs:
+            if not isinstance(a, dict) or not a.get("key"):
+                continue
+            a.setdefault("phone", "")
+            a.setdefault("label", "")
+            a.setdefault("username", "")
+            a.setdefault("user_id", None)
+            norm.append(a)
+        self._accounts = norm
+        if changed:
+            self.config["accounts"] = norm
+            write_config_file(self.config)   # 迁移结果越早落盘越好
+        keys = [a["key"] for a in norm]
+        want = str(self.config.get("current_account") or "").strip()
+        self._current_key = want if want in keys else (keys[0] if keys else None)
+        self._consume_pending_state(self._current_key)
+        self._whitelist = self._whitelist_of(self._current_key)
+        self._stats_cache = self.load_stats_cache()
+        self._role_cache = self.load_role_cache()
+
+    def _consume_pending_state(self, key):
+        """把「还没有账号时先调好的设置」交给第一个出现的账号。
+
+        否则用户在添加账号之前改的设置（并发数 / 间隔 / 白名单…）会在下次启动时静默丢失。
+        """
+        st = (self.config or {}).pop("pending_account_state", None)
+        if not key or not isinstance(st, dict) or not st:
+            return
+        pa = dict((self.config or {}).get("per_account") or {})
+        if not pa.get(key):
+            pa[key] = st
+            self.config["per_account"] = pa
+
+    def _per_account(self, key=None):
+        """取某个账号在 config 里的私有设置（dict 副本）。"""
+        pa = (self.config or {}).get("per_account")
+        if not isinstance(pa, dict):
+            return {}
+        st = pa.get(self._current_key if key is None else key)
+        return dict(st) if isinstance(st, dict) else {}
+
+    def _whitelist_of(self, key=None):
+        """白名单是**按账号**存的：不同账号关心的频道完全不同，混在一起会误保护。"""
+        return {str(x) for x in (self._per_account(key).get("whitelist") or []) if str(x).strip()}
+
+    def _current_account(self):
+        for a in self._accounts:
+            if a.get("key") == self._current_key:
+                return a
+        return None
+
+    def _account_by_key(self, key):
+        for a in self._accounts:
+            if a.get("key") == key:
+                return a
+        return None
+
+    def _account_state(self):
+        """收集「属于当前账号」的可持久化状态（白名单 + 筛选条件 + 抓取配置）。"""
+        st = {"whitelist": sorted(self._whitelist)}
+        for key, var, kind, _default in self.ACCOUNT_STATE_FIELDS:
+            obj = getattr(self, var, None)
+            if obj is None:
+                continue
+            try:
+                if kind == "bool":
+                    st[key] = bool(obj.get())
+                elif kind == "int":
+                    st[key] = self._safe_int(obj, 0, 0, 10 ** 6)
+                else:
+                    st[key] = str(obj.get()).strip()
+            except Exception:
+                continue
+        return st
+
+    def _apply_account_state(self, st, into_vars=True):
+        """把账号状态写回内存与界面变量。
+
+        ⚠️ 缺失的字段**回落到默认值**（而不是「保持上一个账号的值」）——切号时
+        上一个账号的阈值/间隔绝对不能留在界面上，否则会用错条件去筛错数据。
+        into_vars=False 表示只更新内存（__init__ 早期 UI 变量还没建时用）。
+        """
+        st = st if isinstance(st, dict) else {}
+        self._whitelist = {str(x) for x in (st.get("whitelist") or []) if str(x).strip()}
+        if not into_vars:
+            return
+        for key, var, kind, default in self.ACCOUNT_STATE_FIELDS:
+            obj = getattr(self, var, None)
+            if obj is None:
+                continue
+            val = st.get(key, default)
+            if val in (None, ""):
+                val = default
+            try:
+                if kind == "bool":
+                    obj.set(bool(val))
+                elif kind == "int":
+                    obj.set(int(val))
+                else:
+                    obj.set(str(val))
+            except Exception:
+                continue
+
     # ---------------- 配置 ----------------
     def load_config(self):
         try:
@@ -791,40 +1076,40 @@ class App:
         data.update({
             "api_id": self.api_id_var.get().strip(),
             "api_hash": self.api_hash_var.get().strip(),
-            "phone": self.phone_var.get().strip(),
             "proxy_enabled": self.proxy_enabled_var.get(),
             "proxy_type": self.proxy_type_var.get(),
             "proxy_host": self.proxy_host_var.get().strip(),
             "proxy_port": self.proxy_port_var.get().strip(),
             "proxy_user": self.proxy_user_var.get().strip(),
             "proxy_pass": self.proxy_pass_var.get().strip(),
-            "stats_concurrency": self._safe_int(self.conc_var, 6, 1, 32),
-            "stats_use_cache": bool(self.cache_var.get()),
-            "stats_ttl_hours": self._safe_int(self.ttl_var, 24, 1, 720),
-            "filter_members_lt": self.filter_members_var.get().strip(),
-            "filter_posts_lt": self.filter_posts_var.get().strip(),
-            "filter_hide_unknown": bool(self.filter_unknown_var.get()),
-            "leave_interval": self._safe_int(self.interval_var, 2, 1, 120),
-            "leave_jitter": self._safe_int(self.jitter_var, 0, 0, 60),
             "dark_mode": bool(getattr(self, "dark_var", None) and self.dark_var.get()),
             "remember_layout": bool(getattr(self, "remember_layout_var", None) and self.remember_layout_var.get()),
-            # 安全防护（用 getattr 兜底：build_ui 之前若被调用也不应崩）
-            "whitelist": sorted(self._whitelist),
-            "skip_protected": var_bool(self, "skip_protected_var", True),
-            "hide_protected": var_bool(self, "hide_protected_var", False),
-            "detect_roles": var_bool(self, "detect_role_var", True),
-            "preview_before_leave": var_bool(self, "preview_leave_var", True),
         })
+        # 账号注册表 + 当前账号（登录态、显示名、session 基名都在账号记录里）
+        data["accounts"] = list(self._accounts)
+        data["current_account"] = self._current_key
+        # 按账号保存的私有设置（白名单 / 筛选 / 抓取配置）—— 切号时各自独立
+        pa = dict(data.get("per_account") or {})
+        if self._current_key:
+            pa[self._current_key] = self._account_state()
+        else:
+            # 还没有任何账号（用户上来先调设置）——先存到过渡槽，
+            # 等添加第一个账号时带过去，否则这些设置会在下次启动时静默丢失。
+            data["pending_account_state"] = self._account_state()
+        alive = {a.get("key") for a in self._accounts}
+        data["per_account"] = {k: v for k, v in pa.items() if k in alive}
+        # 这些在 v1.2.0 起改为「按账号」存，别再以全局字段留在配置里，否则切号后会串数据
+        for k in ("phone", "whitelist", "stats_concurrency", "stats_use_cache", "stats_ttl_hours",
+                  "filter_members_lt", "filter_posts_lt", "filter_active_gt", "filter_hide_unknown",
+                  "leave_interval", "leave_jitter", "skip_protected", "hide_protected",
+                  "detect_roles", "preview_before_leave"):
+            data.pop(k, None)
         # 布局类字段：先清掉再按当前状态写回（“记住布局”关掉时就不该残留旧值）
         for k in ("win_geometry", "col_widths", "left_width", "left_visible", "log_visible"):
             data.pop(k, None)
         data.update(self._ui_state())
         self.config = data
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        write_config_file(data)
 
     @staticmethod
     def _safe_int(var, default, lo, hi):
@@ -838,9 +1123,20 @@ class App:
         """兼容入口：等价于模块级 var_bool(self, attr, default)。"""
         return var_bool(self, attr, default)
 
+    # ---- 缓存文件都按账号分开：切号时各自载入，绝不让 A 账号的数据串到 B ----
+    def _stats_cache_path(self):
+        if self._current_key:
+            return account_cache_file("stats_cache", self._current_key)
+        return STATS_CACHE_FILE
+
+    def _role_cache_path(self):
+        if self._current_key:
+            return account_cache_file("role_cache", self._current_key)
+        return ROLE_CACHE_FILE
+
     def load_role_cache(self):
         try:
-            with open(ROLE_CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(self._role_cache_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except Exception:
@@ -848,14 +1144,14 @@ class App:
 
     def save_role_cache(self):
         try:
-            with open(ROLE_CACHE_FILE, "w", encoding="utf-8") as f:
+            with open(self._role_cache_path(), "w", encoding="utf-8") as f:
                 json.dump(self._role_cache, f, ensure_ascii=False)
         except Exception:
             pass
 
     def load_stats_cache(self):
         try:
-            with open(STATS_CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(self._stats_cache_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except Exception:
@@ -863,7 +1159,7 @@ class App:
 
     def save_stats_cache(self):
         try:
-            with open(STATS_CACHE_FILE, "w", encoding="utf-8") as f:
+            with open(self._stats_cache_path(), "w", encoding="utf-8") as f:
                 json.dump(self._stats_cache, f, ensure_ascii=False)
         except Exception:
             pass
@@ -902,10 +1198,21 @@ class App:
                     self.filter_unknown_var,
                     self.interval_var, self.jitter_var):
             try:
-                var.trace_add("write", lambda *_a: self.save_config())
+                var.trace_add("write", lambda *_a: self._auto_save())
             except Exception:
                 pass
         self.refresh_cache_info()
+
+    def _auto_save(self):
+        """界面变量变化触发的自动保存。
+
+        ⚠️ 「恢复配置」期间必须跳过：apply_config_to_ui 会逐个 set 这些变量，
+        而 save_config 是「以当前 UI 值为准」重建 per_account 的 —— 不挡住的话，
+        第一个 set 就会把还没恢复完的账号设置覆盖成默认值（实测就是这么坏的）。
+        """
+        if getattr(self, "_suppress_save", False):
+            return
+        self.save_config()
 
     # ---------------- 顶部工具栏 ----------------
     def _build_header(self):
@@ -1007,26 +1314,126 @@ class App:
     def _tab_account(self, nb):
         f = ttk.Frame(nb, padding=10)
         nb.add(f, text="账号")
-        f.grid_columnconfigure(1, weight=1)
-        ttk.Label(f, text="API ID").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        self.api_id_var = tk.StringVar()
-        ttk.Entry(f, textvariable=self.api_id_var).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        ttk.Label(f, text="API HASH").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.api_hash_var = tk.StringVar()
-        ttk.Entry(f, textvariable=self.api_hash_var).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
-        ttk.Label(f, text="手机号").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.tab_account = f
+        f.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(f, text="账号列表（可添加多个，随时切换；切换时不会退出登录）",
+                  foreground="#374151", wraplength=290, justify="left").grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
+
+        box = ttk.Frame(f)
+        box.grid(row=1, column=0, sticky="ew")
+        box.grid_columnconfigure(0, weight=1)
+        self.acc_tree = ttk.Treeview(
+            box, columns=("account", "phone", "state"), show="headings",
+            height=6, selectmode="browse")
+        for c, t, w, st in (("account", "账号", 140, True), ("phone", "手机号", 96, False),
+                            ("state", "状态", 96, False)):
+            self.acc_tree.heading(c, text=t)
+            self.acc_tree.column(c, width=w, anchor="w", stretch=st)
+        self.acc_tree.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.acc_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.acc_tree.configure(yscrollcommand=sb.set)
+        self.acc_tree.bind("<Double-1>", lambda e: self.on_switch_selected_account())
+
+        btns = ttk.Frame(f)
+        btns.grid(row=2, column=0, sticky="ew", pady=(5, 4))
+        ttk.Button(btns, text="切换到选中", command=self.on_switch_selected_account).pack(side="left", padx=2)
+        ttk.Button(btns, text="移除账号", command=lambda: self.on_remove_selected_account(False)).pack(
+            side="left", padx=2)
+        ttk.Button(btns, text="移除并删登录态", command=lambda: self.on_remove_selected_account(True)).pack(
+            side="left", padx=2)
+
+        ttk.Separator(f, orient="horizontal").grid(row=3, column=0, sticky="ew", pady=6)
+
+        row = ttk.Frame(f)
+        row.grid(row=4, column=0, sticky="ew")
+        row.grid_columnconfigure(1, weight=1)
+        ttk.Label(row, text="手机号").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.phone_var = tk.StringVar()
-        ttk.Entry(f, textvariable=self.phone_var).grid(row=2, column=1, sticky="ew", padx=4, pady=4)
-        ttk.Button(f, text="连接 / 登录", command=self.on_connect).grid(
-            row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=(10, 4))
-        ttk.Label(f, text="在 https://my.telegram.org 创建应用后获取 API ID / HASH。\n"
-                          "登录态保存在程序目录 tg_session.session，有效时无需重复输验证码。",
+        self.phone_entry = ttk.Entry(row, textvariable=self.phone_var)
+        self.phone_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(row, text="＋ 添加账号并登录", command=self.on_add_account).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 2))
+
+        ttk.Separator(f, orient="horizontal").grid(row=5, column=0, sticky="ew", pady=6)
+
+        api = ttk.Frame(f)
+        api.grid(row=6, column=0, sticky="ew")
+        api.grid_columnconfigure(1, weight=1)
+        ttk.Label(api, text="API ID").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.api_id_var = tk.StringVar()
+        ttk.Entry(api, textvariable=self.api_id_var).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(api, text="API HASH").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.api_hash_var = tk.StringVar()
+        ttk.Entry(api, textvariable=self.api_hash_var).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(api, text="连接 / 登录当前账号", command=self.on_connect).grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 4))
+        ttk.Label(api, text="在 https://my.telegram.org 创建应用后获取 API ID / HASH。\n"
+                           "API 与代理是全局设置，所有账号共用；登录态按账号分别保存，"
+                           "所以切换账号不需要重新输验证码。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+
         self.lbl_session_info = ttk.Label(f, text="", foreground="#6b7280", wraplength=290, justify="left")
-        self.lbl_session_info.grid(row=5, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
-        self.btn_clear_session = ttk.Button(f, text="删除登录态（切换账号）", command=self.on_clear_session)
-        self.btn_clear_session.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(10, 2))
+        self.lbl_session_info.grid(row=7, column=0, sticky="w", padx=4, pady=(6, 0))
+        self.btn_clear_session = ttk.Button(f, text="删除当前账号的登录态", command=self.on_clear_session)
+        self.btn_clear_session.grid(row=8, column=0, sticky="ew", padx=4, pady=(8, 2))
+
+    # ---------------- 账号切换（界面入口）----------------
+    def _build_account_bar(self, parent):
+        bar = ttk.LabelFrame(parent, text="账号（切换不会退出登录，各账号数据独立）", padding=6)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ttk.Label(bar, text="当前账号:").pack(side="left", padx=(2, 4))
+        self.account_var = tk.StringVar(value="（未添加账号）")
+        self.account_combo = ttk.Combobox(bar, textvariable=self.account_var, state="readonly",
+                                          width=32, values=["（未添加账号）"])
+        self.account_combo.pack(side="left", padx=2)
+        self.account_combo.bind("<<ComboboxSelected>>", self.on_account_combo_selected)
+        ttk.Button(bar, text="＋ 添加账号", command=self.on_add_account).pack(side="left", padx=6)
+        self.lbl_account_info = ttk.Label(bar, text="", foreground="#6b7280")
+        self.lbl_account_info.pack(side="left", padx=(10, 2))
+
+    def _selected_account_key(self):
+        """从「账号」下拉框当前文本反查账号 key（文本就是 account_label）。"""
+        try:
+            text = str(self.account_var.get() or "")
+        except Exception:
+            return None
+        for a in self._accounts:
+            if account_label(a) == text:
+                return a.get("key")
+        return None
+
+    def on_account_combo_selected(self, event=None):
+        key = self._selected_account_key()
+        if key is None or key == self._current_key:
+            return
+        if not self.switch_account(key):
+            self._refresh_account_ui()      # 切换被拒（任务在跑）时把下拉框拉回当前账号
+
+    def on_switch_selected_account(self):
+        sel = ()
+        try:
+            sel = self.acc_tree.selection()
+        except Exception:
+            pass
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一个账号。")
+            return
+        self.switch_account(str(sel[0]))
+
+    def on_remove_selected_account(self, delete_files=False):
+        sel = ()
+        try:
+            sel = self.acc_tree.selection()
+        except Exception:
+            pass
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一个账号。")
+            return
+        self.remove_account(str(sel[0]), delete_files=delete_files)
 
     def _tab_network(self, nb):
         f = ttk.Frame(nb, padding=10)
@@ -1165,9 +1572,12 @@ class App:
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(2, weight=1)
 
+        # 0) 账号条：多账号在这里切换（切换不退出登录，各账号数据独立）
+        self._build_account_bar(parent)
+
         # 1) 快捷筛选（分两行，避免窄窗口时被挤没）
         frm_filter = ttk.LabelFrame(parent, text="快捷筛选（各条件之间是「且」的关系）", padding=7)
-        frm_filter.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        frm_filter.grid(row=1, column=0, sticky="ew", pady=(0, 5))
         self.frm_filter = frm_filter
         row1 = ttk.Frame(frm_filter)
         row1.pack(fill="x")
@@ -1626,13 +2036,14 @@ class App:
     # ---------------- 缓存 / 登录态 ----------------
     def refresh_cache_info(self):
         n = len(self._stats_cache or {})
-        size = 0
+        path = self._stats_cache_path()
         try:
-            size = os.path.getsize(STATS_CACHE_FILE)
+            size = os.path.getsize(path)
         except Exception:
             size = 0
         try:
-            self.lbl_cache_info.configure(text=f"本地缓存 {n} 条，文件 {size / 1024.0:.1f} KB（{STATS_CACHE_FILE}）")
+            self.lbl_cache_info.configure(
+                text=f"当前账号缓存 {n} 条，文件 {size / 1024.0:.1f} KB（{os.path.basename(path)}）")
             self.btn_clear_cache.configure(state="normal" if n else "disabled")
         except Exception:
             pass
@@ -1640,52 +2051,77 @@ class App:
 
     def _refresh_session_info(self):
         try:
-            p = SESSION_FILE + ".session"
+            acc = self._current_account()
+            if acc is None:
+                self.lbl_session_info.configure(
+                    text="尚未添加账号：填好手机号后点「添加账号并登录」，"
+                         "登录态会按账号分别保存。")
+                self.btn_clear_session.configure(state="disabled")
+                return
+            p = account_session_base(acc) + ".session"
             if os.path.exists(p):
                 size = os.path.getsize(p) / 1024.0
-                self.lbl_session_info.configure(text=f"已保存登录态：{os.path.basename(p)}（{size:.0f} KB）")
+                self.lbl_session_info.configure(
+                    text=f"当前账号：{account_label(acc)}\n"
+                         f"登录态：{os.path.basename(p)}（{size:.0f} KB）")
                 self.btn_clear_session.configure(state="normal")
             else:
-                self.lbl_session_info.configure(text="尚未保存登录态，首次登录需输入手机验证码。")
+                self.lbl_session_info.configure(
+                    text=f"当前账号：{account_label(acc)}\n"
+                         "尚未保存登录态，首次登录需输入手机验证码。")
                 self.btn_clear_session.configure(state="disabled")
         except Exception:
             pass
 
     def on_clear_stats_cache(self):
         n = len(self._stats_cache or {})
-        if not messagebox.askyesno("确认", f"确定清空本地统计缓存（{n} 条）吗？\n清空后下次获取统计需要重新请求 Telegram。"):
+        if not messagebox.askyesno("确认", f"确定清空当前账号的统计缓存（{n} 条）吗？\n清空后下次获取统计需要重新请求 Telegram。"):
             return
         self._stats_cache = {}
+        path = self._stats_cache_path()
         try:
-            if os.path.exists(STATS_CACHE_FILE):
-                os.remove(STATS_CACHE_FILE)
+            if os.path.exists(path):
+                os.remove(path)
         except Exception as e:
             self.log_msg(f"⚠️ 删除缓存文件失败（不影响使用）：{e}")
         self.refresh_cache_info()
         self.log_msg(f"🧹 已清空统计缓存（{n} 条）。")
 
     def on_clear_session(self):
-        p = SESSION_FILE + ".session"
-        if not os.path.exists(p):
-            messagebox.showinfo("提示", "当前没有已保存的登录态。")
+        """删除**当前账号**的登录态（其它账号不受影响）。"""
+        acc = self._current_account()
+        if acc is None:
+            messagebox.showinfo("提示", "当前没有账号。")
             return
-        if not messagebox.askyesno("确认", "确定删除已保存的登录态吗？\n删除后需要重新登录（会重新收到验证码）。"):
+        base = account_session_base(acc)
+        p = base + ".session"
+        if not os.path.exists(p):
+            messagebox.showinfo("提示", "当前账号没有已保存的登录态。")
+            return
+        if not messagebox.askyesno(
+                "确认", f"确定删除账号「{account_label(acc)}」的登录态吗？\n"
+                        "删除后这个账号需要重新登录（会重新收到验证码），其它账号不受影响。"):
             return
         try:
-            if self.client is not None:
-                self.run_async(self.client.disconnect())
+            cli = self._clients.pop(acc["key"], None)
+            if cli is not None:
+                self.run_async(cli.disconnect())
+            if acc["key"] == self._current_key:
+                self.client = None
         except Exception:
             pass
         removed = 0
-        for path in (p, SESSION_FILE + ".session-journal"):
+        for path in (p, base + ".session-journal"):
             try:
                 if os.path.exists(path):
                     os.remove(path)
                     removed += 1
             except Exception as e:
                 self.log_msg(f"⚠️ 删除 {os.path.basename(path)} 失败：{e}")
+        self._refresh_account_ui()
         self.refresh_cache_info()
-        self.log_msg(f"🗑 已删除登录态文件（{removed} 个）。请重新点「连接 / 登录」。")
+        self.set_status("⚪ 当前账号的登录态已删除，点「连接 / 登录」重新登录", "#7f8c8d")
+        self.log_msg(f"🗑 已删除登录态文件（{removed} 个）。点「连接 / 登录」可重新登录该账号。")
 
     # ---------------- 外观 / 布局 ----------------
     def on_toggle_theme(self):
@@ -1907,40 +2343,37 @@ class App:
     def apply_config_to_ui(self):
         # 注意：set 这些变量会触发自动保存，而自动保存会改写 self.config。
         # 因此先取一份本地快照，后续一律从快照读，避免"恢复过程中配置被自己覆盖"。
+        # v1.2.0 起再加一道保险：整个恢复过程屏蔽自动保存 —— 因为 save_config 现在
+        # 会用 UI 现值重建 per_account，第一个 set 就会把正要恢复的账号设置冲掉。
         cfg = dict(self.config or {})
-        self.api_id_var.set(cfg.get("api_id", ""))
-        self.api_hash_var.set(cfg.get("api_hash", ""))
-        self.phone_var.set(cfg.get("phone", ""))
-        self.proxy_enabled_var.set(cfg.get("proxy_enabled", False))
-        self.proxy_type_var.set(cfg.get("proxy_type", "SOCKS5"))
-        self.proxy_host_var.set(cfg.get("proxy_host", ""))
-        self.proxy_port_var.set(cfg.get("proxy_port", ""))
-        self.proxy_user_var.set(cfg.get("proxy_user", ""))
-        self.proxy_pass_var.set(cfg.get("proxy_pass", ""))
-        self.conc_var.set(cfg.get("stats_concurrency", 6) or 6)
-        self.ttl_var.set(cfg.get("stats_ttl_hours", 24) or 24)
-        self.cache_var.set(cfg.get("stats_use_cache", True))
-        # 退出节奏
-        self.interval_var.set(cfg.get("leave_interval", 2) or 2)
-        self.jitter_var.set(cfg.get("leave_jitter", 0) or 0)
-        # 筛选条件（仅回填界面，列表加载后由 _append_rows 自动套用）
-        self.filter_members_var.set(str(cfg.get("filter_members_lt", "") or ""))
-        self.filter_posts_var.set(str(cfg.get("filter_posts_lt", "") or ""))
-        self.filter_unknown_var.set(bool(cfg.get("filter_hide_unknown", True)))
-        self._sync_filter_preset_name()
-        # 安全防护
-        self.skip_protected_var.set(bool(cfg.get("skip_protected", True)))
-        self.detect_role_var.set(bool(cfg.get("detect_roles", True)))
-        self.preview_leave_var.set(bool(cfg.get("preview_before_leave", True)))
-        self.hide_protected_var.set(bool(cfg.get("hide_protected", False)))
-        # 外观与布局
-        self.remember_layout_var.set(bool(cfg.get("remember_layout", True)))
-        self.dark_var.set(bool(cfg.get("dark_mode", False)))
-        self._apply_theme(bool(self.dark_var.get()))
-        self._apply_ui_layout(cfg)
-        self.refresh_cache_info()
-        self.refresh_whitelist_info()
-        self._refresh_all_safe_cells()
+        self._suppress_save = True
+        try:
+            # ---- 全局（所有账号共用）----
+            self.api_id_var.set(cfg.get("api_id", ""))
+            self.api_hash_var.set(cfg.get("api_hash", ""))
+            self.proxy_enabled_var.set(cfg.get("proxy_enabled", False))
+            self.proxy_type_var.set(cfg.get("proxy_type", "SOCKS5"))
+            self.proxy_host_var.set(cfg.get("proxy_host", ""))
+            self.proxy_port_var.set(cfg.get("proxy_port", ""))
+            self.proxy_user_var.set(cfg.get("proxy_user", ""))
+            self.proxy_pass_var.set(cfg.get("proxy_pass", ""))
+            # 手机号框＝「要添加的账号」，预填当前账号的号码，方便照着加第二个
+            acc = self._current_account()
+            self.phone_var.set((acc or {}).get("phone") or cfg.get("phone", ""))
+            # ---- 当前账号（白名单 / 筛选条件 / 抓取配置）----
+            self._apply_account_state(self._per_account(self._current_key))
+            self._sync_filter_preset_name()
+            # 外观与布局（全局）
+            self.remember_layout_var.set(bool(cfg.get("remember_layout", True)))
+            self.dark_var.set(bool(cfg.get("dark_mode", False)))
+            self._apply_theme(bool(self.dark_var.get()))
+            self._apply_ui_layout(cfg)
+            self._refresh_account_ui()
+            self.refresh_cache_info()
+            self.refresh_whitelist_info()
+            self._refresh_all_safe_cells()
+        finally:
+            self._suppress_save = False
 
     # ---------------- 界面状态持久化 ----------------
     def _apply_ui_layout(self, cfg=None):
@@ -2205,61 +2638,383 @@ class App:
         self.root.after(0, lambda: self.btn_proxy_test.configure(state="normal"))
 
     def schedule_auto_connect(self):
-        """启动时若「凭据完整」且「已保存登录态」，则自动连接。
-        因为 session 已存在，Telethon 会直接复用登录态，通常无需验证码。"""
+        """启动时若「API 凭据完整」且「当前账号有登录态」，自动连接（无需验证码）。"""
         cfg = self.config or {}
         has_creds = bool(str(cfg.get("api_id", "")).strip()
-                         and str(cfg.get("api_hash", "")).strip()
-                         and str(cfg.get("phone", "")).strip())
+                         and str(cfg.get("api_hash", "")).strip())
         if not has_creds:
-            self.set_status("⚪ 尚未连接（请填写 API 信息后点「连接/登录」）", "#7f8c8d")
+            self.set_status("⚪ 尚未连接（请填写 API 信息后点「连接 / 登录」）", "#7f8c8d")
             return
-        if not os.path.exists(SESSION_FILE + ".session"):
-            self.set_status("⚪ 尚未连接（无登录态，点「连接/登录」后需输入验证码）", "#7f8c8d")
+        acc = self._current_account()
+        if acc is None:
+            self.set_status("⚪ 尚未添加账号（在左侧「账号」页添加）", "#7f8c8d")
             return
-        self.log_msg("检测到已保存的登录态，正在自动连接 ...（session 有效则无需输入验证码）")
+        if not os.path.exists(account_session_base(acc) + ".session"):
+            self.set_status("⚪ 尚未连接（无登录态，点「连接 / 登录」后需输入验证码）", "#7f8c8d")
+            return
+        self.log_msg(f"检测到账号「{account_label(acc)}」的登录态，正在自动连接 ..."
+                     "（session 有效则无需输入验证码）")
         self.set_status("⏳ 正在自动连接 ...", "#e67e22")
         self.root.after(200, self.on_connect)
 
+    def validate_api_creds(self):
+        """API ID / HASH 是**全局**设置：一个 Telegram 应用可以登录多个手机号。"""
+        try:
+            api_id = int(self.api_id_var.get().strip())
+        except Exception:
+            messagebox.showerror("错误", "API ID 必须为数字，请在 my.telegram.org 获取。")
+            return None
+        api_hash = self.api_hash_var.get().strip()
+        if not api_hash:
+            messagebox.showerror("错误", "请填写 API HASH（在 my.telegram.org 获取）。")
+            return None
+        return api_id, api_hash
+
+    # ---------------- 账号：连接 / 添加 / 切换 ----------------
     def on_connect(self):
-        v = self.validate_inputs()
-        if not v:
+        """连接**当前账号**。session 有效时通常无需验证码。"""
+        creds = self.validate_api_creds()
+        if not creds:
             return
-        api_id, api_hash, phone = v
+        api_id, api_hash = creds
+        acc = self._current_account()
+        if acc is None:
+            self.on_add_account()          # 一个账号都没有 -> 走添加流程
+            return
+        key = acc["key"]
+        pooled = self._clients.get(key)
+        if pooled is not None and self.client is pooled:
+            try:
+                alive = pooled.is_connected()
+            except Exception:
+                alive = False
+            if alive:
+                self.set_status(f"🟢 已连接：{account_label(acc)}", "#27ae60")
+                self.log_msg(f"账号「{account_label(acc)}」已处于连接状态，直接刷新列表。")
+                self.on_refresh()
+                return
         proxy = self.build_proxy()
         if proxy == "INVALID":
             return
         self.save_config()
-        self.btn_connect.configure(state="disabled")
-        self.set_status("⏳ 正在连接 Telegram ...", "#e67e22")
+        self._set_conn_busy(True)
+        self.set_status(f"⏳ 正在连接「{account_label(acc)}」...", "#e67e22")
         if proxy:
-            self.log_msg(f"正在连接 Telegram ...（经代理 {proxy[1]}:{proxy[2]}）")
+            self.log_msg(f"正在连接 Telegram ...（账号 {account_label(acc)}，经代理 {proxy[1]}:{proxy[2]}）")
         else:
-            self.log_msg("正在连接 Telegram ...（⚠ 未启用代理：直连可能被网络限制拦截，建议上方先配置并测试代理）")
+            self.log_msg("正在连接 Telegram ...（⚠ 未启用代理：直连可能被网络限制拦截）")
         self.ensure_loop()
-        future = self.run_async(self._connect(api_id, api_hash, phone, proxy))
+        future = self.run_async(self._connect(api_id, api_hash, acc.get("phone", ""), proxy,
+                                              session_base=account_session_base(acc),
+                                              account_key=key))
         future.add_done_callback(self._on_connect_done)
+
+    def on_add_account(self, phone=None):
+        """添加并登录一个**新账号**。同一手机号会直接切过去，不会重复添加。"""
+        creds = self.validate_api_creds()
+        if not creds:
+            return
+        api_id, api_hash = creds
+        if phone is None:
+            phone = self.phone_var.get().strip()
+        if not phone:
+            messagebox.showwarning(
+                "提示", "请先在左侧「账号」页填写要添加的手机号（含国家码，如 +8613800138000）。")
+            try:
+                self.nb_settings.select(self.tab_account)
+                self.phone_entry.focus_set()
+            except Exception:
+                pass
+            return
+        phone = str(phone).strip()
+        key = account_key_from_phone(phone)
+        exist = self._account_by_key(key)
+        if exist is not None:
+            if messagebox.askyesno("已存在",
+                                   f"账号「{account_label(exist)}」已在列表中。\n\n要切换到它吗？"):
+                self.switch_account(key)
+            return
+        proxy = self.build_proxy()
+        if proxy == "INVALID":
+            return
+        session_base = account_session_base({"key": key})
+        if os.path.exists(session_base + ".session"):
+            self.log_msg(f"发现 {os.path.basename(session_base)}.session 已存在 —— "
+                         "该号码登录过，直接复用登录态，通常无需验证码。")
+        self.save_config()
+        self._set_conn_busy(True)
+        self.set_status(f"⏳ 正在添加账号 {phone} ...", "#e67e22")
+        self.log_msg(f"正在添加账号 {phone} ...")
+        self.ensure_loop()
+        future = self.run_async(self._connect(api_id, api_hash, phone, proxy,
+                                              session_base=session_base, account_key=key))
+        future.add_done_callback(self._on_connect_done)
+
+    def _set_conn_busy(self, busy):
+        try:
+            self.btn_connect.configure(state="disabled" if busy else "normal")
+        except Exception:
+            pass
 
     def _on_connect_done(self, future):
         try:
             future.result()
         except OperationCancelled:
             self.log_msg("❌ 已取消登录。")
-            self.root.after(0, lambda: self.btn_connect.configure(state="normal"))
+            self.root.after(0, lambda: self._set_conn_busy(False))
             self.root.after(0, lambda: self.set_status("🔴 未连接（已取消登录）", "#c0392b"))
         except Exception as e:
             self.log_msg(f"❌ 连接失败: {e}")
-            self.root.after(0, lambda: self.btn_connect.configure(state="normal"))
+            self.root.after(0, lambda: self._set_conn_busy(False))
             self.root.after(0, lambda: self.set_status(
-                f"🔴 未连接：{type(e).__name__}（点「连接/登录」可重试）", "#c0392b"))
+                f"🔴 未连接：{type(e).__name__}（点「连接 / 登录」可重试）", "#c0392b"))
 
-    async def _connect(self, api_id, api_hash, phone, proxy):
+    def _register_account(self, key, phone, session_name, me):
+        """把登录成功的账号写入注册表（已存在则更新昵称 / 用户名 / user_id）。"""
+        acc = self._account_by_key(key)
+        if acc is None:
+            acc = {"key": key, "phone": phone, "label": "", "username": "",
+                   "user_id": None, "session": session_name}
+            self._accounts.append(acc)
+        if phone:
+            acc["phone"] = phone
+        if session_name:
+            acc["session"] = session_name     # session 基名决定了读哪个登录态文件
+        if me is not None:
+            acc["user_id"] = getattr(me, "id", None)
+            acc["username"] = getattr(me, "username", None) or ""
+            full = " ".join(str(x) for x in (getattr(me, "first_name", None),
+                                             getattr(me, "last_name", None)) if x).strip()
+            if full:
+                acc["label"] = full
+            if not acc.get("phone") and getattr(me, "phone", None):
+                acc["phone"] = "+" + str(me.phone)
+        self._consume_pending_state(key)   # 首个账号接手「添加前调好的设置」
+        return acc
+
+    def _after_login(self, key, status_text, switched):
+        """登录成功后的主线程收尾（Tk 变量只能在主线程碰）。"""
+        self.set_status(status_text, "#27ae60")
+        self.disable_code_input("✅ 已登录成功，无需再输入验证码。")
+        self._set_conn_busy(False)
+        if switched:
+            self._reset_account_view()       # 换账号：上一个账号的列表 / 分组 / 角色全部作废
+        self._refresh_account_ui()
+        self.refresh_cache_info()
+        self.refresh_whitelist_info()
+        self.save_config()
+        for b in (self.btn_refresh, self.btn_leave, self.btn_kw_leave,
+                  self.btn_destroy, self.btn_export):
+            try:
+                b.configure(state="normal")
+            except Exception:
+                pass
+        self.on_refresh()
+
+    # ---------------- 账号：切换 / 移除 ----------------
+    def _busy(self):
+        """是否有任务在跑（加载列表 / 统计 / 退出）。切号必须等它停，否则两账号数据会串。"""
+        return bool(getattr(self, "_progress_running", False))
+
+    def _reset_account_view(self):
+        """清掉「上一个账号」遗留的内存状态与列表。
+
+        列表、分组、角色都是跟着**当前登录的那个账号**走的，换账号后必须整个作废，
+        否则会出现「新账号的列表上挂着旧账号的分组列 / 角色标记」这种串号。
+        """
+        try:
+            self._stats_cancel.set()
+            self._list_cancel.set()
+        except Exception:
+            pass
+        self._dlg_state = {}
+        self._filters = []
+        self._folder_names = []
+        self._editable_folder_names = []
+        self._role = {}
+        try:
+            self._begin_list()          # 清空表格 + 递增 epoch（作废仍在跑的后台回填）
+        except Exception:
+            pass
+        try:
+            self.folder_filter_var.set(FOLDER_ALL)
+            self._rebuild_folder_menu()
+        except Exception:
+            pass
+        # 旧账号的取消事件已经 set 过，给新账号一对全新的
+        self._stats_cancel = threading.Event()
+        self._list_cancel = threading.Event()
+
+    def switch_account(self, key):
+        """切换到另一个账号，**不退出**当前账号。
+
+        当前账号的 client 留在 self._clients 池里不断开：登录态（session）与 TCP 连接
+        都还在，切回来直接复用，连重新握手都不用，更不会要验证码。
+        返回 True 表示确实执行了切换。
+        """
+        key = str(key or "")
+        if not key or key == self._current_key:
+            return False
+        acc = self._account_by_key(key)
+        if acc is None:
+            messagebox.showerror("错误", "账号不存在，请重新添加。")
+            return False
+        if self._busy():
+            messagebox.showinfo(
+                "提示", "有任务正在进行（加载列表 / 获取统计 / 退出中）。\n"
+                        "等它跑完或点「停止」后再切换账号，免得把两个账号的数据混在一起。")
+            self._refresh_account_ui()      # 把下拉框拉回当前账号，别显示成切过去了
+            return False
+        old_key = self._current_key
+        old_acc = self._account_by_key(old_key)
+        tail = f"（「{account_label(old_acc)}」的登录态保留，不会退出）" if old_acc else ""
+        self.log_msg(f"🔀 正在切换到账号「{account_label(acc)}」...{tail}")
+        # 1) 先把当前账号的状态落盘：缓存文件 + config 里的 per_account[key]
+        try:
+            self.save_stats_cache()
+            self.save_role_cache()
+            self.save_config()
+        except Exception as e:
+            self.log_msg(f"⚠️ 保存当前账号状态失败（不影响切换）：{e}")
+        if old_key and self.client is not None:
+            self._clients[old_key] = self.client      # 保底：确认旧的 client 已入池
+        # 2) 切到目标账号：client、缓存、白名单、配置一起换
+        self._current_key = key
+        self.client = self._clients.get(key)
+        self._stats_cache = self.load_stats_cache()
+        self._role_cache = self.load_role_cache()
+        self._apply_account_state(self._per_account(key))
+        self._sync_filter_preset_name()
+        self.save_config()
+        # 3) 界面：清掉上一个账号的列表，再连接 / 刷新
+        self._reset_account_view()
+        self._refresh_account_ui()
+        self.refresh_cache_info()
+        self.refresh_whitelist_info()
+        self._refresh_all_safe_cells()
+        conn, alive = self.client, False
+        if conn is not None:
+            try:
+                alive = bool(conn.is_connected())
+            except Exception:
+                alive = False
+        if alive:
+            self.log_msg(f"✅ 已切换到「{account_label(acc)}」：直接复用池中保持的连接，无需重新登录。")
+            self.set_status(f"🟢 已连接：{account_label(acc)}", "#27ae60")
+            self.on_refresh()
+        else:
+            self.log_msg(f"已切换到「{account_label(acc)}」，正在用已保存的登录态连接 ...")
+            self.on_connect()
+        return True
+
+    def remove_account(self, key, delete_files=False):
+        """从列表移除账号。delete_files=True 时连登录态与缓存一起删。"""
+        key = str(key or "")
+        acc = self._account_by_key(key)
+        if acc is None:
+            return False
+        is_current = (key == self._current_key)
+        msg = f"确定要从列表移除账号「{account_label(acc)}」吗？"
+        if delete_files:
+            msg += ("\n\n⚠️ 同时删除它的登录态与缓存文件 —— "
+                    "下次用这个手机号登录需要重新输入验证码。")
+        else:
+            msg += "\n\n登录态文件会保留：下次用同一手机号添加时可直接复用，不用再收验证码。"
+        if not messagebox.askyesno("确认移除", msg):
+            return False
+        # 只有「用户明确要删账号」才 disconnect —— 切换账号是绝不断开的
+        cli = self._clients.pop(key, None)
+        if cli is not None:
+            try:
+                self.run_async(cli.disconnect())
+            except Exception:
+                pass
+        if is_current:
+            self.client = None
+        if delete_files:
+            base = account_session_base(acc)
+            for p in (base + ".session", base + ".session-journal",
+                      account_cache_file("stats_cache", key),
+                      account_cache_file("role_cache", key)):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as e:
+                    self.log_msg(f"⚠️ 删除 {os.path.basename(p)} 失败：{e}")
+        # 从注册表与 config 里摘掉
+        self._accounts = [a for a in self._accounts if a.get("key") != key]
+        pa = dict((self.config or {}).get("per_account") or {})
+        pa.pop(key, None)
+        self.config["per_account"] = pa
+        self.config["accounts"] = list(self._accounts)
+        if is_current:
+            self._current_key = self._accounts[0]["key"] if self._accounts else None
+            self.config["current_account"] = self._current_key
+            self._stats_cache = self.load_stats_cache()
+            self._role_cache = self.load_role_cache()
+            self._apply_account_state(self._per_account(self._current_key))
+            self._reset_account_view()
+            self.set_status("⚪ 已移除当前账号（可在左侧「账号」页添加其它账号）", "#7f8c8d")
+        self.save_config()
+        self._refresh_account_ui()
+        self.refresh_cache_info()
+        self.refresh_whitelist_info()
+        self.log_msg(f"🗑 已移除账号「{account_label(acc)}」"
+                     + ("（含登录态与缓存）" if delete_files else "（登录态已保留）"))
+        if is_current and self._current_key:
+            self.on_connect()
+        return True
+
+    def _refresh_account_ui(self):
+        """刷新工具栏下拉框与「账号」页的账号列表。"""
+        texts = [account_label(a) for a in self._accounts]
+        cur = self._current_account()
+        try:
+            self.account_combo.configure(values=texts or ["（未添加账号）"])
+            self.account_var.set(account_label(cur) if cur else "（未添加账号）")
+        except Exception:
+            pass
+        try:
+            tree = self.acc_tree
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for a in self._accounts:
+                k = a.get("key")
+                conn = self._clients.get(k)
+                alive = False
+                try:
+                    alive = bool(conn is not None and conn.is_connected())
+                except Exception:
+                    alive = False
+                if k == self._current_key:
+                    mark = "✅ 当前 · 已连接" if alive else "● 当前 · 未连接"
+                else:
+                    mark = "☑ 已保持登录" if alive else "— 未连接"
+                tree.insert("", "end", iid=str(k), values=(account_label(a), a.get("phone", ""), mark))
+        except Exception:
+            pass
+        try:
+            self.lbl_account_info.configure(
+                text=(f"已添加 {len(self._accounts)} 个账号 —— 切换时不会退出登录，"
+                      "各账号的登录态与数据各自独立"
+                      if self._accounts else
+                      "尚未添加账号：填好下方手机号后点「添加账号并登录」"))
+        except Exception:
+            pass
+        self._refresh_session_info()
+
+    async def _connect(self, api_id, api_hash, phone, proxy,
+                       session_base=None, account_key=None):
+        """连接 / 登录。session_base 决定复用哪个账号的登录态文件。"""
+        if not session_base:
+            acc = self._current_account()
+            session_base = account_session_base(acc) if acc else LEGACY_SESSION_FILE
         if proxy:
             self.log_msg(f"🔌 通过代理 {proxy[1]}:{proxy[2]} 连接 Telegram ...")
         else:
             self.log_msg("⚠ 未启用代理：直连可能因网络限制失败，建议先配置并测试代理。")
         client = TelegramClient(
-            SESSION_FILE, api_id, api_hash, proxy=proxy,
+            session_base, api_id, api_hash, proxy=proxy,
             connection_retries=3, timeout=15,
         )
         self.log_msg("正在连接 Telegram 数据中心 ...（若长时间无响应，多为代理无法访问 Telegram 或网络限制）")
@@ -2275,7 +3030,7 @@ class App:
             return await fut
 
         try:
-            await client.start(phone=phone, code_callback=code_cb, password=pw_cb)
+            await client.start(phone=(phone or None), code_callback=code_cb, password=pw_cb)
         except OperationCancelled:
             raise
         except Exception as e:
@@ -2289,28 +3044,23 @@ class App:
                 self.log_msg("   2) 在「代理设置」里把「类型」在 SOCKS5 与 HTTP 之间切换后再连；")
                 self.log_msg("   3) 点「测试代理」确认能出网到 Telegram（新版本已支持真实出网测试）。")
             raise
-        self.client = client
-        self.log_msg("✅ 登录成功！")
-        # 取账号信息，让状态栏显示到底登的是谁
-        who = ""
+        # 取账号信息：既用于状态栏，也喂给账号记录的昵称
+        me = None
         try:
             me = await client.get_me()
-            who = (getattr(me, "username", None) or getattr(me, "first_name", None)
-                   or (("+" + me.phone) if getattr(me, "phone", None) else "")
-                   or str(getattr(me, "id", "")))
         except Exception:
             pass
-        status_text = f"🟢 已连接：{who}" if who else "🟢 已连接（登录态有效）"
-        self.root.after(0, lambda t=status_text: self.set_status(t, "#27ae60"))
-        self.root.after(0, lambda: self.disable_code_input("✅ 已登录成功，无需再输入验证码。"))
-        self.root.after(0, lambda: (
-            self.btn_refresh.configure(state="normal"),
-            self.btn_leave.configure(state="normal"),
-            self.btn_kw_leave.configure(state="normal"),
-            self.btn_destroy.configure(state="normal"),
-            self.btn_export.configure(state="normal"),
-            self.on_refresh(),
-        ))
+        key = account_key or self._current_key or account_key_from_phone(phone)
+        acc = self._register_account(key, phone, os.path.basename(session_base), me)
+        # ⚠️ 关键：client 只入池、**不 disconnect**。切走以后它还留在这里，
+        # 切回来直接复用这个连接 —— 登录态与网络握手都不用重来。
+        self._clients[acc["key"]] = client
+        switched = (self._current_key != acc["key"])
+        self._current_key = acc["key"]
+        self.client = client
+        self.log_msg("✅ 登录成功！")
+        status_text = f"🟢 已连接：{account_label(acc)}"
+        self.root.after(0, lambda: self._after_login(acc["key"], status_text, switched))
 
     # ---------------- 刷新频道 ----------------
     def on_refresh(self):
@@ -4539,6 +5289,13 @@ class App:
         except Exception:
             pass
         try:
+            # 关闭时才断开**所有**账号 —— 平时切换账号是绝不断开的（那样才叫「保持登录态」）
+            for key, cli in list(getattr(self, "_clients", {}).items()):
+                try:
+                    if cli is not None:
+                        self.run_async(cli.disconnect())
+                except Exception:
+                    pass
             if self.client is not None:
                 self.run_async(self.client.disconnect())
             if self.loop is not None:
@@ -4615,7 +5372,8 @@ def _selftest_say(lines, text):
 
 def selftest():
     """打包后冒烟自检。返回退出码：0=通过，1=失败。"""
-    global CONFIG_FILE, SESSION_FILE, STATS_CACHE_FILE, ROLE_CACHE_FILE
+    global BASE_DIR, CONFIG_FILE, SESSION_FILE, STATS_CACHE_FILE, ROLE_CACHE_FILE
+    global LEGACY_SESSION_FILE, LEGACY_STATS_CACHE_FILE, LEGACY_ROLE_CACHE_FILE
     lines, ok = [], True
     try:
         _selftest_say(lines, "python %s  frozen=%s" % (
@@ -4735,10 +5493,16 @@ def selftest():
         # 登录态与配置（自检绝不能动真实账号数据）。
         import tempfile
         tmpdir = tempfile.mkdtemp(prefix="tg_selftest_")
+        # ⚠️ BASE_DIR 也要一起重定向：多账号的 session / 缓存路径都是从 BASE_DIR 拼的，
+        # 少了这一步，自检就会把账号文件写到用户真实的程序目录里。
+        BASE_DIR = tmpdir
         CONFIG_FILE = os.path.join(tmpdir, "cfg.json")
-        SESSION_FILE = os.path.join(tmpdir, "tg_session")
-        STATS_CACHE_FILE = os.path.join(tmpdir, "stats.json")
-        ROLE_CACHE_FILE = os.path.join(tmpdir, "role.json")
+        LEGACY_SESSION_FILE = os.path.join(tmpdir, "tg_session")
+        LEGACY_STATS_CACHE_FILE = os.path.join(tmpdir, "stats.json")
+        LEGACY_ROLE_CACHE_FILE = os.path.join(tmpdir, "role.json")
+        SESSION_FILE = LEGACY_SESSION_FILE
+        STATS_CACHE_FILE = LEGACY_STATS_CACHE_FILE
+        ROLE_CACHE_FILE = LEGACY_ROLE_CACHE_FILE
         r = tk.Tk()
         r.withdraw()
         try:
@@ -4762,6 +5526,22 @@ def selftest():
             assert app.lbl_version is not None, "状态栏缺版本号标签"
             assert str(app.lbl_version.cget("text")) == APP_VERSION, app.lbl_version.cget("text")
             assert app.btn_changelog is not None and callable(app.on_show_changelog)
+            # 多账号：账号条 + 账号页 + 按账号命名的 session / 缓存路径
+            assert app.account_combo is not None and app.account_var is not None
+            assert app.acc_tree is not None and app.phone_entry is not None
+            assert app.btn_connect is not None
+            assert account_key_from_phone("+8613800138000") == "8613800138000"
+            assert account_key_from_phone("861 3800 1380") == "86138001380"
+            assert account_key_from_phone("") == DEFAULT_ACCOUNT_KEY
+            assert account_session_base({"key": "k1"}).endswith("tg_session_k1")
+            # 旧账号记录里写明 session 基名时要照用（迁移来的那条指向 tg_session）
+            assert account_session_base({"key": "k1", "session": "tg_session"}).endswith("tg_session")
+            assert account_cache_file("stats_cache", "k1").endswith("tg_stats_cache_k1.json")
+            assert app._stats_cache_path().endswith(".json")
+            assert app._role_cache_path().endswith(".json")
+            assert app._per_account() == {} and app._whitelist_of() == set()
+            assert app._selected_account_key() is None
+            _selftest_say(lines, "多账号：账号注册表 / 按账号 session 与缓存路径 / 切换入口控件 OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))

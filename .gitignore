@@ -5,8 +5,12 @@
 *.session-journal
 tg_session*
 tg_cleaner_config.json
+# 单账号时代的文件名（v1.1.x）
 tg_stats_cache.json
 tg_role_cache.json
+# 多账号（v1.2.0 起）：tg_stats_cache_<key>.json / tg_role_cache_<key>.json
+tg_stats_cache*.json
+tg_role_cache*.json
 
 # 运行时产生的日志（无斜杠的写法在任意层级都匹配，dist/ 下的也一并拦掉）
 tg_selftest.log
