@@ -24,6 +24,7 @@ TG 频道批量退出工具 (GUI 版)
 import asyncio
 import csv
 import datetime
+import io
 import json
 import os
 import random
@@ -31,6 +32,7 @@ import re
 import sys
 import threading
 import time
+import zipfile
 
 # GUI 依赖 tkinter（Python 标准库），但部分“精简/嵌入式”Python 或 Linux 默认未安装。
 # 若缺失，给出明确指引而非原始报错。
@@ -285,11 +287,33 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.6.0"
+APP_VERSION = "v1.7.0"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.0", "2026-10-15", [
+        "新增：**Excel(.xlsx) 导出**（导出菜单里六项：CSV / Excel 各三档范围）。"
+        "一个工作簿三张表 —— **会话清单**（表头样式、冻结首行、自动筛选、列宽）／"
+        "**统计概览**（总数·类型分布·用户数量级·活跃度·异常特征·订阅名额）／"
+        "**异常明细**（每个异常会话的每条原因，含服务端字段原文）。"
+        "导出完会问一句「现在打开吗」，不擅自弹程序",
+        "**零依赖**：没有引 openpyxl / xlwt，自己写了个最小 OOXML 生成器"
+        "（zipfile + XML，标准库），exe 体积不受影响。要的东西本来就很有限："
+        "文本 / 千分位整数 / 表头底色 / 冻结 / 筛选 / 列宽。"
+        "代价是我们得自己守规范，所以测试里把「包结构自洽」也当成断言："
+        "每段 XML 能被解析、Content_Types 声明的部件都存在、workbook 引用的每个 rId 都在 rels 里"
+        "（这三样任一不对，Excel 会直接说「文件损坏」）",
+        "**Excel 这条路天然免疫 CSV 注入**：以 `=` / `+` / `@` 开头的频道名，在 CSV 里会被 Excel"
+        "当公式执行（老坑），在 xlsx 里公式必须写在 `<f>` 元素中，内联字符串永远只是字符串。"
+        "CSV 那条也顺手加了一道防护（只挡真会被当公式的几种，**刻意不动以 `-` 开头的值** —— "
+        "负数 ID / 天数是正常数据，一律加引号反而把它们全变成文本）",
+        "数字就写成数字：用户数 / 作品数 / 活跃(天前) / ID 都能直接在 Excel 里排序、求和、做透视表"
+        "（千分位显示）。**没统计过的留空而不是写 0** —— 写 0 会让「没统计过」在表格里看起来"
+        "像「真的是 0 个」；「无消息」也写成文字，不是 1000000000 天",
+        "顺手收拢：导出范围解析抽成 `_export_selection`，CSV 与 Excel 共用一份 —— "
+        "两种格式的行集若各写一遍，迟早会悄悄不一致；导出列定义也收到 `EXCEL_COLUMNS` 一处",
+    ]),
     ("v1.6.0", "2026-10-15", [
         "新增：**数据概览**（「📊 概览」按钮 / **Ctrl+D**）—— 类型分布环形图、用户数量级、"
         "活跃度、异常特征四张图，全部用 Canvas 手绘（零依赖），数据来自当前列表（**零请求**）；"
@@ -1066,8 +1090,11 @@ def quota_limit_for(premium):
     return QUOTA_PREMIUM if premium else QUOTA_FREE
 
 
-def quota_text(used, limit, premium=False):
-    """名额文案。used/limit 都可为 None（未连接 / 未加载）时返回空串。"""
+def quota_text(used, limit, premium=False, with_label=True):
+    """名额文案。used/limit 都可为 None（未连接 / 未加载）时返回空串。
+
+    with_label=False 时省掉「🎯 名额」这层前缀 —— Excel 概览里标签列已经写了「订阅名额」，
+    值里再重复一遍只是噪音。"""
     try:
         used = int(used)
         limit = int(limit)
@@ -1075,7 +1102,8 @@ def quota_text(used, limit, premium=False):
         return ""
     left = max(0, limit - used)
     tag = "Premium" if premium else "免费账号"
-    return f"🎯 名额 {used}/{limit}（剩 {left}，按{tag}估算）"
+    head = f"名额 {used}/{limit}" if with_label else f"{used}/{limit}"
+    return f"{'🎯 ' if with_label else ''}{head}（剩 {left}，按{tag}估算）"
 
 
 # ---------------- 退出历史 / 重新加入 ----------------
@@ -1479,6 +1507,273 @@ def fmt_duration(seconds):
     if sec < 3600:
         return f"{sec // 60} 分 {sec % 60} 秒"
     return f"{sec // 3600} 小时 {(sec % 3600) // 60} 分"
+
+
+# ---------------- Excel(.xlsx) 导出：手写最小 OOXML，零依赖 ----------------
+# 为什么不用 openpyxl：本项目守「单文件 + 不引新依赖」。xlsx 本质就是「一包 XML 打进 zip」，
+# 标准库 zipfile 足够；openpyxl 单独看不大，但连它带 et_xmlfile 一起进 pyinstaller，
+# exe 还要再胖几 MB —— 而我们真正需要的只有：文本 / 千分位整数 / 表头底色 /
+# 冻结首行 / 自动筛选 / 列宽。
+#
+# 另一个更重要的好处：**单元格类型是我们显式声明的**（inlineStr）。CSV 有个经典坑 ——
+# 以 = + - @ 开头的内容会被 Excel 当公式执行（CSV 注入）；xlsx 里公式必须写在 <f> 元素里，
+# 内联字符串永远只是字符串。所以 Excel 这条路天然比 CSV 安全（CSV 那条也顺手加了防护）。
+XL_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XL_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PKG_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+XL_CELL_LIMIT = 32767        # Excel 单元格文本上限，超了文件会打不开
+XL_SHEET_NAME_LIMIT = 31     # 表名上限；还有几个字符不能用
+XL_SHEET_BAD_CHARS = '[]:*?/\\'
+
+# 单元格样式索引（对应下面 STYLES_XML 里 cellXfs 的顺序）
+XS_TEXT, XS_HEAD, XS_INT, XS_BOLD, XS_TITLE, XS_WRAP = 0, 1, 2, 3, 4, 5
+
+STYLES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<styleSheet xmlns="{XL_NS}">'
+    '<fonts count="3">'
+    '<font><sz val="11"/><color theme="1"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="11"/><color theme="1"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="14"/><color theme="1"/><name val="Calibri"/></font>'
+    '</fonts>'
+    '<fills count="3">'
+    '<fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    '<fill><patternFill patternType="solid">'
+    '<fgColor rgb="FFDDEBF7"/><bgColor indexed="64"/></patternFill></fill>'
+    '</fills>'
+    '<borders count="2">'
+    '<border><left/><right/><top/><bottom/><diagonal/></border>'
+    '<border><left/><right/><top/>'
+    '<bottom style="thin"><color rgb="FFB0B7C3"/></bottom><diagonal/></border>'
+    '</borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="6">'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0"'
+    ' applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1">'
+    '<alignment vertical="center"/></xf>'
+    '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0"'
+    ' applyNumberFormat="1"/>'
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1">'
+    '<alignment vertical="top" wrapText="1"/></xf>'
+    '</cellXfs>'
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    '</styleSheet>'
+)
+
+# 单元格标记 -> 样式索引。调用方写 ("h", "名称") 就得到表头单元格（粗体 + 底色 + 下边框）。
+XL_CELL_STYLES = {"s": XS_TEXT, "h": XS_HEAD, "i": XS_INT,
+                  "b": XS_BOLD, "t": XS_TITLE, "w": XS_WRAP}
+# Excel 会把以这些字符开头的文本当公式（CSV 注入）。xlsx 靠类型声明天然免疫，
+# 但 CSV 导出走的还是纯文本，所以这份判据两边共用。
+XL_FORMULA_TRIGGERS = ("=", "+", "@", "\t", "\r")
+
+
+def xml_escape(value):
+    """XML 文本转义 + 丢掉 xlsx 不允许的控制字符（0x00-0x08 / 0x0B / 0x0C / 0x0E-0x1F）。
+
+    控制字符必须**删掉**而不是转义 —— 留着会让 Excel 直接报「文件损坏」打不开。
+    \\t \\n \\r 是允许的，原样保留（xml:space="preserve" 保住空格）。"""
+    out = []
+    for ch in str(value):
+        code = ord(ch)
+        if code < 0x20 and ch not in "\t\n\r":
+            continue
+        if ch == "&":
+            out.append("&amp;")
+        elif ch == "<":
+            out.append("&lt;")
+        elif ch == ">":
+            out.append("&gt;")
+        elif ch == '"':
+            out.append("&quot;")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def xl_col_letter(n):
+    """列号 -> 字母：1->A、26->Z、27->AA。"""
+    letters = ""
+    n = int(n)
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters or "A"
+
+
+def xl_sheet_name(name, used=None):
+    """表名合规化：≤31 字符、去掉 []:*?/\\、去重、不许空。"""
+    raw = str(name or "").strip() or "Sheet"
+    for ch in XL_SHEET_BAD_CHARS:
+        raw = raw.replace(ch, "-")
+    raw = raw[:XL_SHEET_NAME_LIMIT]
+    if used is None:
+        return raw
+    base, out, i = raw, raw, 2
+    while out in used:
+        tail = f"({i})"
+        out = base[:XL_SHEET_NAME_LIMIT - len(tail)] + tail
+        i += 1
+    used.add(out)
+    return out
+
+
+def csv_guard(value):
+    """CSV 单元格防公式注入：以 = + @ 或制表/回车开头的文本前面加一个单引号。
+
+    只挡真正会被 Excel 当公式的几种；**刻意不动以 - 开头的值** ——
+    负数（如 ID、天数）本来就是合法数字，一律加引号反而把它们变成文本。"""
+    text = "" if value is None else str(value)
+    return ("'" + text) if text.startswith(XL_FORMULA_TRIGGERS) else text
+
+
+def xl_cell_token(value, style=None):
+    """把 Python 值规范化成 (样式索引, 类型, 值)：类型 s=文本 / i=数字 / e=空。"""
+    if isinstance(value, tuple) and len(value) == 2 and value[0] in XL_CELL_STYLES:
+        style = XL_CELL_STYLES[value[0]]
+        value = value[1]
+    if value is None or value == "":
+        return (XS_TEXT if style is None else style), "e", ""
+    if isinstance(value, bool):          # bool 是 int 的子类，必须先拦
+        return (XS_TEXT if style is None else style), "s", str(value)
+    if isinstance(value, (int, float)):
+        return (XS_INT if style is None else style), "i", value
+    return (XS_TEXT if style is None else style), "s", str(value)[:XL_CELL_LIMIT]
+
+
+def xl_cell_xml(ref, token):
+    """一个 <c> 单元格。空值也输出标签 —— 否则该格拿不到样式（空行会一片白）。"""
+    style, kind, value = token
+    s_attr = f' s="{style}"' if style else ""
+    if kind == "e":
+        return f'<c r="{ref}"{s_attr}/>'
+    if kind == "i":
+        return f'<c r="{ref}"{s_attr}><v>{value}</v></c>'
+    return (f'<c r="{ref}"{s_attr} t="inlineStr"><is>'
+            f'<t xml:space="preserve">{xml_escape(value)}</t></is></c>')
+
+
+def xl_sheet_xml(sheet):
+    """一张工作表。冻结首行 / 自动筛选 / 列宽都按 sheet 里的开关来。"""
+    freeze = bool(sheet.get("freeze", True))
+    do_filter = bool(sheet.get("filter", True))
+    widths = list(sheet.get("cols") or [])
+    parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+             f'<worksheet xmlns="{XL_NS}">']
+    if freeze:
+        parts.append('<sheetViews><sheetView workbookViewId="0">'
+                     '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft"'
+                     ' state="frozen"/></sheetView></sheetViews>')
+    else:
+        parts.append('<sheetViews><sheetView workbookViewId="0"/></sheetViews>')
+    parts.append('<sheetFormatPr defaultRowHeight="15"/>')
+    if widths:
+        parts.append("<cols>" + "".join(
+            f'<col min="{i + 1}" max="{i + 1}" width="{max(4, w)}" customWidth="1"/>'
+            for i, w in enumerate(widths)) + "</cols>")
+    parts.append("<sheetData>")
+    for idx, row in enumerate(sheet.get("rows") or [], 1):
+        cells = "".join(xl_cell_xml(f"{xl_col_letter(i + 1)}{idx}", xl_cell_token(v))
+                        for i, v in enumerate(row))
+        parts.append(f'<row r="{idx}">{cells}</row>')
+    parts.append("</sheetData>")
+    if do_filter and widths:
+        parts.append(f'<autoFilter ref="A1:{xl_col_letter(len(widths))}1"/>')
+    parts.append("</worksheet>")
+    return "".join(parts)
+
+
+# 导出列定义 —— CSV 与 Excel 共用同一份（列序、表头、宽度只有一个真源）
+EXCEL_COLUMNS = (
+    ("名称", 34), ("用户名", 22), ("类型", 8), ("用户数", 12), ("作品数", 10),
+    ("活跃(天前)", 12), ("分组", 16), ("ID", 18), ("安全防护", 14), ("异常特征", 46),
+)
+EXCEL_RISK_COLUMNS = (
+    ("名称", 34), ("类型", 8), ("ID", 18), ("异常类别", 18), ("判定依据（服务端字段）", 62),
+)
+
+
+def build_xlsx(sheets):
+    """把若干张表打成 xlsx 字节流。sheets = [{"name","cols","rows","freeze","filter"}]。
+
+    只产出「一定会被 Excel 认」的最小部件集：Content_Types / .rels / workbook /
+    workbook.rels / 每张 sheet / styles。没有 sharedStrings —— 全用 inlineStr。"""
+    used_names = set()
+    norm = []
+    for sh in (sheets or []):
+        if not isinstance(sh, dict):
+            continue
+        norm.append({
+            "name": xl_sheet_name(sh.get("name"), used_names),
+            "cols": list(sh.get("cols") or []),
+            "rows": [list(r) for r in (sh.get("rows") or [])],
+            "freeze": bool(sh.get("freeze", True)),
+            "filter": bool(sh.get("filter", True)),
+        })
+    if not norm:
+        norm = [{"name": "Sheet1", "cols": [], "rows": [], "freeze": False, "filter": False}]
+
+    sheet_tags = "".join(
+        f'<sheet name="{xml_escape(sh["name"])}" sheetId="{i + 1}" r:id="rId{i + 1}"/>'
+        for i, sh in enumerate(norm))
+    workbook = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f'<workbook xmlns="{XL_NS}" xmlns:r="{XL_R_NS}">'
+                f'<sheets>{sheet_tags}</sheets></workbook>')
+
+    # styles 固定拿到最后一个 rId，省得 sheet 编号跟着它漂
+    styles_rid = len(norm) + 1
+    wb_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               f'<Relationships xmlns="{PKG_NS}">'
+               + "".join(f'<Relationship Id="rId{i + 1}" Type="{XL_R_NS}/worksheet"'
+                         f' Target="worksheets/sheet{i + 1}.xml"/>'
+                         for i in range(len(norm)))
+               + f'<Relationship Id="rId{styles_rid}" Type="{XL_R_NS}/styles"'
+                 ' Target="styles.xml"/>'
+               '</Relationships>')
+
+    content_types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                     f'<Types xmlns="{CT_NS}">'
+                     '<Default Extension="rels" ContentType="application/vnd.openxml'
+                     'formats-package.relationships+xml"/>'
+                     '<Default Extension="xml" ContentType="application/xml"/>'
+                     '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.'
+                     'openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                     + "".join(
+                         f'<Override PartName="/xl/worksheets/sheet{i + 1}.xml"'
+                         ' ContentType="application/vnd.openxmlformats-officedocument.'
+                         'spreadsheetml.worksheet+xml"/>' for i in range(len(norm)))
+                     + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
+                       'openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                       '</Types>')
+
+    root_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 f'<Relationships xmlns="{PKG_NS}">'
+                 f'<Relationship Id="rId1" Type="{XL_R_NS}/officeDocument"'
+                 ' Target="xl/workbook.xml"/></Relationships>')
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/styles.xml", STYLES_XML)
+        for i, sh in enumerate(norm):
+            z.writestr(f"xl/worksheets/sheet{i + 1}.xml", xl_sheet_xml(sh))
+    return buf.getvalue()
+
+
+def write_xlsx(path, sheets):
+    """写 xlsx 文件，返回字节数。"""
+    data = build_xlsx(sheets)
+    with open(path, "wb") as f:
+        f.write(data)
+    return len(data)
 
 
 # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
@@ -2963,9 +3258,19 @@ class App:
         self.chk_hide_protected.pack(side="left", padx=(6, 0))
         self.btn_export = ttk.Menubutton(frm_sel, text="导出 CSV ▾", state="disabled")
         self._export_menu = tk.Menu(self.btn_export, tearoff=0)
-        self._export_menu.add_command(label="导出当前显示的行", command=lambda: self.on_export("visible"))
-        self._export_menu.add_command(label="导出全部（含被筛选隐藏）", command=lambda: self.on_export("all"))
-        self._export_menu.add_command(label="仅导出已勾选", command=lambda: self.on_export("checked"))
+        self._export_menu.add_command(label="CSV：当前显示的行",
+                                      command=lambda: self.on_export("visible"))
+        self._export_menu.add_command(label="CSV：全部（含被筛选隐藏）",
+                                      command=lambda: self.on_export("all"))
+        self._export_menu.add_command(label="CSV：仅已勾选",
+                                      command=lambda: self.on_export("checked"))
+        self._export_menu.add_separator()
+        self._export_menu.add_command(label="Excel：当前显示的行",
+                                      command=lambda: self.on_export_excel("visible"))
+        self._export_menu.add_command(label="Excel：全部（含被筛选隐藏）",
+                                      command=lambda: self.on_export_excel("all"))
+        self._export_menu.add_command(label="Excel：仅已勾选",
+                                      command=lambda: self.on_export_excel("checked"))
         self._export_menu.add_separator()
         self._export_menu.add_command(label="导出快照 JSON（供以后对比）", command=self.on_export_snapshot)
         self._export_menu.add_command(label="与上次快照对比…", command=self.on_compare_snapshot)
@@ -3072,7 +3377,8 @@ class App:
             ("btn_more", "静音 / 归档：给「太吵但不想退」的会话一个可逆的中间选项"),
             ("btn_dev_refresh", "拉取当前账号的登录设备列表（只读）"),
             ("btn_dev_kill", "踢出选中的设备（本机那条永远不会被踢）"),
-            ("btn_export", "导出 CSV：当前显示 / 全部 / 仅已勾选（含异常特征列）"),
+            ("btn_export", "导出：CSV 或 Excel(.xlsx)；范围可选当前显示 / 全部 / 仅已勾选。"
+                           "Excel 多两张表 —— 统计概览与异常明细"),
             ("btn_leave", "退出频道 / 群组；私聊与机器人会被删除会话。删完都会回头向服务端复核"),
             ("btn_destroy", "删除【你本人创建】的频道 / 群组（对所有成员消失，不可恢复）"),
             ("chk_hide_protected", "把白名单 / 创建者 / 管理员这些「不该动」的行从列表里藏起来"),
@@ -7378,34 +7684,55 @@ class App:
         self.log_msg(f"🔍 关键词匹配到 {len(matched)} 个频道，准备退出。")
         self.leave_items(matched)
 
+    def _export_selection(self, mode):
+        """导出范围解析：CSV 与 Excel **共用这一份** —— 两种格式的行集若各写一遍，
+        迟早会悄悄不一致（「CSV 里有的，Excel 里少一个」这种问题最难查）。"""
+        if mode == "all":
+            return [i for i in self.channels if self.tree.exists(i)], "全部"
+        if mode == "checked":
+            return [i for i in self.selected_items_all() if self.tree.exists(i)], "已勾选"
+        return list(self.tree.get_children()), "当前显示"
+
+    def _export_row_values(self, iid):
+        """一行的导出租：返回 (值列表, 异常明细列表)。取不到就返回 (None, [])。"""
+        ent = self.channels.get(iid)
+        try:
+            name = self.tree.set(iid, "name")
+            username = self.tree.set(iid, "username")
+            kind = self.tree.set(iid, "type")
+            folder = self.tree.set(iid, "folder")
+            cid = self.tree.set(iid, "id")
+            safe = self.protected_reason(iid) or ""
+            risk_txt = risk_detail_text(ent)
+        except Exception:
+            return None, []
+        values = [name, username, kind,
+                  self._stat_cell(iid, "members"), self._stat_cell(iid, "posts"),
+                  self._active_cell(iid), folder, cid, safe, risk_txt]
+        return values, (risk_of(ent) if ent is not None else [])
+
+    def _stat_cell(self, iid, col):
+        """统计值 -> Excel 单元格。没获取过就留空 —— 不要写成 0，
+        那会让「没统计过」在 Excel 里看起来像「真的是 0 个」。"""
+        n = self._stat_num(iid, col)
+        return ("i", n) if n is not None else ""
+
+    def _active_cell(self, iid):
+        n = self._active_num(iid)
+        if n is None:
+            return ""
+        if n >= ACTIVE_NEVER:
+            return "无消息"          # 「一条消息都没有」比 1000000000 天好读得多
+        return ("i", n)
+
     def on_export(self, mode="visible"):
         """导出 CSV：visible=当前显示的行（筛选结果） / all=全部（含被隐藏） / checked=已勾选。"""
-        if mode == "all":
-            iids = [i for i in self.channels if self.tree.exists(i)]
-            label = "全部"
-        elif mode == "checked":
-            iids = [i for i in self.selected_items_all() if self.tree.exists(i)]
-            label = "已勾选"
-        else:
-            iids = list(self.tree.get_children())
-            label = "当前显示"
+        iids, label = self._export_selection(mode)
         rows = []
         for iid in iids:
-            try:
-                rows.append((
-                    self.tree.set(iid, "name"),
-                    self.tree.set(iid, "username"),
-                    self.tree.set(iid, "type"),
-                    self.tree.set(iid, "members"),
-                    self.tree.set(iid, "posts"),
-                    self.tree.set(iid, "active"),
-                    self.tree.set(iid, "folder"),
-                    self.tree.set(iid, "id"),
-                    self.protected_reason(iid) or "",
-                    risk_detail_text(self.channels.get(iid)),
-                ))
-            except Exception:
-                pass
+            values, _detail = self._export_row_values(iid)
+            if values is not None:
+                rows.append(values)
         if not rows:
             messagebox.showinfo("提示", f"没有可导出的行（范围：{label}）。")
             return
@@ -7421,13 +7748,140 @@ class App:
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["名称", "用户名", "类型", "用户数", "作品数", "活跃(天前)",
-                            "分组", "ID", "安全防护", "异常特征"])
-                w.writerows(rows)
+                w.writerow([t for t, _w in EXCEL_COLUMNS])
+                # 防公式注入：以 = + @ 开头的文本会被 Excel 当公式执行（CSV 老坑）。
+                # 只挡这几种，**刻意不动以 - 开头的值**（负数 ID / 天数是正常的，加引号反而变文本）
+                for r in rows:
+                    w.writerow([csv_guard(v) for v in r])
             self.log_msg(f"✅ 已导出{label} {len(rows)} 条到 {path}")
             messagebox.showinfo("完成", f"已导出{label} {len(rows)} 条到：\n{path}")
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
+
+    # ---------------- Excel(.xlsx) 导出 ----------------
+    def _excel_overview_rows(self, count, label):
+        """「统计概览」表的内容。全部来自当前列表（零请求）。"""
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        out = [[("t", "会话统计概览")],
+               ["生成时间 " + stamp + "　范围：" + label + "（" + str(count) + " 行）"],
+               []]
+
+        def block(title, pairs, head=("项目", "数值")):
+            out.append([("b", title)])
+            out.append([("h", head[0]), ("h", head[1])])
+            for a, b_ in pairs:
+                out.append([a, b_])
+            out.append([])
+
+        # 总数 / 名额
+        try:
+            data = self.dashboard_data()
+        except Exception:
+            data = {"kinds": [], "members": [], "active": [], "risk": [],
+                    "members_unknown": 0, "active_unknown": 0}
+        kinds = dict(data.get("kinds") or [])
+        total = sum(kinds.values())
+        head_pairs = [("会话总数", ("i", total))]
+        for k, v in (data.get("kinds") or []):
+            head_pairs.append(("　· " + str(k), ("i", v)))
+        try:
+            head_pairs.append(("命中异常", ("i", sum(v for _l, v in (data.get("risk") or [])))))
+        except Exception:
+            pass
+        try:
+            quota = quota_text(self.quota_used(), self.quota_limit(),
+                               bool(getattr(self, "_premium", False)), with_label=False)
+        except Exception:
+            quota = ""
+        if quota:
+            head_pairs.append(("订阅名额", quota))
+        if data.get("members_unknown"):
+            head_pairs.append(("用户数尚未获取", ("i", data["members_unknown"])))
+        block("总览", head_pairs)
+
+        if data.get("kinds"):
+            block("类型分布", [(str(k), ("i", v)) for k, v in data["kinds"]],
+                  head=("类型", "数量"))
+        if data.get("members"):
+            block("用户数量级（仅频道 / 群组）",
+                  [(str(k), ("i", v)) for k, v in data["members"]], head=("区间", "数量"))
+        if data.get("active"):
+            block("活跃度（距最近一条消息）",
+                  [(str(k), ("i", v)) for k, v in data["active"]], head=("区间", "数量"))
+        if data.get("risk"):
+            block("异常特征", [(str(k), ("i", v)) for k, v in data["risk"]],
+                  head=("类别", "数量"))
+
+        out.append([("b", "说明")])
+        for line in ("· 用户数 / 作品数 / 活跃时间为空 = 尚未获取（点「获取 / 更新统计」后补全）；",
+                     "· 「活跃(天前)」显示「无消息」= 该会话里一条消息都没有；",
+                     "· 本表数据全部来自当前列表，导出时不向 Telegram 发任何请求。"):
+            out.append([line])
+        return out
+
+    def _excel_workbook(self, iids, label):
+        """构造 Excel 的三张表（纯数据，便于测试）：会话清单 / 统计概览 / 异常明细。"""
+        rows = [[("h", t) for t, _w in EXCEL_COLUMNS]]
+        risk_rows = [[("h", t) for t, _w in EXCEL_RISK_COLUMNS]]
+        detail_count = 0
+        for iid in iids:
+            values, detail = self._export_row_values(iid)
+            if values is None:
+                continue
+            rows.append(values)
+            for code, why in detail:
+                detail_count += 1
+                risk_rows.append([values[0], values[2], values[7],
+                                  RISK_LABEL.get(code, code), ("w", why)])
+        sheets = [{"name": "会话清单", "cols": [w for _t, w in EXCEL_COLUMNS],
+                   "rows": rows, "freeze": True, "filter": True},
+                  {"name": "统计概览", "cols": (26, 52),
+                   "rows": self._excel_overview_rows(len(rows) - 1, label),
+                   "freeze": False, "filter": False}]
+        if detail_count:
+            # 没有异常就不建这张空表 —— 空工作表只会让人以为导出漏了
+            sheets.append({"name": "异常明细", "cols": [w for _t, w in EXCEL_RISK_COLUMNS],
+                           "rows": risk_rows, "freeze": True, "filter": True})
+        return sheets
+
+    def on_export_excel(self, mode="visible"):
+        """导出 Excel(.xlsx)：会话清单 + 统计概览 + 异常明细。
+
+        用自己手写的 OOXML 生成器（零依赖）—— 见 build_xlsx 上面那段说明。
+        """
+        iids, label = self._export_selection(mode)
+        if not iids:
+            messagebox.showinfo("提示", f"没有可导出的行（范围：{label}）。")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("全部文件", "*.*")],
+            initialfile={"visible": "tg_channels_visible.xlsx",
+                         "all": "tg_channels_all.xlsx",
+                         "checked": "tg_channels_checked.xlsx"}.get(mode, "tg_channels.xlsx"),
+        )
+        if not path:
+            return
+        try:
+            sheets = self._excel_workbook(iids, label)
+            size = write_xlsx(path, sheets)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            self.log_msg(f"❌ Excel 导出失败: {e}")
+            return
+        names = "、".join(sh["name"] for sh in sheets)
+        self.log_msg(f"✅ 已导出{label} {len(iids)} 条到 {path}"
+                     f"（{size / 1024:.1f} KB，工作表：{names}）")
+        if messagebox.askyesno("完成", f"已导出{label} {len(iids)} 条到：\n{path}\n\n"
+                                       f"工作表：{names}\n\n现在打开看看吗？"):
+            opener = getattr(os, "startfile", None)
+            if not callable(opener):
+                self.log_msg("ℹ️ 当前系统没有「用默认程序打开」这个能力，请手动打开。")
+                return
+            try:
+                opener(path)
+            except Exception as e:      # noqa: BLE001
+                self.log_msg(f"⚠️ 打开文件失败（文件已经生成好了）: {e}")
 
     async def _run_destructive(self, sel, interval, jitter, do_one, verb,
                                task_label=None, progress_verb=None, defer_drop=False,
@@ -8529,6 +8983,26 @@ def selftest():
             assert parse_join_target("t.me/joinchat/AbC") == (REJOIN_INVITE, "AbC")
             assert shortcut_rows(app) and any(k == "Ctrl+D" for k, _d in shortcut_rows(app))
             _selftest_say(lines, "v1.6.0：数据概览 / 任务续跑·ETA / 设备管理 / 快照对比 / 静音归档 OK")
+            # v1.7.0：Excel 导出（零依赖手写 OOXML）—— 这里直接真造一个包出来过一遍
+            assert callable(getattr(app, "on_export_excel", None)), "缺少 Excel 导出入口"
+            assert app.btn_export is not None and app._export_menu is not None
+            _xl = build_xlsx([{"name": "会话清单", "cols": [20, 12], "rows": [
+                [("h", "名称"), ("h", "用户数")], ["测试 & 频道", ("i", 32519)]]}])
+            assert len(_xl) > 400, len(_xl)
+            with zipfile.ZipFile(io.BytesIO(_xl)) as _z:
+                assert _z.testzip() is None, "生成的 xlsx 不是合法的 zip"
+                _parts = set(_z.namelist())
+            assert {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
+                    "xl/_rels/workbook.xml.rels", "xl/styles.xml",
+                    "xl/worksheets/sheet1.xml"} <= _parts, sorted(_parts)
+            assert xml_escape('a&b<c') == "a&amp;b&lt;c"
+            assert xml_escape("a\x07b") == "ab", repr(xml_escape("a\x07b"))
+            assert xl_col_letter(26) == "Z" and xl_col_letter(27) == "AA" \
+                and xl_col_letter(703) == "AAA"
+            assert len(xl_sheet_name("长" * 50)) == XL_SHEET_NAME_LIMIT
+            assert csv_guard("=1+1") == "'=1+1" and csv_guard("-100123") == "-100123"
+            assert len(EXCEL_COLUMNS) == 10 and len(EXCEL_RISK_COLUMNS) == 5
+            _selftest_say(lines, "v1.7.0：Excel 导出（零依赖 OOXML：三表 / 表头样式 / 冻结 / 筛选）OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
