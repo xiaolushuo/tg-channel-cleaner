@@ -285,11 +285,38 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.2"
+APP_VERSION = "v1.7.3"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.3", "2026-10-15", [
+        "修复：**「🗒 日志」按钮被窗口挡住**（用户反馈）。实测默认窗口宽度 1200 下，顶部那一排"
+        "控件的右边界到了 **1368px** —— 超出窗口的那部分被直接裁掉，不只是「🗒 日志」，"
+        "「⏹ 停止全部」也一样点不到（窗口再窄连「停止统计」「获取 / 更新统计」一起消失）。"
+        "根因是那一排用 grid 逐个铺开，而 **grid 在空间不足时既不压缩也不滚动**，"
+        "超出的控件不会换行、也没有滚动条，就是静静地看不见",
+        "改法：新增 `FlowBar` —— 一排控件放不下时**自动折到下一行**。"
+        "顶部筛选条与日志面板头部都换成了它（日志面板那一排同样超出最小窗口宽度，"
+        "窄窗口下右半截的「搜索」「自动滚动」原本也点不到）。"
+        "现在 1920 宽排一行、1366/1200 排两行、1080 排两行，**任何宽度下每个控件都在界内**。"
+        "没有「少放几个按钮」这种丢功能的做法 —— 这些按钮（停止统计 / 停止全部 / 日志）都得用",
+        "⚠️ 折行有两个坑，都踩过并留在代码注释里：",
+        "  ① **折行算式与实际摆放必须用同一个**（`_step_of` 是唯一真源）。"
+        "第一版折行用了控件的请求宽度、摆放时却没有把间距算进去，结果「算出来放得下、"
+        "摆上去最后一个控件被挤成 1px 宽」（1500 宽下就这么丢掉了「🗒 日志」）",
+        "  ② **不能只在窗口宽度变化时重排**。状态文字会从「⚪ 尚未连接」变成"
+        "「⚪ 尚未连接（请填写 API 信息后点…）」，一行放不下的那一刻必须折行；"
+        "只盯窗口宽度的话这一行会永远保持旧布局，最右边的控件被静静挤出去。"
+        "现在同时监听每个控件的请求宽度变化（并做快照比较，避免重排抖动）",
+        "另修：窄窗口下折行所需的宽度来源从 `winfo_width()` 改成 Configure 事件带来的值 —— "
+        "窗口刚改变尺寸时几何还没更新完，`winfo_width()` 返回的是**上一轮的旧宽度**，"
+        "按旧宽度算折行必然在新宽度下溢出",
+        "新增测试套件 `test_flowbar`（42 条）：折行算法（纯逻辑，含「任何宽度下都不丢控件」"
+        "「每行都不超可用宽度」两条核心不变量）、真实 6 档宽度下逐控件校验不超界、"
+        "内容变宽自动重排、连续 20 轮 update 布局稳定（防抖动）、行容器复用、"
+        "以及「这两排不许退回一排 grid 铺开」的源码护栏",
+    ]),
     ("v1.7.2", "2026-10-15", [
         "修复：**其他信息类似显示问题的普查结果**。上一版只修了「异常特征」，"
         "这一版把全界面文案扫了一遍，找到四类同源问题（都不是某句话写得不好，而是缺统一的规矩）：",
@@ -1466,6 +1493,180 @@ def add_tip(widget, text):
         return Tooltip(widget, text)
     except Exception:
         return None
+
+
+# 折行时留出的安全余量（像素）。折行判断与实际摆放哪怕差 1px，最后一个控件就会被
+# 挤到容器外（宽 1px、看不见也点不到），所以宁可多折一行。
+_FLOW_SAFE_PX = 2
+
+
+# ---------------- 自动换行的横排容器 ----------------
+class FlowBar(ttk.Frame):
+    """一排控件放不下时**自动折到下一行**，而不是被窗口右边缘裁掉。
+
+    为什么需要它：顶部筛选条这一排的自然宽度约 1609px，而窗口默认只有 1200px、
+    最小 1080px。grid 在空间不足时**既不压缩也不滚动** —— 超出右边界的那几个控件
+    直接被窗口裁掉，用户看到的现象就是「按钮被挡住、点不到」。
+    （实测：1200 宽时「🗒 日志」「⏹ 停止全部」的右边界在 1368 处，完全不可见。）
+
+    为什么不是简单地「少放几个按钮」：这些按钮都是要用的（停止统计 / 停止全部 / 日志），
+    少放哪个都不行。折行是唯一既不丢功能、又不要求用户把窗口拉宽的做法。
+
+    用法：`flow.add(控件)` 登记，布局交给本容器（不要自己去 grid）。
+    `stretch=True` 的项会吃掉它所在那一行的多余宽度（搜索框用）。
+    """
+
+    def __init__(self, master, gap=6, row_gap=3, reserve=0, **kw):
+        super().__init__(master, **kw)
+        self._gap = int(gap)
+        self._row_gap = int(row_gap)
+        # 容器自身左右内边距（ttk 的 padding）吃掉的可摆放宽度：折行计算必须扣掉，
+        # 否则会「以为放得下」而把最后一个控件挤出可视区（实测少算 20px 就漏一个按钮）。
+        self._reserve = int(reserve)
+        self._items = []            # [(控件, 是否吃剩余宽度, 尾部额外留白)]
+        self._rows = []             # 行容器（复用，不销毁重建）
+        self._last_width = -1
+        self._last_reqs = None      # 上一次布局时各控件的请求宽度
+        self._pending = None
+        self._errors = []           # 摆放失败的原因（诊断用：不静默吞掉）
+        self.grid_columnconfigure(0, weight=1)
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    # ---- 登记 ----
+    def add(self, widget, stretch=False, tail=0):
+        """登记一个控件。stretch=吃剩余宽度；tail=这个控件右侧额外留白。"""
+        self._items.append((widget, bool(stretch), int(tail)))
+        # ⚠️ 除了容器宽度，**控件自身的请求宽度变化也要重排**：
+        # 状态文字会从「⚪ 尚未连接」变成「⚪ 尚未连接（请填写 API 信息）」，一行放不下的
+        # 那一刻必须折行 —— 只盯容器宽度的话，这一行会永远保持旧布局，最右边的控件
+        # 被静静挤出去（实测就是这么丢掉「🗒 日志」的）。
+        try:
+            widget.bind("<Configure>", self._on_item_resize, add="+")
+        except Exception:
+            pass
+        self._schedule()            # 构建期会连续 add 几十个，合并成一次重排
+        return widget
+
+    def add_all(self, *widgets):
+        for w in widgets:
+            self.add(w)
+
+    def line_count(self):
+        """当前排了几行（测试用）。"""
+        return len(self._rows)
+
+    # ---- 触发重排 ----
+    def _schedule(self):
+        if self._pending:
+            try:
+                self.after_cancel(self._pending)
+            except Exception:
+                pass
+        try:
+            self._pending = self.after_idle(self._relayout)
+        except Exception:
+            self._pending = None
+
+    def _on_configure(self, event):
+        """只在**容器宽度真的变了**时重排。
+
+        ⚠️ 这个判断不能省：重排会改变自身高度 → 又触发 Configure → 不判断就无限重排。
+        """
+        if int(event.width) <= 1 or int(event.width) == self._last_width:
+            return
+        self._last_width = int(event.width)
+        self._schedule()
+
+    def req_snapshot(self):
+        """各控件当前的请求宽度（用来判断「内容变了，需要重排」）。"""
+        out = []
+        for widget, _stretch, _tail in self._items:
+            try:
+                out.append(int(widget.winfo_reqwidth()))
+            except Exception:
+                out.append(-1)
+        return tuple(out)
+
+    def _on_item_resize(self, _event=None):
+        """某个控件的内容变宽 / 变窄了。
+
+        同样要防死循环：重排会让控件换个位置，又会触发它的 Configure ——
+        所以只有**请求宽度真的变了**才排。
+        """
+        snap = self.req_snapshot()
+        if snap == self._last_reqs:
+            return
+        self._last_reqs = snap
+        self._schedule()
+
+    # ---- 折行与摆放 ----
+    def _step_of(self, widget, tail):
+        """一个控件在行内占用的宽度（含间距）。
+
+        ⚠️ 折行计算和实际 pack **必须用同一个算式** —— 否则「算出来放得下、摆上去溢出」，
+        最后那个控件就被挤没了。这里是唯一真源。
+        """
+        try:
+            need = widget.winfo_reqwidth()
+        except Exception:
+            need = 80
+        return need + max(0, tail) + self._gap
+
+    def _lines_for(self, width):
+        """按可用宽度把控件分成若干行（纯计算，不碰界面 —— 便于测试）。"""
+        avail = max(1, int(width) - self._reserve)
+        lines, cur, used = [], [], 0
+        for item in self._items:
+            step = self._step_of(item[0], item[2])
+            if cur and used + step > avail - _FLOW_SAFE_PX:
+                lines.append(cur)
+                cur, used = [], 0
+            cur.append(item)
+            used += step
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def _new_row(self, index):
+        row = ttk.Frame(self)
+        row.grid(row=index, column=0, sticky="ew", pady=(0, self._row_gap) if index else 0)
+        self._rows.append(row)
+        return row
+
+    def _relayout(self):
+        self._pending = None
+        # ⚠️ 宽度取 Configure 事件带来的值（_last_width），不要用 winfo_width()：
+        # 窗口刚改变尺寸时几何还没更新完，winfo_width() 会返回**上一轮的旧宽度**，
+        # 于是「按旧宽度算折行」→ 新宽度下就溢出（实测就是这么漏掉的）。
+        width = self._last_width if self._last_width > 1 else self.winfo_width()
+        if width <= 1:              # 还没被映射，等下一次 Configure
+            return
+        lines = self._lines_for(width)
+        self._errors = []
+        self._last_reqs = self.req_snapshot()
+        # 行容器**复用**而不是销毁重建：在刚 destroy 的容器上重新 pack 会拿到失效的几何主，
+        # 控件会静默地不出现。
+        while len(self._rows) < len(lines):
+            self._new_row(len(self._rows))
+        for i, line in enumerate(lines):
+            row = self._rows[i]
+            row.grid()
+            for j, (widget, stretch, tail) in enumerate(line):
+                is_last = (j == len(line) - 1)
+                # 与 _step_of 用同一个算式：占位 = 请求宽 + tail + gap
+                right = max(0, tail) + (self._gap if (not is_last or tail) else 0)
+                opts = {"side": "left", "padx": (0, right)}
+                if stretch:
+                    opts.update({"fill": "x", "expand": True})
+                try:
+                    if widget.winfo_manager():
+                        widget.pack_forget()     # 换行时要先解除旧容器上的管理
+                    widget.pack(in_=row, **opts)
+                except Exception as e:          # noqa: BLE001
+                    self._errors.append((widget.winfo_class(), str(e)))
+                    continue
+        for row in self._rows[len(lines):]:
+            row.grid_remove()                   # 多余的行收起来（不销毁，下次还用它）
 
 
 # ---------------- 数据概览（图表用，Canvas 手绘、零依赖） ----------------
@@ -2786,29 +2987,33 @@ class App:
 
     # ---------------- 顶部工具栏 ----------------
     def _build_header(self):
-        bar = ttk.Frame(self.root, padding=(10, 8, 10, 2))
+        # ⚠️ 这一排控件加起来约 1609px，比窗口默认宽度（1200）和最小宽度（1080）都宽。
+        # 以前用 grid 排，空间不足时**既不压缩也不滚动**，最右边的「🗒 日志」「⏹ 停止全部」
+        # 直接被窗口右边缘裁掉 —— 用户看到的就是「按钮被挡住、点不到」。
+        # 现在交给 FlowBar：放不下就折到下一行，任何窗口宽度下都点得到。
+        bar = FlowBar(self.root, padding=(10, 8, 10, 2), reserve=20)   # reserve=左右各 10px 内边距
         bar.grid(row=0, column=0, sticky="ew")
-        bar.grid_columnconfigure(4, weight=1)         # 搜索框所在列吃掉多余宽度
+        self._flow_header = bar          # 供自检 / 测试检查折行情况
 
         self.btn_left_toggle = ttk.Button(bar, text="◧ 设置", width=9, command=self.toggle_left_panel)
-        self.btn_left_toggle.grid(row=0, column=0, padx=(0, 6))
+        bar.add(self.btn_left_toggle)
 
         # 连接状态：一眼看出是否已连上（登录态来自 session，有效时无需再输验证码）
         self.status_var = tk.StringVar(value="⚪ 尚未连接")
         self.lbl_status = ttk.Label(bar, textvariable=self.status_var, foreground="#7f8c8d")
-        self.lbl_status.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        bar.add(self.lbl_status, tail=6)
 
         self.btn_connect = ttk.Button(bar, text="连接 / 登录", command=self.on_connect)
-        self.btn_connect.grid(row=0, column=2, padx=3)
+        bar.add(self.btn_connect)
         self.btn_refresh = ttk.Button(bar, text="刷新列表", command=self.on_refresh, state="disabled")
-        self.btn_refresh.grid(row=0, column=3, padx=3)
+        bar.add(self.btn_refresh)
 
-        # 搜索：输入即筛（250ms 防抖），回车立即生效，Esc/✕ 清空
+        # 搜索：输入即筛（250ms 防抖），回车立即生效，Esc/✕ 清空。
+        # stretch：吃掉本行多余宽度（以前靠 grid 的 weight 列，现在由 FlowBar 负责）
         sfrm = ttk.Frame(bar)
-        sfrm.grid(row=0, column=4, sticky="ew", padx=10)
         ttk.Label(sfrm, text="🔍").pack(side="left")
         self.search_var = tk.StringVar()
-        self.ent_search = ttk.Entry(sfrm, textvariable=self.search_var)
+        self.ent_search = ttk.Entry(sfrm, textvariable=self.search_var, width=22)
         self.ent_search.pack(side="left", fill="x", expand=True, padx=4)
         self.search_var.trace_add("write", lambda *_a: self.on_search_changed())
         self.ent_search.bind("<Return>", lambda e: self._apply_search(verbose=True))
@@ -2816,36 +3021,37 @@ class App:
         self.btn_search_clear.pack(side="left")
         self.lbl_search_hit = ttk.Label(sfrm, text="", foreground="#6b7280")
         self.lbl_search_hit.pack(side="left", padx=(6, 0))
+        bar.add(sfrm, stretch=True)
 
-        ttk.Label(bar, text="类型:").grid(row=0, column=5, padx=(4, 2))
+        bar.add(ttk.Label(bar, text="类型:"))
         self.type_filter_var = tk.StringVar(value="全部")
         self.cmb_type = ttk.Combobox(bar, textvariable=self.type_filter_var, state="readonly",
                                      width=7, values=TYPE_CHOICES)
-        self.cmb_type.grid(row=0, column=6)
+        bar.add(self.cmb_type, tail=4)
         self.cmb_type.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
         # 分组筛选：取值在连上账号、读到 dialog filters 后填充（见 refresh_folders）
-        ttk.Label(bar, text="分组:").grid(row=0, column=7, padx=(10, 2))
+        bar.add(ttk.Label(bar, text="分组:"))
         self.folder_filter_var = tk.StringVar(value=FOLDER_ALL)
         self.cmb_folder = ttk.Combobox(bar, textvariable=self.folder_filter_var, state="readonly",
                                        width=12, values=(FOLDER_ALL, FOLDER_NONE))
-        self.cmb_folder.grid(row=0, column=8)
+        bar.add(self.cmb_folder, tail=4)
         self.cmb_folder.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
         self.only_checked_var = tk.BooleanVar(value=False)
         self.chk_only_checked = ttk.Checkbutton(bar, text="只看已勾选", variable=self.only_checked_var,
                                                 command=self.on_quick_filter_changed)
-        self.chk_only_checked.grid(row=0, column=9, padx=8)
+        bar.add(self.chk_only_checked, tail=4)
 
         # 统计与任务控制
         self.btn_stats = ttk.Button(bar, text="获取 / 更新统计", command=self.on_fetch_stats, state="disabled")
-        self.btn_stats.grid(row=0, column=10, padx=3)
+        bar.add(self.btn_stats)
         self.btn_stats_stop = ttk.Button(bar, text="停止统计", command=self.on_stop_stats, state="disabled")
-        self.btn_stats_stop.grid(row=0, column=11, padx=3)
+        bar.add(self.btn_stats_stop)
         self.btn_stop_all = ttk.Button(bar, text="⏹ 停止全部", command=self.on_stop_all)
-        self.btn_stop_all.grid(row=0, column=12, padx=3)
+        bar.add(self.btn_stop_all)
         self.btn_log_toggle = ttk.Button(bar, text="🗒 日志", width=8, command=self.toggle_log_panel)
-        self.btn_log_toggle.grid(row=0, column=13, padx=(8, 0))
+        bar.add(self.btn_log_toggle)
 
         # 登录验证条：固定在界面上（不用弹窗，避免窗口被遮住时看不到输入框）
         strip = ttk.Frame(self.root, padding=(10, 2, 10, 6))
@@ -3575,29 +3781,33 @@ class App:
     def _build_log_panel(self):
         self.frm_log = ttk.Frame(self.root, padding=(10, 2, 10, 8))
         self.frm_log.grid(row=4, column=0, sticky="ew")
-        head = ttk.Frame(self.frm_log)
+        # 这一排控件比最小窗口还宽（运行日志 / 清空 / 导出 / 复制全部 / 三级过滤 / 搜索 /
+        # 自动滚动 / 提示），同样交给 FlowBar 折行 —— 否则窄窗口下右半截（连「搜索」
+        # 「自动滚动」）都点不到。
+        head = FlowBar(self.frm_log, gap=6)
         head.pack(fill="x")
-        ttk.Label(head, text="运行日志").pack(side="left")
-        ttk.Button(head, text="清空", width=6, command=self.on_clear_log).pack(side="left", padx=6)
-        ttk.Button(head, text="导出", width=6, command=self.on_export_log).pack(side="left")
-        ttk.Button(head, text="复制全部", width=9, command=self.on_copy_log).pack(side="left", padx=(6, 0))
+        self._flow_log_head = head      # 供自检 / 测试检查折行情况
+        head.add(ttk.Label(head, text="运行日志"))
+        head.add(ttk.Button(head, text="清空", width=6, command=self.on_clear_log))
+        head.add(ttk.Button(head, text="导出", width=6, command=self.on_export_log))
+        head.add(ttk.Button(head, text="复制全部", width=9, command=self.on_copy_log))
         # 级别过滤：长任务一次刷上百行，只想看失败时把「信息」关掉即可
-        ttk.Label(head, text="　显示:").pack(side="left")
+        head.add(ttk.Label(head, text="显示:"), tail=2)
         for lv, label in LOG_LEVEL_META:
             var = tk.BooleanVar(value=True)
             self._log_level_vars[lv] = var
-            ttk.Checkbutton(head, text=label, variable=var,
-                            command=self.on_log_filter_changed).pack(side="left", padx=(6, 0))
-        ttk.Label(head, text=" 搜索:").pack(side="left", padx=(8, 0))
+            head.add(ttk.Checkbutton(head, text=label, variable=var,
+                                     command=self.on_log_filter_changed))
+        head.add(ttk.Label(head, text="搜索:"), tail=2)
         self.log_query_var = tk.StringVar()
         ent_lq = ttk.Entry(head, textvariable=self.log_query_var, width=18)
-        ent_lq.pack(side="left", padx=(2, 0))
+        head.add(ent_lq, tail=2)
         ent_lq.bind("<Return>", lambda e: self.on_log_filter_changed())
         self.log_query_var.trace_add("write", lambda *_a: self.on_log_filter_changed())
         self.log_autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(head, text="自动滚动", variable=self.log_autoscroll_var).pack(side="left", padx=10)
-        ttk.Label(head, text="提示：退出间隔太短容易触发限流；日志区可用顶部「🗒 日志」收起。",
-                  foreground="#6b7280").pack(side="right")
+        head.add(ttk.Checkbutton(head, text="自动滚动", variable=self.log_autoscroll_var))
+        head.add(ttk.Label(head, text="提示：退出间隔太短容易触发限流；日志区可用顶部「🗒 日志」收起。",
+                           foreground="#6b7280"))
         self.log = scrolledtext.ScrolledText(self.frm_log, height=7, state="normal")
         self.log.pack(fill="both", expand=True, pady=(3, 0))
         for lv, _label in LOG_LEVEL_META:
@@ -9213,6 +9423,38 @@ def selftest():
             assert "🚫" in _LOG_WARN_TOKENS and log_level_of("🚫 x") == LOG_WARN
             assert log_level_of("⏭ x") == LOG_WARN and log_level_of("⚠️ x") == LOG_WARN
             _selftest_say(lines, "v1.7.2：错误人话化（25 类）/ 统一分隔符 · 全角冒号 / 警示日志归警告级 OK")
+            # v1.7.3：横排自动换行 —— 按钮不再被窗口右边缘裁掉
+            assert isinstance(app._flow_header, FlowBar), "顶部筛选条没有用 FlowBar"
+            assert isinstance(app._flow_log_head, FlowBar), "日志面板头部没有用 FlowBar"
+            _fb = FlowBar(app.root, gap=10, reserve=0)
+            _fakes = []
+            for _w in (120, 120, 120):
+                _fk = type("Fk", (), {"winfo_reqwidth": lambda self, _w=_w: _w,
+                                      "bind": lambda self, *a, **k: None})()
+                _fakes.append(_fk)
+                _fb.add(_fk)
+            assert _fb._step_of(_fakes[0], 0) == 130, _fb._step_of(_fakes[0], 0)
+            assert [len(l) for l in _fb._lines_for(1000)] == [3]
+            assert [len(l) for l in _fb._lines_for(300)] == [2, 1], _fb._lines_for(300)
+            # ⭐ 核心不变量：任何宽度下都不丢控件
+            for _w in (5, 60, 130, 260, 400, 9999):
+                assert sum(len(l) for l in _fb._lines_for(_w)) == 3, _w
+            # 折行结论（纯计算，不依赖「窗口此刻有没有被映射」）
+            _items = len(app._flow_header._items)
+            assert sum(len(l) for l in app._flow_header._lines_for(1080)) == _items, \
+                "按最小窗口宽度折行后丢了控件"
+            assert sum(len(l) for l in app._flow_header._lines_for(1920)) == _items
+            assert not app._flow_header._errors and not app._flow_log_head._errors, \
+                "摆放过程有静默失败"
+            try:
+                app.root.update_idletasks()      # 促一轮布局，再验实际坐标
+            except Exception:
+                pass
+            if app.btn_log_toggle.winfo_width() > 2:     # 已布局才校验坐标
+                assert (app.btn_log_toggle.winfo_rootx() - app.root.winfo_rootx()
+                        + app.btn_log_toggle.winfo_width()) <= app.root.winfo_width(), \
+                    "「🗒 日志」按钮被窗口挡住了"
+            _selftest_say(lines, "v1.7.3：横排自动折行（任何窗口宽度下按钮都可见可点）OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
