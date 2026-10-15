@@ -287,11 +287,34 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.0"
+APP_VERSION = "v1.7.1"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.1", "2026-10-15", [
+        "修复：**异常特征显示得太乱**。三处原因，都改了：",
+        "① 说明里混着内部术语和英文原文 —— 以前一条是这样的：「服务端标注受限 —— 违反服务条款："
+        "This channel is unavailable due to violation of the Terms of Service.」。"
+        "现在**中文说明和服务端原文彻底分家**：说明只写「违反服务条款」，"
+        "英文原文单独进 Excel 的「服务端原文」列 / 日志的缩进行。"
+        "同时把「服务端返回 ChannelForbidden：」这类**给我们自己看的词**从所有界面文案里去掉 —— "
+        "用户不需要知道 Telegram 的构造函数叫什么",
+        "② 多条原因用「；」连成一长串 —— 现在用「 · 」并排，每条都短。"
+        "（连接符只有 `RISK_SEP` 一处定义，不再各写各的）",
+        "③ 表格「异常」列以前写「最重的一类 + 「＋N」」（如 `🚫 违规受限 +2`）—— "
+        "看到 +2 也不知道另外两个是什么，只能去右键。现在**全部类别并排**："
+        "`诈骗 · 违规受限 · 禁言`；顺带去掉了每行都重复的 🚫 前缀（这一列每行都是异常，"
+        "emoji 没有信息量还占宽度）",
+        "④ 概览图表里的异常标签也换成了短标签 —— 最多 9 根柱子挤在 500px 宽里，"
+        "写长类别名（「已停用 / 已不在」）会直接叠在一起看不清，2-3 个字反而最清楚",
+        "新增：Excel「异常明细」表拆成 **异常类别 / 判定依据 / 服务端原文** 三列"
+        "（以前判定依据一列里塞着中英混杂的一长句）",
+        "内部：**呈现层收成一个出口** `risk_rows(ent)` → (类别码, 短标签, 说明, 原文)。"
+        "以前表格列 / 日志 / 导出各拼各的文案，于是同一件事在表格里写类名、在日志里写人话、"
+        "在导出里把英文原文混进中文句子 —— 改一处漏三处。现在加一条测试护栏："
+        "`risk_of` 只允许有「定义 + 两个消费点」三个出现处，新加的呈现点必须走 `risk_rows`",
+    ]),
     ("v1.7.0", "2026-10-15", [
         "新增：**Excel(.xlsx) 导出**（导出菜单里六项：CSV / Excel 各三档范围）。"
         "一个工作簿三张表 —— **会话清单**（表头样式、冻结首行、自动筛选、列宽）／"
@@ -890,21 +913,26 @@ RISK_FAKE = "fake"              # Telegram 标记：假冒
 RISK_DEAD = "dead"              # 群已停用 / 你已不在（条目残留）
 RISK_BANNED = "banned"          # 你被禁言 / 全员默认禁言
 RISK_NOJOIN = "nojoin"          # 不能直接关注（加入需管理员批准）
-RISK_NEEDJOIN = "needjoin"      # 必须先加入才能发言
+RISK_NEEDJOIN = "needjoin"      # 须先加入才能发言
 RISK_GHOST = "ghost"            # 对方账号已注销（私聊）
 
 # 类别码 -> 短标签（表格「异常」列用）与人话说明（日志 / 导出 / 提示用）
+# (类别码, 短标签, 类别名)
+#   短标签：出现在**表格列 / 明细表的类别列**，多个并排（「已封禁 · 违规受限」）→ 极简、无 emoji；
+#   类别名：只单独出现的地方（统计日志 / 概览 / 筛选提示）→ 可以完整一点。
 RISK_META = (
-    (RISK_FORBIDDEN, "🚫 已封禁", "已封禁 / 不可访问"),
-    (RISK_RESTRICTED, "🚫 违规受限", "违规受限（版权 / 服务条款 / 色情等）"),
-    (RISK_SCAM, "🚫 诈骗", "Telegram 标记：诈骗"),
-    (RISK_FAKE, "🚫 假冒", "Telegram 标记：假冒"),
-    (RISK_DEAD, "🚫 已停用", "已停用 / 已不在（被踢或已退出，条目残留）"),
-    (RISK_BANNED, "🚫 禁言", "被禁言 / 全员禁言"),
-    (RISK_NOJOIN, "🚫 需审核", "不能直接关注（加入需管理员批准）"),
-    (RISK_NEEDJOIN, "🚫 须先加入", "必须先加入才能发言"),
-    (RISK_GHOST, "🚫 已注销", "对方账号已注销"),
+    (RISK_FORBIDDEN, "已封禁", "已封禁 / 不可访问"),
+    (RISK_RESTRICTED, "违规受限", "违规受限"),
+    (RISK_SCAM, "诈骗", "Telegram 标记：诈骗"),
+    (RISK_FAKE, "假冒", "Telegram 标记：假冒"),
+    (RISK_DEAD, "已停用", "已停用 / 已不在"),
+    (RISK_BANNED, "禁言", "被禁言"),
+    (RISK_NOJOIN, "需审核", "加入需批准"),
+    (RISK_NEEDJOIN, "须先加入", "须先加入才能发言"),
+    (RISK_GHOST, "已注销", "对方账号已注销"),
 )
+# 多项并排时的连接符（表格列 / 日志 / 导出统一用它，别再各写各的）
+RISK_SEP = " · "
 RISK_CODES = tuple(c for c, _s, _l in RISK_META)
 RISK_SHORT = {c: s for c, s, _l in RISK_META}
 RISK_LABEL = {c: l for c, _s, l in RISK_META}
@@ -955,12 +983,27 @@ def restriction_reasons(ent):
     return out
 
 
-def restriction_text(ent):
-    """一句话说完所有受限原因（表格列 / 导出用）。"""
+def restriction_labels(ent):
+    """受限原因的**中文短标签**，多条用「、」连接。"""
+    labels = []
+    for label, _text in restriction_reasons(ent):
+        if label and label not in labels:
+            labels.append(label)
+    return "、".join(labels)
+
+
+def risk_raw_text(ent):
+    """服务端给的**原文**（目前只有 restriction_reason.text 有）。
+
+    刻意单独拿出来放：原文基本是英文、有时一整句，一旦混进中文说明就变成
+    「服务端标注受限 —— 违反服务条款：This channel is unavailable due to …」
+    这种最难读的东西。它只出现在**单独的列 / 单独的一行**里。"""
     parts = []
-    for label, text in restriction_reasons(ent):
-        parts.append(label if (not text or text == label) else f"{label}：{text}")
-    return "；".join(parts)
+    for _label, text in restriction_reasons(ent):
+        t = (text or "").strip()
+        if t and t not in parts:
+            parts.append(t)
+    return " / ".join(parts)
 
 
 def _send_banned(rights):
@@ -986,47 +1029,47 @@ def risk_of(ent):
     if ent is None:
         return out
     if isinstance(ent, tl_types.ChannelForbidden):
-        return [(RISK_FORBIDDEN, "服务端返回 ChannelForbidden：频道已不可访问"
-                                 "（被封 / 被踢 / 频道已删）")]
+        return [(RISK_FORBIDDEN, "频道已不可访问"
+                                 "（被封 / 被踢 / 已删）")]
     if isinstance(ent, tl_types.ChatForbidden):
-        return [(RISK_FORBIDDEN, "服务端返回 ChatForbidden：群已不可访问"
-                                 "（被封 / 被踢 / 群已删）")]
+        return [(RISK_FORBIDDEN, "群已不可访问"
+                                 "（被封 / 被踢 / 已删）")]
     if isinstance(ent, tl_types.Channel):
         if getattr(ent, "scam", False):
-            out.append((RISK_SCAM, "Telegram 标记该频道为诈骗"))
+            out.append((RISK_SCAM, "Telegram 官方标记为诈骗"))
         if getattr(ent, "fake", False):
-            out.append((RISK_FAKE, "Telegram 标记该频道为假冒"))
-        detail = restriction_text(ent)
-        if detail:
-            out.append((RISK_RESTRICTED, "服务端标注受限 —— " + detail))
+            out.append((RISK_FAKE, "Telegram 官方标记为假冒"))
+        labels = restriction_labels(ent)
+        if labels:
+            out.append((RISK_RESTRICTED, labels))
         elif getattr(ent, "restricted", False):
-            out.append((RISK_RESTRICTED, "被服务端标记为受限（未给出具体原因）"))
+            out.append((RISK_RESTRICTED, "被标记受限（未给出原因）"))
         if getattr(ent, "left", False):
-            out.append((RISK_DEAD, "你已经不在这个频道 / 群组里（会话条目残留）"))
+            out.append((RISK_DEAD, "你已不在其中（会话条目残留）"))
         if getattr(ent, "join_request", False):
-            out.append((RISK_NOJOIN, "加入需要管理员批准，不能直接关注"))
+            out.append((RISK_NOJOIN, "加入需管理员批准，不能直接关注"))
         elif getattr(ent, "join_to_send", False):
             out.append((RISK_NEEDJOIN, "必须先加入才能发言"))
         if _send_banned(getattr(ent, "banned_rights", None)):
-            out.append((RISK_BANNED, "你在这个频道 / 群里被禁止发言"))
+            out.append((RISK_BANNED, "你被禁止发言"))
         elif _send_banned(getattr(ent, "default_banned_rights", None)):
             out.append((RISK_BANNED, "全员默认被禁止发言"))
     elif isinstance(ent, tl_types.Chat):
         if getattr(ent, "deactivated", False):
-            out.append((RISK_DEAD, "该群已被停用（通常是封禁）"))
+            out.append((RISK_DEAD, "群已停用（通常是封禁）"))
         if getattr(ent, "left", False):
-            out.append((RISK_DEAD, "你已经不在这个群里"))
+            out.append((RISK_DEAD, "你已不在其中"))
         if _send_banned(getattr(ent, "default_banned_rights", None)):
             out.append((RISK_BANNED, "全员默认被禁止发言"))
     elif isinstance(ent, tl_types.User):
         if getattr(ent, "deleted", False):
             out.append((RISK_GHOST, "对方账号已注销（客户端里是灰头像 / 纯数字名）"))
         if getattr(ent, "scam", False):
-            out.append((RISK_SCAM, "Telegram 标记该用户为诈骗"))
+            out.append((RISK_SCAM, "Telegram 官方标记为诈骗"))
         if getattr(ent, "fake", False):
-            out.append((RISK_FAKE, "Telegram 标记该用户为假冒"))
+            out.append((RISK_FAKE, "Telegram 官方标记为假冒"))
         if getattr(ent, "restricted", False):
-            out.append((RISK_RESTRICTED, "该账号被服务端标记为受限"))
+            out.append((RISK_RESTRICTED, "账号被标记受限"))
     return out
 
 
@@ -1036,18 +1079,30 @@ def risk_codes_of(ent):
     return tuple(c for c in RISK_ORDER if c in codes)
 
 
+def risk_rows(ent):
+    """一个会话的全部异常特征 → [(类别码, 短标签, 说明, 服务端原文), ...]。
+
+    **所有呈现点（表格列 / 日志 / CSV / Excel 明细）都从这里取。**
+    以前每个地方自己拼文案，于是同一件事在表格里写类名、在日志里写人话、
+    在导出里把英文原文混进中文句子 —— 一改就得改四处，还必然有漏掉的。"""
+    raw = risk_raw_text(ent)
+    return [(code, RISK_SHORT.get(code, code), why, raw) for code, why in risk_of(ent)]
+
+
 def risk_cell_text(ent):
-    """表格「异常」列的文字：最重的一类 + 「＋N」。"""
-    codes = risk_codes_of(ent)
-    if not codes:
-        return ""
-    txt = RISK_SHORT.get(codes[0], codes[0])
-    return txt if len(codes) == 1 else f"{txt} +{len(codes) - 1}"
+    """表格「异常」列：**全部类别**的短标签并排，如「已封禁 · 违规受限」。
+
+    上一版写的是「最重的一类 + 「＋N」」—— 用户看到 `违规受限 +2` 根本不知道
+    另外两个是什么，只能去右键。短标签本来就只有 2-3 个字，全列出来更直接。"""
+    return RISK_SEP.join(short for _c, short, _w, _r in risk_rows(ent))
 
 
 def risk_detail_text(ent):
-    """把该会话的全部异常原因连成一串（日志 / 导出 / 提示用）。"""
-    return "；".join(why for _c, why in risk_of(ent))
+    """一行说明（日志 / 导出用）：全部原因用「 · 」并排。
+
+    给的是**说明**（人话），不含内部类名、也不含服务端原文 ——
+    原文见 `risk_raw_text`，它只出现在单独的列 / 单独的一行里。"""
+    return RISK_SEP.join(why for _c, _s, why, _r in risk_rows(ent))
 
 
 # ---------------- 日志级别 ----------------
@@ -1348,7 +1403,9 @@ def dashboard_stats(kind_counts, members, actives, risk_counts):
     mem, mem_unknown = histogram(members, MEMBER_BUCKETS)
     act, act_unknown = histogram(actives, ACTIVE_BUCKETS)
     kinds = [(k, int(v)) for k, v in (kind_counts or []) if int(v or 0) > 0]
-    risks = [(RISK_LABEL.get(c, c), int(v)) for c, v in (risk_counts or []) if int(v or 0) > 0]
+    # 异常用**短标签**：柱子最多 9 根挤在 500px 宽里，长类别名（「已停用 / 已不在」）
+    # 会直接叠在一起看不清 —— 图表里 2-3 个字反而最清楚
+    risks = [(RISK_SHORT.get(c, c), int(v)) for c, v in (risk_counts or []) if int(v or 0) > 0]
     return {"kinds": kinds, "members": mem, "members_unknown": mem_unknown,
             "active": act, "active_unknown": act_unknown, "risk": risks}
 
@@ -1691,10 +1748,11 @@ def xl_sheet_xml(sheet):
 # 导出列定义 —— CSV 与 Excel 共用同一份（列序、表头、宽度只有一个真源）
 EXCEL_COLUMNS = (
     ("名称", 34), ("用户名", 22), ("类型", 8), ("用户数", 12), ("作品数", 10),
-    ("活跃(天前)", 12), ("分组", 16), ("ID", 18), ("安全防护", 14), ("异常特征", 46),
+    ("活跃(天前)", 12), ("分组", 16), ("ID", 18), ("安全防护", 14), ("异常特征", 54),
 )
 EXCEL_RISK_COLUMNS = (
-    ("名称", 34), ("类型", 8), ("ID", 18), ("异常类别", 18), ("判定依据（服务端字段）", 62),
+    ("名称", 30), ("类型", 8), ("ID", 18), ("异常类别", 14),
+    ("判定依据", 30), ("服务端原文", 56),
 )
 
 
@@ -4015,7 +4073,7 @@ class App:
         self.root.geometry("1200x780")
         for c, w in (("sel", 50), ("name", 220), ("username", 160), ("type", 60),
                      ("members", 80), ("posts", 80), ("active", 72), ("folder", 120),
-                     ("risk", 104), ("id", 110), ("safe", 92)):
+                     ("risk", 118), ("id", 110), ("safe", 92)):
             try:
                 self.tree.column(c, width=w)
             except Exception:
@@ -4160,13 +4218,16 @@ class App:
             name = self.tree.set(iid, "name")
         except Exception:
             name = str(iid)
-        rows = risk_of(self.channels.get(iid))
+        rows = risk_rows(self.channels.get(iid))
         if not rows:
             self.log_msg(f"🚫 {name}：未命中任何异常特征。")
             return
-        self.log_msg(f"🚫 {name} 的异常特征（{len(rows)} 条，全部来自服务端字段）：")
-        for code, why in rows:
-            self.log_msg(f"   · {RISK_LABEL.get(code, code)}：{why}")
+        self.log_msg(f"🚫 {name} — 命中 {len(rows)} 条异常特征（依据全部来自服务端已给的字段）：")
+        for _code, short, why, raw in rows:
+            self.log_msg(f"   · {short}：{why}" if why and why != short else f"   · {short}")
+            if raw:
+                # 服务端原文单独缩进一行：中英夹在一句里是最难读的
+                self.log_msg(f"       服务端原文：{raw}")
 
     def _ctx_leave_one(self):
         iid, vals = self._ctx_row()
@@ -5432,8 +5493,9 @@ class App:
             n = counts.get(c, 0)
             if n:
                 self.log_msg(f"   · {label}：{n}")
-        self.log_msg("   · 点「🚫 异常 ▾」可按类别只看 / 一次勾选；"
-                     "导出的 CSV 里「异常」列带完整原因。")
+        self.log_msg("   · 点「🚫 异常 ▾」可按类别只看 / 一次勾选；右键某行选「为什么异常」"
+                     "看单个的依据；导出 Excel 会另带一张「异常明细」表"
+                     "（类别 / 判定依据 / 服务端原文分三列）。")
         return hit
 
 
@@ -7709,7 +7771,7 @@ class App:
         values = [name, username, kind,
                   self._stat_cell(iid, "members"), self._stat_cell(iid, "posts"),
                   self._active_cell(iid), folder, cid, safe, risk_txt]
-        return values, (risk_of(ent) if ent is not None else [])
+        return values, (risk_rows(ent) if ent is not None else [])
 
     def _stat_cell(self, iid, col):
         """统计值 -> Excel 单元格。没获取过就留空 —— 不要写成 0，
@@ -7829,10 +7891,10 @@ class App:
             if values is None:
                 continue
             rows.append(values)
-            for code, why in detail:
+            for _code, short, why, raw in detail:
                 detail_count += 1
-                risk_rows.append([values[0], values[2], values[7],
-                                  RISK_LABEL.get(code, code), ("w", why)])
+                risk_rows.append([values[0], values[2], values[7], short,
+                                  ("w", why), ("w", raw)])
         sheets = [{"name": "会话清单", "cols": [w for _t, w in EXCEL_COLUMNS],
                    "rows": rows, "freeze": True, "filter": True},
                   {"name": "统计概览", "cols": (26, 52),
@@ -9001,8 +9063,25 @@ def selftest():
                 and xl_col_letter(703) == "AAA"
             assert len(xl_sheet_name("长" * 50)) == XL_SHEET_NAME_LIMIT
             assert csv_guard("=1+1") == "'=1+1" and csv_guard("-100123") == "-100123"
-            assert len(EXCEL_COLUMNS) == 10 and len(EXCEL_RISK_COLUMNS) == 5
+            assert len(EXCEL_COLUMNS) == 10 and len(EXCEL_RISK_COLUMNS) == 6
             _selftest_say(lines, "v1.7.0：Excel 导出（零依赖 OOXML：三表 / 表头样式 / 冻结 / 筛选）OK")
+            # v1.7.1：异常特征的呈现（短标签并排 / 原文单独放 / 呈现层单一出口）
+            assert callable(risk_rows) and callable(risk_raw_text)
+            assert not any("🚫" in v for _c, v, _l in RISK_META), RISK_META
+            _rmulti = tl_types.Channel(
+                id=9, title="x", photo=None, date=None, broadcast=True, scam=True,
+                restricted=True,
+                restriction_reason=[tl_types.RestrictionReason(
+                    platform="all", reason="terms", text="violation of ToS")],
+                banned_rights=tl_types.ChatBannedRights(until_date=None, send_messages=True))
+            assert risk_cell_text(_rmulti) == "诈骗 · 违规受限 · 禁言", risk_cell_text(_rmulti)
+            assert "ToS" not in risk_detail_text(_rmulti) \
+                and "ToS" in risk_raw_text(_rmulti), risk_detail_text(_rmulti)
+            assert "ChannelForbidden" not in risk_detail_text(tl_types.ChannelForbidden(
+                id=8, access_hash=1, title="x", broadcast=True))
+            assert [c[0] for c in EXCEL_RISK_COLUMNS] == [
+                "名称", "类型", "ID", "异常类别", "判定依据", "服务端原文"]
+            _selftest_say(lines, "v1.7.1：异常特征呈现（短标签并排 · 原文独立列 · 单一出口）OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
