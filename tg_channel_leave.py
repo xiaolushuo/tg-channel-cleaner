@@ -6,8 +6,7 @@ TG 频道批量退出工具 (GUI 版)
 使用 Telethon 操作你【自己的】Telegram 账号，列出已订阅的频道/群组，
 勾选后批量退出。纯本地工具，不依赖任何第三方服务器。
 
-使用前准备:
-  1. 打开 https://my.telegram.org ，登录后「API development tools」创建一个应用，
+使用前准备：1. 打开 https://my.telegram.org ，登录后「API development tools」创建一个应用，
      拿到 api_id 与 api_hash。
   2. pip install telethon
   3. 运行本脚本，填入 api_id / api_hash / 手机号，点击「连接/登录」。
@@ -15,8 +14,7 @@ TG 频道批量退出工具 (GUI 版)
   4. 等会话列表加载完，勾选要处理的，点「退出 / 删除选中」。
      频道 / 群组会被**退出**；私聊 / 机器人没有「退出」这个概念，会被**删除会话**。
 
-注意事项:
-  - 本工具仅用于管理你自己的账号，请遵守 Telegram 服务条款。
+注意事项：- 本工具仅用于管理你自己的账号，请遵守 Telegram 服务条款。
   - 退出间隔默认 2 秒；若提示限流(FloodWait)，工具会自动等待后重试。
   - 登录态保存在本目录 tg_session.session，请勿泄露该文件。
 """
@@ -287,11 +285,39 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.1"
+APP_VERSION = "v1.7.2"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.2", "2026-10-15", [
+        "修复：**其他信息类似显示问题的普查结果**。上一版只修了「异常特征」，"
+        "这一版把全界面文案扫了一遍，找到四类同源问题（都不是某句话写得不好，而是缺统一的规矩）：",
+        "① **英文异常直接甩给用户**（最严重、也最常见）—— 连不上时看到的是"
+        "「[Errno 11001] getaddrinfo failed」「RPCError 420: FLOOD_WAIT_30」，"
+        "登录态失效看到「AuthKeyUnregisteredError - The authorization key…」。"
+        "现在加了一层 `humanize_error()`：**可预期的错误翻成一句中文 + 下一步**"
+        "（约 25 类：限流等待多少秒 / 登录态失效请重新登录 / 两步验证要密码 / "
+        "api_id 去哪儿核对 / 网络或代理不通 / 邀请链接过期…），"
+        "**认不出来的异常原样返回** —— 不假装认识，也方便照原样去搜。"
+        "全项目 35 处「异常直接进界面」的地方都过了这一层（含日志、弹窗、状态栏）",
+        "② **并列分隔符各写各的**（全角空格 / 「；」/「、」混用）—— 统计条的类型分布"
+        "以前是「📢 频道 800 个　👥 群组 300 个」那种全角空格分隔 + 逐项带「个」，"
+        "现在统一成 `SEP_DOT`（「 · 」）一处定义：「📢 频道 800 · 👥 群组 300」。"
+        "异常菜单的计数也从「（全部）（12）」改成「（全部） · 12 个」（双层括号太糊）",
+        "③ **同一份数据在多处各拼一遍** —— 「原因 → 个数」在弹窗里排多行、在日志里排一行，"
+        "以前两处各写一遍（改一处必然漏另一处），现在统一走 `reason_count_text()`",
+        "④ **符号写法不统一** —— `⚠` 与 `⚠️` 混用（18:4）、半角 `->` 与全角 `→` 混用、"
+        "中文文案里夹着半角冒号（`失败: xxx`）。现在统一：⚠️ 带变体选择符、箭头用 →、"
+        "中文一律用全角「：」（顺带把 41 处修正过来）",
+        "另修：**🚫 异常特征、⏭ 跳过受保护项这两类日志以前被归为「信息」级** —— "
+        "用户在日志面板一关「信息」就再也看不到它们了；它们都是「需要你看一眼」的，"
+        "现在归「警告」级",
+        "新增测试套件 `test_error_msg`（39 条）：既测人话化本身（约 25 类错误逐个抽查、"
+        "「不认识的异常必须原样返回」「翻好的错误里不许残留英文类名」），"
+        "也把这次的规矩固化成护栏 —— 以后任何人再写 `type(e).__name__` 进文案、"
+        "再往日志里塞原始 `{e}`、再用全角空格当分隔符、再写半角冒号，测试都会拦下来",
+    ]),
     ("v1.7.1", "2026-10-15", [
         "修复：**异常特征显示得太乱**。三处原因，都改了：",
         "① 说明里混着内部术语和英文原文 —— 以前一条是这样的：「服务端标注受限 —— 违反服务条款："
@@ -370,7 +396,7 @@ CHANGELOG = [
         "新增：**空会话筛选预设**（「空会话（作品数 = 0）」「空会话且 >90 天没消息」）—— "
         "僵尸会话最典型的判据。注意这类是**我们推断**的，所以只进筛选预设，"
         "**不塞进「异常」列**（那一列只放服务端标记，混着会让人不敢信）",
-        "新增：**日志面板可过滤**。每行按前缀自动分级（❌/⛔/🔥 错误、⚠/❓/⏳ 警告、其余信息），"
+        "新增：**日志面板可过滤**。每行按前缀自动分级（❌/⛔/🔥 错误、⚠️/❓/⏳ 警告、其余信息），"
         "顶部可勾选显示哪几级、可按关键词搜索、可一键「复制全部」；"
         "**过滤只改显示，不改已写下的事实**（关掉信息级不会让那几行消失），自动滚动可关",
         "新增：**工具提示**（鼠标停留 0.45 秒，关键按钮都有说明）、**F1 快捷键面板**"
@@ -931,8 +957,10 @@ RISK_META = (
     (RISK_NEEDJOIN, "须先加入", "须先加入才能发言"),
     (RISK_GHOST, "已注销", "对方账号已注销"),
 )
-# 多项并排时的连接符（表格列 / 日志 / 导出统一用它，别再各写各的）
-RISK_SEP = " · "
+# 并列项之间的**统一分隔符**。以前各写各的（全角空格 / 「；」/「、」），
+# 同一行里混着两三种分隔符最显乱。
+SEP_DOT = " · "
+RISK_SEP = SEP_DOT          # 兼容旧名（风险那几处仍在用）
 RISK_CODES = tuple(c for c, _s, _l in RISK_META)
 RISK_SHORT = {c: s for c, s, _l in RISK_META}
 RISK_LABEL = {c: l for c, _s, l in RISK_META}
@@ -1121,17 +1149,93 @@ def LOG_LEVEL_COLOR_OF(pal, level):
     dark = pal.get("bg") == THEME_DARK["bg"]
     return (LOG_LEVEL_COLOR_DARK if dark else LOG_LEVEL_COLOR).get(level, pal["fg"])
 _LOG_ERR_TOKENS = ("❌", "⛔", "🔥")
-_LOG_WARN_TOKENS = ("⚠", "❓", "⏹", "⏳", "↻")
+# 匹配器里保留不带变体选择符的 `⚠`（两种写法都能命中）。
+# 🚫 异常特征、⏭ 跳过受保护项 —— 都是「需要你看一眼」的，必须归警告级，
+# 否则用户在日志面板一关「信息」就再也看不到它们。
+_LOG_WARN_TOKENS = ("⚠", "❓", "⏹", "⏳", "↻", "🚫", "⏭")
 
 
 def log_level_of(msg):
-    """按前缀判断日志级别：❌/⛔/🔥 = 错误，⚠/❓/⏳/↻/⏹ = 警告，其余 = 信息。"""
+    """按前缀判断日志级别：❌/⛔/🔥 = 错误，⚠️/❓/⏳/↻/⏹ = 警告，其余 = 信息。"""
     head = str(msg).lstrip(" 　·.-")[:4]
     if any(t in head for t in _LOG_ERR_TOKENS):
         return LOG_ERROR
     if any(t in head for t in _LOG_WARN_TOKENS):
         return LOG_WARN
     return LOG_INFO
+
+
+# ---------------- 错误信息人话化 ----------------
+# 直接 str(e) 甩到界面上，用户看到的是
+#   「[Errno 11001] getaddrinfo failed」「RPCError 420: FLOOD_WAIT_30 (caused by
+#    GetDialogsRequest)」「AuthKeyUnregisteredError - The authorization key …」
+# —— 既中英混杂，又没告诉他该干什么。这里把**可预期**的错误翻成一句中文 + 下一步。
+# **认不出来的异常原样返回**：不假装认识，也方便他照原样去搜。
+ERROR_HUMAN = (
+    # (类名片段, 人话, 是否把原文也附上)
+    ("AuthKeyUnregisteredError", "登录态已失效（session 被撤销，或在别处退出过）—— 请重新登录这个账号", False),
+    ("AuthKeyDuplicatedError", "同一份 session 在别处同时登录过，登录态已被 Telegram 撤销 —— 删掉它重新登录", False),
+    ("SessionRevokedError", "这个登录态已被撤销，请重新登录", False),
+    ("SessionPasswordNeededError", "该账号开了两步验证，需要填两步密码", False),
+    ("PhoneCodeInvalidError", "验证码不对", False),
+    ("PhoneCodeExpiredError", "验证码已过期，点「发送验证码」重发一次", False),
+    ("PhoneNumberInvalidError", "手机号格式不对（要带国家码，例如 +8613800138000）", False),
+    ("PhoneNumberBannedError", "这个手机号已被 Telegram 封禁", False),
+    ("ApiIdInvalidError", "api_id / api_hash 不正确 —— 去 my.telegram.org 核对后再填", False),
+    ("ApiIdPublishedFloodError", "这个 api_id 被限流了 —— 换一个应用，或过一段时间再试", False),
+    ("UserAlreadyParticipantError", "已经是成员了，无需重复加入", False),
+    ("UsernameNotOccupiedError", "这个用户名已经不存在（频道可能改名或已注销）", False),
+    ("UsernameInvalidError", "用户名格式不对", False),
+    ("ChannelPrivateError", "该频道已不可访问（被封 / 设为私密 / 你被拉黑）", False),
+    ("ChannelInvalidError", "这个频道的实体已失效 —— 先点「🔄 刷新列表」再试", False),
+    ("InviteHashExpiredError", "邀请链接已过期", False),
+    ("InviteHashInvalidError", "邀请链接无效", False),
+    ("ChatAdminRequiredError", "这个操作需要管理员权限", False),
+    ("UserBannedInChannelError", "你在这个频道里被封禁了", False),
+    ("ChatWriteForbiddenError", "你没有在这个群里发言的权限", False),
+    ("PeerIdInvalidError", "服务端不认识这个会话（实体已失效）—— 先点「🔄 刷新列表」再试", False),
+    ("FileNotFoundError", "找不到文件", True),
+    ("PermissionError", "没有权限（文件可能被其它程序占用）", True),
+    ("IsADirectoryError", "那是个目录，不是文件", True),
+    ("DatabaseError", "本地 session 文件有问题 —— 把它删掉重新登录即可", False),
+)
+
+# 网络 / 代理类的特征词。Telethon 这类抛的是 OSError / ConnectionError，类名不统一，
+# 只能从文案认；认出来统一给一句「检查网络 / 代理」，比原文有用得多。
+ERROR_NET_HINTS = ("getaddrinfo", "timed out", "timeout", "connection refused",
+                   "connection reset", "network is unreachable", "cannot connect",
+                   "connect failed", "10054", "10060", "11001", "proxy",
+                   "unreachable host", "eof occurred")
+
+
+def reason_count_text(reasons, multi_line=False):
+    """「原因 → 个数」的排布。弹窗要多行、日志要一行，但**只该由一处生成** ——
+    以前这两个地方各拼一遍，改一处必然漏另一处。"""
+    items = list((reasons or {}).items())
+    if not items:
+        return ""
+    if multi_line:
+        return "\n".join(f"· {k}：{v} 个" for k, v in items)
+    return SEP_DOT.join(f"{k} {v} 个" for k, v in items)
+
+
+def humanize_error(e):
+    """异常 → 用户看得懂的一句话（含下一步）。**认不出来就原样返回**。"""
+    if e is None:
+        return ""
+    name = type(e).__name__
+    text = str(e or "").strip()
+    low = text.lower()
+    if name == "FloodWaitError" or "flood_wait" in low:
+        secs = getattr(e, "seconds", None)
+        return (f"被 Telegram 限流了，需要等 {secs} 秒（等完再试即可）" if secs
+                else "被 Telegram 限流了，过一会儿再试")
+    for frag, human, keep_raw in ERROR_HUMAN:
+        if frag in name:
+            return f"{human}：{text}" if (keep_raw and text) else human
+    if any(h in low for h in ERROR_NET_HINTS):
+        return "连不上 Telegram（网络或代理不通）—— 检查代理设置后再试"
+    return text or name
 
 
 # ---------------- 订阅名额（500 / 1000） ----------------
@@ -1937,7 +2041,7 @@ async def rejoin_one(client, kind, value):
             try:
                 await client(tl_messages.CheckChatInviteRequest(value))
             except Exception as e:      # noqa: BLE001
-                return "fail", f"邀请链接不可用（可能已过期 / 已被撤销）：{e}"
+                return "fail", f"邀请链接不可用（可能已过期 / 已被撤销）：{humanize_error(e)}"
             await client(tl_messages.ImportChatInviteRequest(value))
             return "ok", "已通过邀请链接加入"
         entity = await client.get_entity(value)      # 先解析实体，别把字符串塞进请求
@@ -1947,7 +2051,7 @@ async def rejoin_one(client, kind, value):
         return "already", "已经是成员"
     except (telethon_errors.InviteHashExpiredError,
             telethon_errors.InviteHashInvalidError) as e:
-        return "fail", f"邀请链接失效：{e}"
+        return "fail", f"邀请链接失效：{humanize_error(e)}"
     except telethon_errors.FloodWaitError as e:
         return "fail", f"被限流，请等 {getattr(e, 'seconds', '?')} 秒后重试"
     except telethon_errors.UsernameNotOccupiedError:
@@ -1955,7 +2059,7 @@ async def rejoin_one(client, kind, value):
     except telethon_errors.ChannelPrivateError:
         return "fail", "该频道已不可访问（被封 / 私密 / 你被拉黑）"
     except Exception as e:      # noqa: BLE001
-        return "fail", str(e)
+        return "fail", humanize_error(e)
 
 
 async def delete_history_entity(client, ent):
@@ -2011,7 +2115,7 @@ async def dialogs_still_present(client, ents):
     try:
         res = await client(tl_messages.GetPeerDialogsRequest(peers=peers))
     except Exception as e:
-        return None, str(e)
+        return None, humanize_error(e)
     dialogs = getattr(res, "dialogs", None)
     if dialogs is None:
         return None, "服务端响应里没有 dialogs 字段，无法判定"
@@ -2177,7 +2281,7 @@ async def dialog_history_cleared(client, ent):
             limit=1, max_id=0, min_id=0, hash=0))
         return int(getattr(res, "total", 0) or 0), ""
     except Exception as e:
-        return None, str(e)
+        return None, humanize_error(e)
 
 
 async def destroy_entity(client, ent):
@@ -3011,7 +3115,7 @@ class App:
             self.log_msg(f"⏳ 拉取设备被限流，等 {getattr(e, 'seconds', '?')} 秒后再试。")
             return
         except Exception as e:      # noqa: BLE001
-            self.log_msg(f"❌ 拉取登录设备失败: {e}")
+            self.log_msg(f"❌ 拉取登录设备失败：{humanize_error(e)}")
             return
         rows = [authorization_row(a) for a in (getattr(res, "authorizations", None) or [])]
         rows.sort(key=lambda r: (not r["current"], r.get("active") or ""))
@@ -3075,10 +3179,10 @@ class App:
             try:
                 await self.client(tl_account.ResetAuthorizationRequest(hash=t["hash"]))
                 ok += 1
-                self.log_msg(f"🚪 已踢出: {t['device']}（{t['ip']} {t['active']}）")
+                self.log_msg(f"🚪 已踢出：{t['device']}（{t['ip']} {t['active']}）")
             except Exception as e:      # noqa: BLE001
                 fail += 1
-                self.log_msg(f"❌ 踢出失败: {t['device']} → {e}")
+                self.log_msg(f"❌ 踢出失败：{t['device']} → {humanize_error(e)}")
             await asyncio.sleep(max(1.0, self._interval()))
         self.log_msg(f"🏁 踢设备完成：成功 {ok} 个，失败 {fail} 个。")
         self.root.after(0, lambda o=ok, f=fail: self.finish_task(
@@ -3581,7 +3685,7 @@ class App:
                     pass
                 self.paned.forget(self.panel_left)
         except Exception as e:
-            self.log_msg(f"❌ 切换设置栏失败: {e}")
+            self.log_msg(f"❌ 切换设置栏失败：{humanize_error(e)}")
         self._left_visible = bool(visible)
         try:
             self.btn_left_toggle.configure(text="◧ 设置" if visible else "▸ 设置")
@@ -3806,7 +3910,7 @@ class App:
             self.log_msg(f"✅ 日志已导出：{path}")
             messagebox.showinfo("完成", f"日志已导出到：\n{path}")
         except Exception as e:
-            messagebox.showerror("导出失败", str(e))
+            messagebox.showerror("导出失败", humanize_error(e))
 
     # ---------------- 缓存 / 登录态 ----------------
     def refresh_cache_info(self):
@@ -3858,7 +3962,7 @@ class App:
             if os.path.exists(path):
                 os.remove(path)
         except Exception as e:
-            self.log_msg(f"⚠️ 删除缓存文件失败（不影响使用）：{e}")
+            self.log_msg(f"⚠️ 删除缓存文件失败（不影响使用）：{humanize_error(e)}")
         self.refresh_cache_info()
         self.log_msg(f"🧹 已清空统计缓存（{n} 条）。")
 
@@ -3892,7 +3996,7 @@ class App:
                     os.remove(path)
                     removed += 1
             except Exception as e:
-                self.log_msg(f"⚠️ 删除 {os.path.basename(path)} 失败：{e}")
+                self.log_msg(f"⚠️ 删除 {os.path.basename(path)} 失败：{humanize_error(e)}")
         self._refresh_account_ui()
         self.refresh_cache_info()
         self.set_status("⚪ 当前账号的登录态已删除，点「连接 / 登录」重新登录", "#7f8c8d")
@@ -3903,7 +4007,7 @@ class App:
         try:
             self._apply_theme(bool(self.dark_var.get()))
         except Exception as e:
-            self.log_msg(f"⚠️ 切换主题失败: {e}")
+            self.log_msg(f"⚠️ 切换主题失败：{humanize_error(e)}")
         self.save_config()
 
     def _apply_theme(self, dark=None):
@@ -4144,7 +4248,7 @@ class App:
         text = vals.get(col, "")
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.log_msg(f"📋 已复制{self._col_titles.get(col, col)}: {text}")
+        self.log_msg(f"📋 已复制{self._col_titles.get(col, col)}：{text}")
 
     def _tme_link(self, iid):
         ent = self.channels.get(iid)
@@ -4161,7 +4265,7 @@ class App:
         link = self._tme_link(iid)
         self.root.clipboard_clear()
         self.root.clipboard_append(link)
-        self.log_msg(f"📋 已复制链接: {link}")
+        self.log_msg(f"📋 已复制链接：{link}")
 
     def _ctx_open_link(self):
         iid, _ = self._ctx_row()
@@ -4171,9 +4275,9 @@ class App:
         link = self._tme_link(iid)
         try:
             webbrowser.open(link)
-            self.log_msg(f"🌐 已用浏览器打开: {link}")
+            self.log_msg(f"🌐 已用浏览器打开：{link}")
         except Exception as e:
-            self.log_msg(f"❌ 打开链接失败: {e}")
+            self.log_msg(f"❌ 打开链接失败：{humanize_error(e)}")
 
     def _ctx_toggle_whitelist(self):
         iid, _ = self._ctx_row()
@@ -4434,7 +4538,7 @@ class App:
             self.root.clipboard_append(text)
             self.log_msg(f"📋 已复制 {len(getattr(self, '_log_records', []))} 行日志到剪贴板。")
         except Exception as e:
-            self.log_msg(f"⚠️ 复制日志失败: {e}")
+            self.log_msg(f"⚠️ 复制日志失败：{humanize_error(e)}")
 
     # ---------------- 登录验证（界面内嵌输入框，避免弹窗不可见）----------------
     def enable_code_input(self, prompt_text, fut):
@@ -4473,7 +4577,7 @@ class App:
         try:
             self.loop.call_soon_threadsafe(fut.set_result, val)
         except Exception as e:
-            self.log_msg(f"❌ 提交验证码失败: {e}")
+            self.log_msg(f"❌ 提交验证码失败：{humanize_error(e)}")
 
     def validate_inputs(self):
         try:
@@ -4623,7 +4727,7 @@ class App:
                 "测试结果", f"代理 {host}:{port} 可正常访问 Telegram 外网。\n可以点击「连接/登录」了。"))
         else:
             self.log_msg(f"❌ 代理 {host}:{port} 端口虽通，但无法经其访问 Telegram 外网：{net_err}")
-            self.log_msg("⚠ 请检查：①代理软件的节点/分流规则是否放行 Telegram；"
+            self.log_msg("⚠️ 请检查：①代理软件的节点/分流规则是否放行 Telegram；"
                          "②在「类型」里把 SOCKS5 与 HTTP 切换后再试；③确认该节点本身能上 Telegram。")
             self.root.after(0, lambda: messagebox.showerror(
                 "测试失败",
@@ -4696,7 +4800,7 @@ class App:
         if proxy:
             self.log_msg(f"正在连接 Telegram ...（账号 {account_label(acc)}，经代理 {proxy[1]}:{proxy[2]}）")
         else:
-            self.log_msg("正在连接 Telegram ...（⚠ 未启用代理：直连可能被网络限制拦截）")
+            self.log_msg("正在连接 Telegram ...（⚠️ 未启用代理：直连可能被网络限制拦截）")
         self.ensure_loop()
         future = self.run_async(self._connect(api_id, api_hash, acc.get("phone", ""), proxy,
                                               session_base=account_session_base(acc),
@@ -4758,10 +4862,10 @@ class App:
             self.root.after(0, lambda: self._set_conn_busy(False))
             self.root.after(0, lambda: self.set_status("🔴 未连接（已取消登录）", "#c0392b"))
         except Exception as e:
-            self.log_msg(f"❌ 连接失败: {e}")
+            self.log_msg(f"❌ 连接失败：{humanize_error(e)}")
             self.root.after(0, lambda: self._set_conn_busy(False))
             self.root.after(0, lambda: self.set_status(
-                f"🔴 未连接：{type(e).__name__}（点「连接 / 登录」可重试）", "#c0392b"))
+                "🔴 未连接（点「连接 / 登录」重试，原因见日志）", "#c0392b"))
 
     def _register_account(self, key, phone, session_name, me):
         """把登录成功的账号写入注册表（已存在则更新昵称 / 用户名 / user_id）。"""
@@ -4874,7 +4978,7 @@ class App:
             self.save_role_cache()
             self.save_config()
         except Exception as e:
-            self.log_msg(f"⚠️ 保存当前账号状态失败（不影响切换）：{e}")
+            self.log_msg(f"⚠️ 保存当前账号状态失败（不影响切换）：{humanize_error(e)}")
         if old_key and self.client is not None:
             self._clients[old_key] = self.client      # 保底：确认旧的 client 已入池
         # 2) 切到目标账号：client、缓存、白名单、配置一起换
@@ -4939,7 +5043,7 @@ class App:
                     if os.path.exists(p):
                         os.remove(p)
                 except Exception as e:
-                    self.log_msg(f"⚠️ 删除 {os.path.basename(p)} 失败：{e}")
+                    self.log_msg(f"⚠️ 删除 {os.path.basename(p)} 失败：{humanize_error(e)}")
         # 从注册表与 config 里摘掉
         self._accounts = [a for a in self._accounts if a.get("key") != key]
         pa = dict((self.config or {}).get("per_account") or {})
@@ -5011,7 +5115,7 @@ class App:
         if proxy:
             self.log_msg(f"🔌 通过代理 {proxy[1]}:{proxy[2]} 连接 Telegram ...")
         else:
-            self.log_msg("⚠ 未启用代理：直连可能因网络限制失败，建议先配置并测试代理。")
+            self.log_msg("⚠️ 未启用代理：直连可能因网络限制失败，建议先配置并测试代理。")
         client = TelegramClient(
             session_base, api_id, api_hash, proxy=proxy,
             connection_retries=3, timeout=15,
@@ -5033,11 +5137,11 @@ class App:
         except OperationCancelled:
             raise
         except Exception as e:
-            self.log_msg(f"❌ 连接/登录失败: {type(e).__name__} - {e}")
+            self.log_msg(f"❌ 连接/登录失败：{humanize_error(e)}")
             emsg = str(e)
             if ("IncompleteReadError" in emsg or "Server closed the connection" in emsg
                     or "0 bytes read" in emsg or "ConnectionReset" in emsg):
-                self.log_msg("⚠ 诊断：代理端口虽能连通，但无法经代理访问 Telegram 数据中心。"
+                self.log_msg("⚠️ 诊断：代理端口虽能连通，但无法经代理访问 Telegram 数据中心。"
                              "常见原因与对策：")
                 self.log_msg("   1) 代理软件的节点/分流规则未放行 Telegram —— 先用浏览器或 TG 桌面端确认能上；")
                 self.log_msg("   2) 在「代理设置」里把「类型」在 SOCKS5 与 HTTP 之间切换后再连；")
@@ -5135,7 +5239,7 @@ class App:
         except OperationCancelled:
             self.log_msg("⏹ 已停止获取列表。")
         except Exception as e:
-            self.log_msg(f"❌ 获取频道失败: {e}")
+            self.log_msg(f"❌ 获取频道失败：{humanize_error(e)}")
         finally:
             self._list_cancel.clear()
             self.root.after(0, self._finish_list)
@@ -5392,14 +5496,16 @@ class App:
         except Exception:
             return
         for label, codes in RISK_GROUPS:
+            # 组名自己带括号（如「违规 / 被封（全部）」），再加一层计数括号就成了
+            # 「（全部）（12）」—— 用「 · N 个」隔开好看得多
             m.add_command(
-                label=f"只看：{label}（{self._risk_hit_count(codes)}）",
+                label=f"只看：{label}{SEP_DOT}{self._risk_hit_count(codes)} 个",
                 command=lambda c=codes: self.set_risk_filter(c))
         m.add_separator()
         cur = getattr(self, "_risk_filter", None)
         m.add_command(label="清除异常筛选" + ("（当前生效）" if cur else ""),
                       command=lambda: self.set_risk_filter(None))
-        m.add_command(label=f"勾选全部异常行（{self._risk_hit_count()}）",
+        m.add_command(label=f"勾选全部异常行{SEP_DOT}{self._risk_hit_count()} 个",
                       command=lambda: self.check_all_risk_rows())
         m.add_command(label="把异常统计写进日志", command=self.log_risk_summary)
         m.add_command(label="记住这些异常（写入白名单）", command=self.whitelist_risk_rows)
@@ -5580,7 +5686,7 @@ class App:
             res = await self.client(tl_messages.GetDialogFiltersRequest())
         except Exception as e:
             self._filters = []
-            self.log_msg(f"ℹ️ 未能读取分组列表（{type(e).__name__}: {e}），分组列与分组筛选暂不可用。")
+            self.log_msg(f"ℹ️ 未能读取分组列表（{humanize_error(e)}），分组列与分组筛选暂不可用。")
             self.root.after(0, self.apply_folders_to_ui)
             return
         self._filters = list(getattr(res, "filters", res) or [])
@@ -6042,7 +6148,7 @@ class App:
             self.log_msg(f"⏳ 触发限流：需要等待 {e.seconds} 秒，请稍后重试。")
             self.root.after(0, lambda: self.finish_task("限流等待"))
         except Exception as e:
-            self.log_msg(f"❌ 分组操作失败: {type(e).__name__}: {e}")
+            self.log_msg(f"❌ 分组操作失败：{humanize_error(e)}")
             self.root.after(0, lambda: self.finish_task("分组操作失败"))
 
     def _set_stat(self, epoch, iid, members, posts, role=None, active_ts=UNSET):
@@ -6355,7 +6461,7 @@ class App:
                 await asyncio.sleep(wait)
             except Exception as e:
                 if i == attempts - 1:
-                    self.log_msg(f"⚠️ 获取失败（{label}）: {type(e).__name__} - {e}")
+                    self.log_msg(f"⚠️ 获取失败（{label}）：{humanize_error(e)}")
                 else:
                     await asyncio.sleep(0.5 * (i + 1))
         return None
@@ -6851,13 +6957,17 @@ class App:
         return counts
 
     def _kinds_text(self, counts):
+        """类型分布文字：`📢 频道 800 · 👥 群组 300 · 💬 私聊 120`。
+
+        上一版用**全角空格**分隔、而且每项都带「个」—— 一行五六个类型时既难扫读又太长；
+        数字后面接分隔符就够了。"""
         parts = []
         for kind, icon in KIND_ICON:
             n = counts.get(kind, 0)
             if kind == KIND_OTHER and not n:
                 continue          # 「其它」为 0 时不占位，免得干扰
-            parts.append(f"{icon} {kind} {n} 个")
-        return "　".join(parts)
+            parts.append(f"{icon} {kind} {n}")
+        return SEP_DOT.join(parts)
 
     def _stats_text(self):
         total = len(self.channels)
@@ -6893,7 +7003,7 @@ class App:
         except FileNotFoundError:
             items = []
         except Exception as e:      # noqa: BLE001
-            self.log_msg(f"⚠️ 退出历史读取失败（当作空历史继续）: {e}")
+            self.log_msg(f"⚠️ 退出历史读取失败（当作空历史继续）：{humanize_error(e)}")
             items = []
         self._history = items
         self._history_key = key
@@ -6907,7 +7017,7 @@ class App:
             with open(self.history_path(), "w", encoding="utf-8") as f:
                 json.dump(items, f, ensure_ascii=False, indent=1)
         except Exception as e:      # noqa: BLE001
-            self.log_msg(f"⚠️ 退出历史写入失败（不影响本次操作）: {e}")
+            self.log_msg(f"⚠️ 退出历史写入失败（不影响本次操作）：{humanize_error(e)}")
 
     def record_history(self, rows, action):
         """把**服务端已确认**退出 / 删除的行记进历史。rows = [(iid, ent, name)]。"""
@@ -7012,13 +7122,13 @@ class App:
                 status, note = "fail", str(e)
             if status == "ok":
                 ok += 1
-                self.log_msg(f"➕ 已重新加入: {name}（{note or '服务端已确认'}）")
+                self.log_msg(f"➕ 已重新加入：{name}（{note or '服务端已确认'}）")
             elif status == "already":
                 ok += 1
-                self.log_msg(f"➖ 本就在里面，无需重复加入: {name}")
+                self.log_msg(f"➖ 本就在里面，无需重复加入：{name}")
             else:
                 fail += 1
-                self.log_msg(f"❌ 重新加入失败: {name} → {note}")
+                self.log_msg(f"❌ 重新加入失败：{name} → {note}")
             await asyncio.sleep(max(1.0, self._interval()))
         self.log_msg(f"🏁 重新加入完成：成功 {ok} 个，失败 {fail} 个。"
                      "（列表不会自动刷新，点「🔄 刷新列表」即可看到它们回来）")
@@ -7048,7 +7158,7 @@ class App:
             self.root.clipboard_append(text)
             self.log_msg(f"📋 已复制 {len(targets)} 条重新加入链接到剪贴板。")
         except Exception as e:
-            self.log_msg(f"⚠️ 复制链接失败: {e}")
+            self.log_msg(f"⚠️ 复制链接失败：{humanize_error(e)}")
 
     # ---------------- 批量任务：进度落盘 / 续跑 / ETA ----------------
     def task_path(self):
@@ -7063,7 +7173,7 @@ class App:
         except FileNotFoundError:
             return None
         except Exception as e:      # noqa: BLE001
-            self.log_msg(f"⚠️ 任务进度文件读取失败（忽略这次记录）: {e}")
+            self.log_msg(f"⚠️ 任务进度文件读取失败（忽略这次记录）：{humanize_error(e)}")
             return None
 
     def save_task(self, ctx):
@@ -7281,7 +7391,7 @@ class App:
             with open(self.snapshot_path(), "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=1)
         except Exception as e:      # noqa: BLE001
-            messagebox.showerror("导出失败", str(e))
+            messagebox.showerror("导出失败", humanize_error(e))
             return
         self.log_msg(f"📸 已导出快照 {len(data)} 条 → {os.path.basename(self.snapshot_path())}"
                      "（以后点「与上次快照对比」即可看变化）")
@@ -7294,7 +7404,7 @@ class App:
             messagebox.showinfo("提示", "还没有快照。先点「导出快照 JSON」存一份，之后再对比。")
             return
         except Exception as e:      # noqa: BLE001
-            messagebox.showerror("读取失败", str(e))
+            messagebox.showerror("读取失败", humanize_error(e))
             return
         if not self.channels:
             messagebox.showinfo("提示", "列表是空的，先刷新列表再对比。")
@@ -7344,7 +7454,7 @@ class App:
                 await set_mute(self.client, ent, value)
             else:
                 await set_archive(self.client, ent, value)
-            return True, f"{'🔕' if action == 'mute' else '📦'} {verb}: {name}"
+            return True, f"{'🔕' if action == 'mute' else '📦'} {verb}：{name}"
 
         await self._run_destructive(iids, self._interval(), self._jitter(), _do, verb,
                                     task_label=f"正在{verb}（共 {len(iids)} 个）…",
@@ -7818,7 +7928,7 @@ class App:
             self.log_msg(f"✅ 已导出{label} {len(rows)} 条到 {path}")
             messagebox.showinfo("完成", f"已导出{label} {len(rows)} 条到：\n{path}")
         except Exception as e:
-            messagebox.showerror("导出失败", str(e))
+            messagebox.showerror("导出失败", humanize_error(e))
 
     # ---------------- Excel(.xlsx) 导出 ----------------
     def _excel_overview_rows(self, count, label):
@@ -7928,8 +8038,8 @@ class App:
             sheets = self._excel_workbook(iids, label)
             size = write_xlsx(path, sheets)
         except Exception as e:
-            messagebox.showerror("导出失败", str(e))
-            self.log_msg(f"❌ Excel 导出失败: {e}")
+            messagebox.showerror("导出失败", humanize_error(e))
+            self.log_msg(f"❌ Excel 导出失败：{humanize_error(e)}")
             return
         names = "、".join(sh["name"] for sh in sheets)
         self.log_msg(f"✅ 已导出{label} {len(iids)} 条到 {path}"
@@ -7943,7 +8053,7 @@ class App:
             try:
                 opener(path)
             except Exception as e:      # noqa: BLE001
-                self.log_msg(f"⚠️ 打开文件失败（文件已经生成好了）: {e}")
+                self.log_msg(f"⚠️ 打开文件失败（文件已经生成好了）：{humanize_error(e)}")
 
     async def _run_destructive(self, sel, interval, jitter, do_one, verb,
                                task_label=None, progress_verb=None, defer_drop=False,
@@ -7991,7 +8101,7 @@ class App:
                 else:
                     fail += 1
             except FloodWaitError as e:
-                self.log_msg(f"⏳ 触发限流，等待 {e.seconds} 秒后重试: {name}")
+                self.log_msg(f"⏳ 触发限流，等待 {e.seconds} 秒后重试：{name}")
                 secs = int(e.seconds)
                 n, t = done + 1, total
                 self.root.after(0, lambda n=n, t=t, s=secs: self.set_progress(
@@ -8010,10 +8120,10 @@ class App:
                         fail += 1
                 except Exception as e2:
                     fail += 1
-                    self.log_msg(f"❌ {verb}失败: {name} -> {e2}")
+                    self.log_msg(f"❌ {verb}失败：{name} → {humanize_error(e2)}")
             except Exception as e:
                 fail += 1
-                self.log_msg(f"❌ {verb}失败: {name} -> {e}")
+                self.log_msg(f"❌ {verb}失败：{name} → {humanize_error(e)}")
             done += 1
             if task_ctx is not None:
                 # 每完成一个就把进度写盘：崩溃 / 断电 / 手动关窗口之后还能接着跑
@@ -8091,13 +8201,13 @@ class App:
             kind = session_kind(ent)
             status, note = await leave_or_delete_entity(self.client, ent, kind)
             if status == LEAVE_BLOCKED:
-                return False, f"⛔ 无法退出（{note}）: {name}"
+                return False, f"⛔ 无法退出（{note}）：{name}"
             if status == LEAVE_GONE:
-                return True, f"➖ 无需退出（{note}）: {name}"
+                return True, f"➖ 无需退出（{note}）：{name}"
             if exit_action_of(kind) == EXIT_DELETE:
                 # 私聊在「退出」里也是删会话：结论等复核完由 _finish_destructive 统一报
                 return True, ""
-            return True, f"✅ 已退出: {name}"
+            return True, f"✅ 已退出：{name}"
 
         _ok, _fail, made = await self._run_destructive(
             sel, interval, jitter, _do_leave, "退出",
@@ -8320,19 +8430,19 @@ class App:
             if isinstance(ent, tl_types.User) and getattr(ent, "is_self", False):
                 return False, ("⛔ 无法删除（这是你自己的「收藏夹」：Telegram 不允许删除这个会话；"
                                "本次**没有**发送任何请求，以免误清空你收藏的内容。"
-                               "确实要清空请到客户端里用「清空聊天记录」）: %s" % name)
+                               "确实要清空请到客户端里用「清空聊天记录」）：%s" % name)
             status, note = await delete_history_entity(self.client, ent)
             if status == DEL_BLOCKED:
-                return False, f"⛔ 无法删除（{note}）: {name}"
+                return False, f"⛔ 无法删除（{note}）：{name}"
             if status == DEL_GONE:
-                return True, f"➖ 无需删除（{note}）: {name}"
+                return True, f"➖ 无需删除（{note}）：{name}"
             if isinstance(ent, tl_types.User):
                 # ⚠️ 私聊先**不许**说「已删除」：请求只是发出去了，
                 # 服务端可能安静地收下却什么都不做。结论等复核完由
                 # _finish_destructive 统一报（空串 = 先别写日志）。
                 return True, ""
             verb = "已退出并移除会话" if is_member_kind(session_kind(ent)) else "已删除会话"
-            return True, f"🗑 {verb}: {name}"
+            return True, f"🗑 {verb}：{name}"
 
         # ⚠️ 复核对象只能取执行器**当场记下**的成功名单。曾经想「跑完之后不在
         # self.channels 里的就是成功的」——那是错的：行清理是 root.after 排给 Tk
@@ -8362,12 +8472,12 @@ class App:
                 # 私聊的「到底删掉没有」现在才有答案 —— 到这一步才写日志，
                 # 免得日志先写了「已删除」再改口。
                 if iid in kept_ids:
-                    self.log_msg(f"⚠️ 未能删除（服务端确认仍然存在）: {name}"
+                    self.log_msg(f"⚠️ 未能删除（服务端确认仍然存在）：{name}"
                                  f"{dialog_remove_tag(ent)}")
                 elif iid in unver:
-                    self.log_msg(f"❓ 未能复核（无法确认删掉没有）: {name}")
+                    self.log_msg(f"❓ 未能复核（无法确认删掉没有）：{name}")
                 else:
-                    self.log_msg(f"🗑 已删除会话（服务端已复核确认）: {name}")
+                    self.log_msg(f"🗑 已删除会话（服务端已复核确认）：{name}")
             if iid in kept_ids or iid in unver:
                 continue        # 没被确认的一律留在列表，别让界面看起来「都成了」
             self.root.after(0, lambda i=iid: self._drop_row(i))
@@ -8453,7 +8563,7 @@ class App:
                         self.log_msg(f"   · ⏳ 被限流（{_name}），等待 {wait} 秒后继续")
                         await asyncio.sleep(wait)
                     except Exception as e:      # noqa: BLE001
-                        self.log_msg(f"   · 重试失败（{_name}）: {e}")
+                        self.log_msg(f"   · 重试失败（{_name}）：{humanize_error(e)}")
                     await asyncio.sleep(per_peer)   # 让出事件循环（限量档顺带限速）
                 # 重试也要限速，别把服务端惹火
                 if pending:
@@ -8565,14 +8675,16 @@ class App:
             reasons = {}
             for b in blocked:
                 reasons[b["reason"]] = reasons.get(b["reason"], 0) + 1
-            detail = "\n".join(f"· {k}：{v} 个" for k, v in reasons.items())
+            # 同一份「原因 → 个数」在弹窗里排多行、在日志里排一行 —— 用一个函数生成，
+            # 以前这两处各拼一遍，改一处必然漏另一处
+            detail = reason_count_text(reasons)
             messagebox.showinfo(
                 "提示",
-                f"勾选的 {len(iids)} 个里没有可删除的{want_kind}。\n\n{detail}\n\n"
+                f"勾选的 {len(iids)} 个里没有可删除的{want_kind}。\n\n"
+                + reason_count_text(reasons, multi_line=True) + "\n\n"
                 f"「删除我创建的{want_kind}」只处理【你本人创建】的{want_kind}；"
                 "其它会话请用「🗑 删除会话（含聊天记录）」或「🚪 退出 / 删除选中」。")
-            self.log_msg("⏭ 「删除自建%s」无可执行项（" % want_kind
-                         + "；".join(f"{k} {v} 个" for k, v in reasons.items()) + "）")
+            self.log_msg(f"⏭ 「删除自建{want_kind}」无可执行项（{detail}）")
             return
         if not self._destroy_dialog(to_del, blocked, want_kind):
             self.log_msg("已取消删除。")
@@ -8599,10 +8711,10 @@ class App:
         async def _do(ent, name):
             status, note = await destroy_entity(self.client, ent)
             if status == DEL_BLOCKED:
-                return False, f"⛔ 无法删除（{note}）: {name}"
+                return False, f"⛔ 无法删除（{note}）：{name}"
             if status == DEL_GONE:
-                return True, f"➖ 无需删除（{note}）: {name}"
-            return True, f"🔥 已彻底删除{want_kind}: {name}"
+                return True, f"➖ 无需删除（{note}）：{name}"
+            return True, f"🔥 已彻底删除{want_kind}：{name}"
 
         await self._run_destructive(
             sel, interval, jitter, _do, "删除",
@@ -9082,6 +9194,25 @@ def selftest():
             assert [c[0] for c in EXCEL_RISK_COLUMNS] == [
                 "名称", "类型", "ID", "异常类别", "判定依据", "服务端原文"]
             _selftest_say(lines, "v1.7.1：异常特征呈现（短标签并排 · 原文独立列 · 单一出口）OK")
+            # v1.7.2：错误人话化 + 文案一致性
+            assert humanize_error(None) == ""
+            assert "重新登录" in humanize_error(
+                telethon_errors.AuthKeyUnregisteredError(request=None))
+            assert "代理" in humanize_error(OSError("[Errno 11001] getaddrinfo failed"))
+            assert "30 秒" in humanize_error(
+                telethon_errors.FloodWaitError(request=None, capture=30))
+            assert humanize_error(ValueError("没见过的错")) == "没见过的错", "未知异常必须原样返回"
+            _leak = [n for n, _h, _k in ERROR_HUMAN
+                     if "Error" in humanize_error(type(n, (Exception,), {})())]
+            assert not _leak, _leak
+            assert SEP_DOT == " · " and RISK_SEP == SEP_DOT
+            assert " · " in app._kinds_text({"频道": 1, "群组": 2})
+            assert "个 · " not in app._kinds_text({"频道": 1, "群组": 2})
+            assert reason_count_text({"a": 1}) == "a 1 个"
+            assert reason_count_text({"a": 1}, multi_line=True) == "· a：1 个"
+            assert "🚫" in _LOG_WARN_TOKENS and log_level_of("🚫 x") == LOG_WARN
+            assert log_level_of("⏭ x") == LOG_WARN and log_level_of("⚠️ x") == LOG_WARN
+            _selftest_say(lines, "v1.7.2：错误人话化（25 类）/ 统一分隔符 · 全角冒号 / 警示日志归警告级 OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
