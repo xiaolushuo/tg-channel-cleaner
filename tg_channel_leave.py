@@ -98,8 +98,10 @@ from telethon import TelegramClient
 from telethon import errors as telethon_errors
 from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
+from telethon.tl.functions import account as tl_account
 from telethon.tl.functions import channels as tl_channels
 from telethon.tl.functions import contacts as tl_contacts
+from telethon.tl.functions import folders as tl_folders
 from telethon.tl.functions import messages as tl_messages
 from telethon.tl.types import Channel
 from telethon.utils import get_peer_id
@@ -283,11 +285,31 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.5.0"
+APP_VERSION = "v1.6.0"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.6.0", "2026-10-15", [
+        "新增：**数据概览**（「📊 概览」按钮 / **Ctrl+D**）—— 类型分布环形图、用户数量级、"
+        "活跃度、异常特征四张图，全部用 Canvas 手绘（零依赖），数据来自当前列表（**零请求**）；"
+        "「用户数还没获取」的会话单独计数，不混进「0 个」里",
+        "新增：**批量任务可续跑 + 进度 ETA**。开跑前先把「要处理哪些」写盘、每完成一个就记一次，"
+        "中断 / 崩溃 / 关窗口之后点「⏯ 任务 ▾ → 继续上次未完成的」会把剩下的行勾出来接着做；"
+        "进度条上多了「剩余约 N 分 · 1.2 个/秒」。**续跑只勾选、不替你直接开跑**",
+        "新增：**登录设备管理**（左侧「设备」页）—— 列出当前账号的登录设备（设备 / 系统 / IP / "
+        "国家 / 最近活跃，本机带标记），可踢出选中或一次踢出其它全部；"
+        "本机那条永远不会被踢，踢之前有确认清单。只用 `account.getAuthorizations` / "
+        "`resetAuthorization`，只动自己的账号",
+        "新增：**会话快照与对比**（导出菜单）—— 导出快照 JSON，之后再点「与上次快照对比」，"
+        "输出「新增 / 消失 / 改名 / 用户数变化 / 新增异常」五类差异，明细写日志",
+        "新增：**批量静音 / 归档**（底部「🔕 更多 ▾」）—— 给「太吵但不想退」的会话一个**可逆**的"
+        "中间选项：静音、取消静音、归档、移出归档（`account.updateNotifySettings` / "
+        "`folders.editPeerFolders`）；不改变列表内容，也不动任何记录",
+        "深色主题补完整：行 tag（斑马纹 / 白名单 / 创建者 / 异常分级）与日志级别颜色都跟着主题走，"
+        "那些创建时写死浅灰的说明标签也会一起换色（深色下不再糊成一片）；行高 22 → 24，"
+        "并加了斑马纹。**不提供「跟随系统」** —— 那要读注册表，本项目不碰注册表",
+    ]),
     ("v1.5.0", "2026-10-15", [
         "新增：**订阅名额指示**。列表上方的统计条现在会写「🎯 名额 447/500（剩 53，按免费账号估算）」—— "
         "这个工具本来就是为解决「订阅满 500 加不进去」而做的，以前却看不到自己用了多少、"
@@ -1012,6 +1034,13 @@ LOG_WARN = "warn"
 LOG_ERROR = "error"
 LOG_LEVEL_META = ((LOG_INFO, "信息"), (LOG_WARN, "警告"), (LOG_ERROR, "错误"))
 LOG_LEVEL_COLOR = {LOG_INFO: "#8a8f98", LOG_WARN: "#c8871a", LOG_ERROR: "#d4574e"}
+LOG_LEVEL_COLOR_DARK = {LOG_INFO: "#9aa0a6", LOG_WARN: "#e0a44a", LOG_ERROR: "#f09595"}
+
+
+def LOG_LEVEL_COLOR_OF(pal, level):
+    """日志级别颜色：深色下要提亮，否则在深底上几乎看不见。"""
+    dark = pal.get("bg") == THEME_DARK["bg"]
+    return (LOG_LEVEL_COLOR_DARK if dark else LOG_LEVEL_COLOR).get(level, pal["fg"])
 _LOG_ERR_TOKENS = ("❌", "⛔", "🔥")
 _LOG_WARN_TOKENS = ("⚠", "❓", "⏹", "⏳", "↻")
 
@@ -1052,6 +1081,7 @@ def quota_text(used, limit, premium=False):
 # ---------------- 退出历史 / 重新加入 ----------------
 HISTORY_FILE_NAME = "tg_history_%s.json"
 HISTORY_MAX = 2000          # 只保留最近这么多条，避免文件无限增长
+TASK_FILE_NAME = "tg_task_%s.json"     # 批量任务的进度（中断后可以接着跑）
 REJOIN_USERNAME = "username"
 REJOIN_INVITE = "invite"
 
@@ -1122,6 +1152,31 @@ def history_summary_text(items, limit=20):
                    f"（{it.get('kind', '')}）{can}"
                    + (f"  t.me/{it['username']}" if it.get("username") else ""))
     return out
+
+
+# ---------------- 主题调色板 ----------------
+# 浅色沿用系统原生 ttk；深色切到 clam 并统一配色（ttk 里只有 clam 系列允许改底色）。
+# 说明：**不做「跟随系统」** —— 那要读注册表（HKCU\...\Themes\Personalize\AppsUseLightTheme），
+# 这个项目不碰注册表，所以只给「浅色 / 深色」两个明确选项。
+THEME_LIGHT = {
+    "bg": "#f5f6f7", "panel": "#ffffff", "fg": "#1f2328", "field": "#ffffff",
+    "sel": "#cfe3ff", "head": "#eaeef2", "sub": "#6b7280", "border": "#d0d7de",
+    "stripe": "#f2f4f7", "wl": "#185FA5", "danger": "#a32d2d", "accent": "#3f6fb5",
+    "risk_hi": "#b3261e", "risk_mid": "#a35a00", "risk_lo": "#5f6368",
+    "log_bg": "#ffffff", "log_fg": "#1f2328",
+}
+THEME_DARK = {
+    "bg": "#1f2125", "panel": "#26282d", "fg": "#e8eaed", "field": "#2c2f35",
+    "sel": "#3a4450", "head": "#2f3238", "sub": "#a6acb4", "border": "#3a3d43",
+    "stripe": "#2b2e34", "wl": "#7cb2ea", "danger": "#f09595", "accent": "#4a7fc1",
+    "risk_hi": "#f09595", "risk_mid": "#e0a44a", "risk_lo": "#9aa0a6",
+    "log_bg": "#17191c", "log_fg": "#d7dae0",
+}
+MUTED_LIGHT = ("#6b7280", "#374151", "#7f8c8d", "#9aa0a6", "#5f6368")
+
+
+def theme_palette(dark):
+    return THEME_DARK if dark else THEME_LIGHT
 
 
 # ---------------- 快捷键一览 / 工具提示 ----------------
@@ -1224,6 +1279,206 @@ def add_tip(widget, text):
         return Tooltip(widget, text)
     except Exception:
         return None
+
+
+# ---------------- 数据概览（图表用，Canvas 手绘、零依赖） ----------------
+MEMBER_BUCKETS = ((0, 100, "<100"), (100, 1000, "100–1k"), (1000, 10000, "1k–10k"),
+                  (10000, 100000, "10k–100k"), (100000, 10 ** 12, ">100k"))
+ACTIVE_BUCKETS = ((0, 1, "今天"), (1, 7, "≤7天"), (7, 30, "≤30天"),
+                  (30, 90, "≤90天"), (90, 365, "≤1年"), (365, 10 ** 9, ">1年"))
+CHART_COLORS = ("#3f6fb5", "#4f9d69", "#c8871a", "#a855a8", "#d4574e", "#5aa0b5", "#8a8f98")
+
+
+def histogram(values, buckets):
+    """把数值分桶。返回 ([(标签, 个数)...], 无法判定数)。
+    None（统计未获取 / 不适用）单独计数 —— 和图里的「0 个」不是一回事，不能混。"""
+    counts = [0] * len(buckets)
+    unknown = 0
+    for v in list(values or []):
+        if v is None:
+            unknown += 1
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            unknown += 1
+            continue
+        for i, (lo, hi, _label) in enumerate(buckets):
+            if lo <= fv < hi:
+                counts[i] += 1
+                break
+        else:
+            if buckets and fv >= buckets[-1][1]:
+                counts[-1] += 1
+            else:
+                unknown += 1
+    return [(label, counts[i]) for i, (_lo, _hi, label) in enumerate(buckets)], unknown
+
+
+def dashboard_stats(kind_counts, members, actives, risk_counts):
+    """整理成四张图要用的序列（纯函数：不碰 UI，便于测试）。"""
+    mem, mem_unknown = histogram(members, MEMBER_BUCKETS)
+    act, act_unknown = histogram(actives, ACTIVE_BUCKETS)
+    kinds = [(k, int(v)) for k, v in (kind_counts or []) if int(v or 0) > 0]
+    risks = [(RISK_LABEL.get(c, c), int(v)) for c, v in (risk_counts or []) if int(v or 0) > 0]
+    return {"kinds": kinds, "members": mem, "members_unknown": mem_unknown,
+            "active": act, "active_unknown": act_unknown, "risk": risks}
+
+
+def draw_donut(canvas, items, size=170, colors=CHART_COLORS):
+    """环形图。items = [(标签, 数量)]；空数据画一句提示而不是空白。"""
+    canvas.delete("all")
+    total = sum(n for _l, n in items)
+    if not items or total <= 0:
+        canvas.create_text(size // 2 + 4, size // 2, text="暂无数据", fill="#8a8f98")
+        return
+    pad = 12
+    box = (pad, pad, size - pad, size - pad)
+    start = 90.0
+    for i, (_label, n) in enumerate(items):
+        extent = -360.0 * n / total
+        if abs(extent) < 0.2:
+            extent = -0.2
+        canvas.create_arc(*box, start=start, extent=extent, style="pieslice",
+                          fill=colors[i % len(colors)], outline="")
+        start += extent
+    hole = 46
+    canvas.create_oval(size / 2 - hole, size / 2 - hole, size / 2 + hole, size / 2 + hole,
+                       fill=canvas.cget("bg"), outline="")
+    canvas.create_text(size / 2, size / 2 - 6, text=str(total), fill="#1f2328",
+                       font=("", 13))
+    canvas.create_text(size / 2, size / 2 + 12, text="合计", fill="#8a8f98")
+    for i, (label, n) in enumerate(items):
+        y = pad + 6 + i * 18
+        x = size + 6
+        canvas.create_rectangle(x, y - 4, x + 9, y + 5,
+                                fill=colors[i % len(colors)], outline="")
+        canvas.create_text(x + 15, y, text=f"{label} {n}", anchor="w", fill="#1f2328")
+
+
+def draw_bars(canvas, items, width=300, height=170, color="#3f6fb5"):
+    """竖向柱状图（带横轴标签）。items = [(标签, 数量)]。"""
+    canvas.delete("all")
+    if not items or sum(n for _l, n in items) <= 0:
+        canvas.create_text(width // 2, height // 2, text="暂无数据", fill="#8a8f98")
+        return
+    top, bottom, left, right = 16, height - 30, 30, width - 8
+    peak = max(n for _l, n in items) or 1
+    canvas.create_line(left, bottom, right, bottom, fill="#b4b2a9")
+    slot = (right - left) / max(1, len(items))
+    bar_w = max(6, min(38, slot * 0.6))
+    for i, (label, n) in enumerate(items):
+        cx = left + slot * (i + 0.5)
+        h = (bottom - top) * (n / peak) if peak else 0
+        canvas.create_rectangle(cx - bar_w / 2, bottom - h, cx + bar_w / 2, bottom,
+                                fill=color, outline="")
+        canvas.create_text(cx, bottom - h - 8, text=str(n), fill="#1f2328")
+        canvas.create_text(cx, bottom + 13, text=label, fill="#5f6368")
+
+
+# ---------------- 会话快照与对比 ----------------
+SNAPSHOT_FILE_NAME = "tg_snapshot_%s.json"
+
+
+def snapshot_row(ent, iid_meta=None):
+    """把一个会话压成快照里的一行（只存能长期对比的字段）。"""
+    meta = iid_meta or {}
+    return {
+        "name": str(meta.get("name") or ""),
+        "kind": session_kind(ent),
+        "members": meta.get("members"),
+        "posts": meta.get("posts"),
+        "active": meta.get("active"),
+        "risk": list(meta.get("risk") or []),
+    }
+
+
+def diff_snapshots(old, new):
+    """对比两次快照。old/new = {频道id(str): 行}，返回各类差异（纯函数）。"""
+    old = dict(old or {})
+    new = dict(new or {})
+    added = sorted(set(new) - set(old))
+    removed = sorted(set(old) - set(new))
+    renamed, member_changed, risk_added = [], [], []
+    for cid in sorted(set(old) & set(new)):
+        o, n = old[cid] or {}, new[cid] or {}
+        if (o.get("name") or "") != (n.get("name") or ""):
+            renamed.append((cid, o.get("name"), n.get("name")))
+        om, nm = o.get("members"), n.get("members")
+        if om is not None and nm is not None and int(nm) != int(om):
+            member_changed.append((cid, int(om), int(nm)))
+        new_risk = set(n.get("risk") or ()) - set(o.get("risk") or ())
+        if new_risk:
+            risk_added.append((cid, sorted(new_risk)))
+    return {"added": added, "removed": removed, "renamed": renamed,
+            "members": member_changed, "risk_added": risk_added,
+            "old_count": len(old), "new_count": len(new)}
+
+
+# ---------------- 登录设备（自己的账号） ----------------
+def authorization_row(a):
+    """account.getAuthorizations 的一条 → 展示用字典。"""
+    def fmt(dt):
+        try:
+            return dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
+        except Exception:
+            return "—"
+    model = str(getattr(a, "device_model", "") or "").strip()
+    system = " ".join(str(x) for x in (getattr(a, "system_version", ""),
+                                       getattr(a, "platform", "")) if x).strip()
+    app = " ".join(str(x) for x in (getattr(a, "app_name", ""),
+                                    getattr(a, "app_version", "")) if x).strip()
+    return {
+        "hash": getattr(a, "hash", None),
+        "current": bool(getattr(a, "current", False)),
+        "device": (model or app or "未知设备") + ("（本机）" if getattr(a, "current", False) else ""),
+        "system": system or app or "—",
+        "ip": str(getattr(a, "ip", "") or "—"),
+        "country": str(getattr(a, "country", "") or "—"),
+        "created": fmt(getattr(a, "date_created", None)),
+        "active": fmt(getattr(a, "date_active", None)),
+        "official": bool(getattr(a, "official_app", False)),
+        "password_pending": bool(getattr(a, "password_pending", False)),
+    }
+
+
+# ---------------- 静音 / 归档（不退出，先让它们安静） ----------------
+def mute_until_forever():
+    """Telegram 的「永久静音」= mute_until 设到很远（这里用 2038 年，32 位时间戳边界）。"""
+    return datetime.datetime(2038, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def unmute_value():
+    return datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+async def set_mute(client, ent, mute=True):
+    """静音 / 取消静音一个会话。返回 (是否成功, 说明)。"""
+    settings = tl_types.PeerNotifySettings(
+        mute_until=mute_until_forever() if mute else unmute_value())
+    await client(tl_account.UpdateNotifySettingsRequest(
+        peer=tl_types.InputNotifyPeer(peer=ent), settings=settings))
+    return True, "已静音" if mute else "已取消静音"
+
+
+async def set_archive(client, ent, archive=True):
+    """归档 / 移出归档（folder_id=1 是归档）。"""
+    await client(tl_folders.EditPeerFoldersRequest([
+        tl_types.InputFolderPeer(peer=ent, folder_id=1 if archive else 0)]))
+    return True, "已归档" if archive else "已移出归档"
+
+
+def fmt_duration(seconds):
+    """把秒数说成人话（进度条上的 ETA 用）。"""
+    try:
+        sec = int(max(0, round(float(seconds))))
+    except (TypeError, ValueError):
+        return "—"
+    if sec < 60:
+        return f"{sec} 秒"
+    if sec < 3600:
+        return f"{sec // 60} 分 {sec % 60} 秒"
+    return f"{sec // 3600} 小时 {(sec % 3600) // 60} 分"
 
 
 # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
@@ -1750,11 +2005,15 @@ class App:
         self._log_records = []      # 日志完整记录 [(级别, 文案)]：过滤/搜索只改显示，不改已写下的事实
         self._log_levels = {LOG_INFO: True, LOG_WARN: True, LOG_ERROR: True}
         self._log_level_vars = {}
+        self._striped = set()       # 当前带斑马纹背景的行（按可见顺序算）
         self._log_query = ""        # 日志面板里只显示包含这个子串的行
         self._history = None        # 退出历史（按账号懒加载）
         self._history_key = None
         self._guide = None          # 未加载 / 未连接时的引导卡片
         self._tips = []             # 工具提示（持有引用，别让 GC 收掉）
+        self._dash = None           # 数据概览窗口（单例）
+        self._dash_canvas = {}      # 概览里的画布
+        self._auths = []            # 最近一次拉到的登录设备（按账号）
         self._task_start = None     # 当前阶段任务开始时间（用于显示耗时）
         self._progress_running = False
         self._left_visible = True
@@ -2160,6 +2419,7 @@ class App:
         self._tab_account(nb)
         self._tab_network(nb)
         self._tab_stats(nb)
+        self._tab_devices(nb)
         self._tab_leave(nb)
         self._tab_appearance(nb)
 
@@ -2354,6 +2614,124 @@ class App:
                           "并发越大越快、也越容易触发限流；命中缓存则完全不发请求。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+
+    def _tab_devices(self, nb):
+        """登录设备管理：只看自己的账号，能踢掉其它设备（改密码后忘了退的旧设备最常见）。"""
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text="设备")
+        f.grid_columnconfigure(0, weight=1)
+        ttk.Label(f, text="当前账号的登录设备（本机那条不会被踢）",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
+        self.dev_tree = ttk.Treeview(f, columns=("device", "system", "ip", "active"),
+                                     show="headings", height=8, selectmode="extended")
+        for c, t, w in (("device", "设备", 120), ("system", "系统", 60),
+                        ("ip", "IP", 90), ("active", "最近活跃", 96)):
+            self.dev_tree.heading(c, text=t)
+            self.dev_tree.column(c, width=w, anchor="w")
+        self.dev_tree.grid(row=1, column=0, sticky="ew")
+        row = ttk.Frame(f)
+        row.grid(row=2, column=0, sticky="ew", pady=(6, 2))
+        self.btn_dev_refresh = ttk.Button(row, text="刷新设备", command=self.on_refresh_devices)
+        self.btn_dev_refresh.pack(side="left", padx=2)
+        self.btn_dev_kill = ttk.Button(row, text="踢出选中", command=self.on_kill_devices)
+        self.btn_dev_kill.pack(side="left", padx=2)
+        ttk.Button(row, text="踢出其它全部", command=self.on_kill_others).pack(side="left", padx=2)
+        self.lbl_dev_info = ttk.Label(f, text="", foreground="#6b7280",
+                                      wraplength=290, justify="left")
+        self.lbl_dev_info.grid(row=3, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(f, text="提示：踢设备只影响登录态，不会删消息；被踢的设备需要重新登录。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=4, column=0, sticky="w", pady=(6, 2))
+
+    # ---------------- 登录设备管理 ----------------
+    def on_refresh_devices(self):
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接账号。")
+            return
+        self.run_async(self._refresh_devices())
+
+    async def _refresh_devices(self):
+        try:
+            res = await self.client(tl_account.GetAuthorizationsRequest())
+        except FloodWaitError as e:
+            self.log_msg(f"⏳ 拉取设备被限流，等 {getattr(e, 'seconds', '?')} 秒后再试。")
+            return
+        except Exception as e:      # noqa: BLE001
+            self.log_msg(f"❌ 拉取登录设备失败: {e}")
+            return
+        rows = [authorization_row(a) for a in (getattr(res, "authorizations", None) or [])]
+        rows.sort(key=lambda r: (not r["current"], r.get("active") or ""))
+        self._auths = rows
+        try:
+            for iid in self.dev_tree.get_children():
+                self.dev_tree.delete(iid)
+            for r in rows:
+                self.dev_tree.insert("", "end", iid=str(r["hash"]), values=(
+                    r["device"], r["system"], r["ip"], r["active"]))
+            self.lbl_dev_info.configure(text=f"共 {len(rows)} 个设备会话（含本机）")
+        except Exception:
+            pass
+        self.log_msg(f"📱 登录设备：共 {len(rows)} 个"
+                     f"（本机 1 个，其它 {max(0, len(rows) - 1)} 个）")
+        for r in rows[:12]:
+            tag = "（本机）" if r["current"] else ""
+            self.log_msg(f"   · {r['device']}{tag} {r['system']} | {r['ip']} "
+                         f"{r['country']} | 最近活跃 {r['active']}")
+
+    def _device_targets(self, only_others=False):
+        rows = list(getattr(self, "_auths", []) or [])
+        if only_others:
+            return [r for r in rows if not r["current"]]
+        try:
+            sel = {str(x) for x in self.dev_tree.selection()}
+        except Exception:
+            sel = set()
+        return [r for r in rows if str(r["hash"]) in sel and not r["current"]]
+
+    def on_kill_devices(self):
+        self._kill_devices_ui(self._device_targets(False), "选中的")
+
+    def on_kill_others(self):
+        self._kill_devices_ui(self._device_targets(True), "其它全部")
+
+    def _kill_devices_ui(self, targets, label):
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接账号。")
+            return
+        if not targets:
+            messagebox.showinfo("提示", f"没有可踢出的设备（{label}）。先点「刷新设备」；"
+                                        "本机那条永远不会被踢。")
+            return
+        preview = "\n".join(f"· {t['device']} {t['system']} {t['ip']} {t['active']}"
+                            for t in targets[:10])
+        more = f"\n…另有 {len(targets) - 10} 个" if len(targets) > 10 else ""
+        if not messagebox.askyesno("踢出登录设备",
+                                   f"要踢出这 {len(targets)} 个设备吗（{label}）？\n\n"
+                                   f"{preview}{more}\n\n"
+                                   "被踢的设备需要重新登录；本机的会话不受影响。"):
+            return
+        self.run_async(self._kill_devices(targets))
+
+    async def _kill_devices(self, targets):
+        self.root.after(0, lambda n=len(targets): self.start_task(f"正在踢出 {n} 个设备…"))
+        ok = fail = 0
+        for idx, t in enumerate(targets, 1):
+            self.root.after(0, lambda i=idx, n=len(targets): self.set_progress(
+                i - 1, n, f"正在踢出 {i}/{n}"))
+            try:
+                await self.client(tl_account.ResetAuthorizationRequest(hash=t["hash"]))
+                ok += 1
+                self.log_msg(f"🚪 已踢出: {t['device']}（{t['ip']} {t['active']}）")
+            except Exception as e:      # noqa: BLE001
+                fail += 1
+                self.log_msg(f"❌ 踢出失败: {t['device']} → {e}")
+            await asyncio.sleep(max(1.0, self._interval()))
+        self.log_msg(f"🏁 踢设备完成：成功 {ok} 个，失败 {fail} 个。")
+        self.root.after(0, lambda o=ok, f=fail: self.finish_task(
+            f"踢设备完成：成功 {o} 个，失败 {f} 个"))
+        self._auths = [r for r in getattr(self, "_auths", []) if r not in targets]
+        self.root.after(0, self.on_refresh_devices)
 
     def _tab_leave(self, nb):
         f = ttk.Frame(nb, padding=10)
@@ -2561,6 +2939,15 @@ class App:
         self._history_menu.add_command(label="清空历史…", command=self.on_clear_history)
         self.btn_history["menu"] = self._history_menu
         self.btn_history.pack(side="left", padx=3)
+        ttk.Button(frm_sel, text="📊 概览", command=self.on_show_dashboard).pack(
+            side="left", padx=3)
+        # 批量任务：中断续跑（进度每完成一个就落盘）
+        self.btn_task = ttk.Menubutton(frm_sel, text="⏯ 任务 ▾")
+        self._task_menu = tk.Menu(self.btn_task, tearoff=0)
+        self._task_menu.add_command(label="继续上次未完成的…", command=self.on_resume_task)
+        self._task_menu.add_command(label="清除任务进度记录", command=self.on_discard_task)
+        self.btn_task["menu"] = self._task_menu
+        self.btn_task.pack(side="left", padx=3)
         # 分组操作：对一批行批量加入 / 移出分组（只改归属，不退出也不删除）
         self.btn_folder = ttk.Menubutton(frm_sel, text="📁 分组 ▾")
         # postcommand：菜单弹出前重算（勾选数 / 筛选结果数会一直变，静态菜单会显示旧数字）
@@ -2579,6 +2966,9 @@ class App:
         self._export_menu.add_command(label="导出当前显示的行", command=lambda: self.on_export("visible"))
         self._export_menu.add_command(label="导出全部（含被筛选隐藏）", command=lambda: self.on_export("all"))
         self._export_menu.add_command(label="仅导出已勾选", command=lambda: self.on_export("checked"))
+        self._export_menu.add_separator()
+        self._export_menu.add_command(label="导出快照 JSON（供以后对比）", command=self.on_export_snapshot)
+        self._export_menu.add_command(label="与上次快照对比…", command=self.on_compare_snapshot)
         self.btn_export["menu"] = self._export_menu
         self.btn_export.pack(side="left", padx=3)
         self.lbl_count = ttk.Label(frm_sel, text="共 0 个，已选 0 个")
@@ -2604,6 +2994,20 @@ class App:
             command=lambda: self.on_destroy_created(KIND_GROUP))
         self.btn_destroy["menu"] = self._destroy_menu
         self.btn_destroy.pack(side="left", padx=3)
+        # 静音 / 归档：给「太吵但不想退」一个中间选项（都可逆，不改变列表）
+        self.btn_more = ttk.Menubutton(frm_act, text="🔕 更多 ▾")
+        self._more_menu = tk.Menu(self.btn_more, tearoff=0)
+        self._more_menu.add_command(label="静音选中（不退出）",
+                                    command=lambda: self.on_mute_archive("mute", True))
+        self._more_menu.add_command(label="取消静音选中",
+                                    command=lambda: self.on_mute_archive("mute", False))
+        self._more_menu.add_separator()
+        self._more_menu.add_command(label="归档选中（移出主列表）",
+                                    command=lambda: self.on_mute_archive("archive", True))
+        self._more_menu.add_command(label="移出归档选中",
+                                    command=lambda: self.on_mute_archive("archive", False))
+        self.btn_more["menu"] = self._more_menu
+        self.btn_more.pack(side="left", padx=3)
         self.lbl_pending = ttk.Label(frm_act, text="待退出 0 个")
         self.lbl_pending.pack(side="left", padx=8)
         ttk.Label(frm_act, text="退出间隔(秒):").pack(side="left", padx=(10, 2))
@@ -2664,6 +3068,10 @@ class App:
             ("btn_risk", "按服务端标记筛选：违规受限 / 已封禁 / 不可访问 / 诈骗 / 假冒 / 禁言 / 已注销"),
             ("btn_folder", "把勾选（或筛选结果 / 全部）的会话批量加入或移出某个分组"),
             ("btn_history", "退出历史：退出是不可逆的，这里可以看记录并把公开频道重新加回来"),
+            ("btn_task", "批量任务进度：中断 / 关窗口后可以接着跑（每完成一个就记一次）"),
+            ("btn_more", "静音 / 归档：给「太吵但不想退」的会话一个可逆的中间选项"),
+            ("btn_dev_refresh", "拉取当前账号的登录设备列表（只读）"),
+            ("btn_dev_kill", "踢出选中的设备（本机那条永远不会被踢）"),
             ("btn_export", "导出 CSV：当前显示 / 全部 / 仅已勾选（含异常特征列）"),
             ("btn_leave", "退出频道 / 群组；私聊与机器人会被删除会话。删完都会回头向服务端复核"),
             ("btn_destroy", "删除【你本人创建】的频道 / 群组（对所有成员消失，不可恢复）"),
@@ -2726,7 +3134,8 @@ class App:
         self.log.pack(fill="both", expand=True, pady=(3, 0))
         for lv, _label in LOG_LEVEL_META:
             try:
-                self.log.tag_configure(lv, foreground=LOG_LEVEL_COLOR.get(lv, "#1f2328"))
+                self.log.tag_configure(
+                    lv, foreground=LOG_LEVEL_COLOR_OF(theme_palette(getattr(self, "_dark", False)), lv))
             except Exception:
                 pass
 
@@ -2852,6 +3261,8 @@ class App:
         self.root.bind("<Control-G>", self._on_folder_bulk_key)
         self.root.bind("<F5>", self._on_refresh_key)
         self.root.bind("<F1>", self._on_shortcuts_key)
+        self.root.bind("<Control-d>", self._on_dashboard_key)
+        self.root.bind("<Control-D>", self._on_dashboard_key)
         self.root.bind("<Control-h>", self._on_history_key)
         self.root.bind("<Control-H>", self._on_history_key)
         self.root.bind("<Control-l>", self._on_clear_log_key)
@@ -2862,6 +3273,11 @@ class App:
 
     def _on_shortcuts_key(self, event=None):
         self.on_show_shortcuts()
+        return "break"
+
+    def _on_dashboard_key(self, event=None):
+        """Ctrl+D：数据概览（图表）。"""
+        self.on_show_dashboard()
         return "break"
 
     def _on_history_key(self, event=None):
@@ -3127,47 +3543,136 @@ class App:
         self.save_config()
 
     def _apply_theme(self, dark=None):
-        """浅色保持系统原生主题；深色切到 clam 并统一配色（ttk 只有 clam 系列支持改底色）。"""
+        """浅色保持系统原生主题；深色切到 clam 并统一配色（ttk 只有 clam 系列支持改底色）。
+
+        除了 ttk 样式，还要一起处理三处「自己画的颜色」：
+          1) Treeview 的行 tag（斑马纹 / 白名单 / 创建者 / 异常分级）；
+          2) 日志 Text（独立控件，不跟 ttk 主题）；
+          3) 那些创建时写死了浅色灰的说明标签 —— 深色下它们会糊成一片看不清。
+        做法是**遍历控件树**按「原色属于浅色灰」找出这些标签再统一上色，
+        不要求每个创建点都记得登记。"""
         if dark is None:
             dark = bool(getattr(self, "_dark", False))
         self._dark = bool(dark)
+        pal = theme_palette(self._dark)
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam" if self._dark else self._default_theme)
         except Exception:
             pass
-        if self._dark:
-            bg, panel, fg, field, sel = "#1f2125", "#26282d", "#e8eaed", "#2c2f35", "#3a4450"
-            head, sub = "#2f3238", "#9aa0a6"
-        else:
-            bg, panel, fg, field, sel = "#f5f6f7", "#ffffff", "#1f2328", "#ffffff", "#cfe3ff"
-            head, sub = "#eaeef2", "#6b7280"
         try:
-            style.configure(".", background=bg, foreground=fg, fieldbackground=field)
-            style.configure("TFrame", background=bg)
-            style.configure("TLabelframe", background=bg, bordercolor=head)
-            style.configure("TLabelframe.Label", background=bg, foreground=fg)
-            style.configure("TLabel", background=bg, foreground=fg)
+            style.configure(".", background=pal["bg"], foreground=pal["fg"],
+                            fieldbackground=pal["field"])
+            style.configure("TFrame", background=pal["bg"])
+            style.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"])
+            style.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"])
+            style.configure("TLabel", background=pal["bg"], foreground=pal["fg"])
             style.configure("TButton", padding=(6, 3))
-            style.configure("TCheckbutton", background=bg, foreground=fg)
-            style.configure("TNotebook", background=bg, borderwidth=0)
-            style.configure("TNotebook.Tab", padding=(10, 4))
-            style.configure("TEntry", fieldbackground=field, foreground=fg)
-            style.configure("TCombobox", fieldbackground=field, foreground=fg)
-            style.configure("TSpinbox", fieldbackground=field, foreground=fg)
-            style.configure("Treeview", background=panel, fieldbackground=panel, foreground=fg, rowheight=22)
-            style.map("Treeview", background=[("selected", sel)], foreground=[("selected", fg)])
-            style.configure("Treeview.Heading", background=head, foreground=fg)
-            style.configure("Horizontal.TProgressbar", background="#3f6fb5")
-            self.root.configure(bg=bg)
+            style.map("TButton", foreground=[("disabled", pal["sub"])])
+            style.configure("TCheckbutton", background=pal["bg"], foreground=pal["fg"])
+            style.configure("TRadiobutton", background=pal["bg"], foreground=pal["fg"])
+            style.configure("TNotebook", background=pal["bg"], borderwidth=0)
+            style.configure("TNotebook.Tab", padding=(10, 4), background=pal["head"],
+                            foreground=pal["fg"])
+            style.configure("TEntry", fieldbackground=pal["field"], foreground=pal["fg"])
+            style.configure("TCombobox", fieldbackground=pal["field"], foreground=pal["fg"])
+            style.configure("TSpinbox", fieldbackground=pal["field"], foreground=pal["fg"])
+            style.configure("TSeparator", background=pal["border"])
+            style.configure("Treeview", background=pal["panel"], fieldbackground=pal["panel"],
+                            foreground=pal["fg"], rowheight=24, bordercolor=pal["border"])
+            style.map("Treeview", background=[("selected", pal["sel"])],
+                      foreground=[("selected", pal["fg"])])
+            style.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"])
+            style.configure("Horizontal.TProgressbar", background=pal["accent"])
+            self.root.configure(bg=pal["bg"])
         except Exception:
             pass
         try:
-            self.log.configure(bg="#17191c" if self._dark else "#ffffff",
-                               fg=fg if self._dark else "#1f2328",
-                               insertbackground=fg)
+            self.log.configure(bg=pal["log_bg"], fg=pal["log_fg"], insertbackground=pal["fg"])
+            for lv, _label in LOG_LEVEL_META:
+                self.log.tag_configure(lv, foreground=LOG_LEVEL_COLOR_OF(pal, lv))
         except Exception:
             pass
+        self._configure_tree_tags(pal)
+        self._recolor_muted_labels(pal)
+
+    def _configure_tree_tags(self, pal):
+        """行 tag 的配色。斑马纹只给背景，异常 / 保护只给前景 —— 两组不打架。"""
+        try:
+            self.tree.tag_configure("stripe", background=pal["stripe"])
+            self.tree.tag_configure("wl", foreground=pal["wl"])
+            self.tree.tag_configure("unleaveable", foreground=pal["danger"])
+            self.tree.tag_configure("risk_hi", foreground=pal["risk_hi"])
+            self.tree.tag_configure("risk_mid", foreground=pal["risk_mid"])
+            self.tree.tag_configure("risk_lo", foreground=pal["risk_lo"])
+        except Exception:
+            pass
+
+    def _recolor_muted_labels(self, pal):
+        """把「创建时写死浅色灰」的说明标签切成当前主题的次要色。"""
+        found = []
+        try:
+            stack = [self.root]
+            while stack:
+                w = stack.pop()
+                try:
+                    stack.extend(w.winfo_children())
+                except Exception:
+                    continue
+                try:
+                    if isinstance(w, (ttk.Label, tk.Label)):
+                        cur = str(w.cget("foreground") or "")
+                        if cur in MUTED_LIGHT or getattr(w, "_tg_muted", False):
+                            w._tg_muted = True
+                            found.append(w)
+                except Exception:
+                    continue
+        except Exception:
+            return
+        for w in found:
+            try:
+                w.configure(foreground=pal["sub"])
+            except Exception:
+                continue
+
+    def _row_tags(self, iid):
+        """一行的 tag 组合：斑马纹（背景）+ 保护 / 异常分级（前景）。"""
+        tags = []
+        if iid in getattr(self, "_striped", ()):  # type: ignore[arg-type]
+            tags.append("stripe")
+        try:
+            reason = self.protected_reason(iid)
+        except Exception:
+            reason = None
+        if reason == "白名单":
+            tags.append("wl")
+        elif reason:
+            tags.append("unleaveable")
+        codes = (getattr(self, "_risk", None) or {}).get(iid, ())
+        if codes:
+            if codes[0] in (RISK_FORBIDDEN, RISK_RESTRICTED, RISK_SCAM, RISK_FAKE):
+                tags.append("risk_hi")
+            elif codes[0] in (RISK_BANNED, RISK_NOJOIN, RISK_NEEDJOIN):
+                tags.append("risk_mid")
+            else:
+                tags.append("risk_lo")
+        return tuple(tags)
+
+    def _set_row_tags(self, iid):
+        try:
+            self.tree.item(iid, tags=self._row_tags(iid))
+        except Exception:
+            pass
+
+    def _restripe(self):
+        """重算斑马纹（按当前**可见顺序**）。行增删 / 排序 / 筛选后都要重算。"""
+        try:
+            rows = list(self.tree.get_children())
+        except Exception:
+            return
+        self._striped = {iid for idx, iid in enumerate(rows) if idx % 2 == 1}
+        for iid in rows:
+            self._set_row_tags(iid)
 
     def on_show_shortcuts(self):
         """F1：快捷键面板（顺带把「三个概念」的颜色约定写进去）。"""
@@ -3629,6 +4134,15 @@ class App:
                 time.sleep(0.02)
 
     def run_async(self, coro):
+        if self.loop is None:
+            # 后台循环还没起来（窗口刚建 / 循环线程挂了）：明确说一句，
+            # 别抛 AttributeError，也别把协程丢在那儿等 GC 报「never awaited」。
+            self.log_msg("⚠️ 后台事件循环还没就绪，这个任务没有执行；稍后重试即可。")
+            try:
+                coro.close()
+            except Exception:
+                pass
+            return None
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     # ---------------- 连接 / 登录 ----------------
@@ -4333,6 +4847,9 @@ class App:
         _guide = getattr(self, "_update_guide", None)   # 测试桩 App 没有这个方法，别把它带崩
         if callable(_guide):
             _guide()                                  # 有行了就把引导卡片收起来
+        _restripe = getattr(self, "_restripe", None)
+        if callable(_restripe):
+            _restripe()
         if self._filter_active:
             self.apply_filter(verbose=False)      # 新行按当前筛选条件决定是否显示
         else:
@@ -4354,6 +4871,16 @@ class App:
         _quota = getattr(self, "log_quota", None)   # 测试桩 App 没有这个方法
         if callable(_quota):
             _quota()              # 名额（频道 + 群组）—— 这个工具就是为它而生的
+        _pending = getattr(self, "pending_task", None)
+        if callable(_pending):
+            try:
+                ctx = _pending()
+            except Exception:
+                ctx = None
+            if ctx:
+                self.log_msg(f"⏯ 上次的「{ctx.get('action', '')}」任务没跑完"
+                             f"（完成 {len(ctx.get('done') or [])}/{len(ctx.get('ids') or [])}）—— "
+                             "点「⏯ 任务 ▾ → 继续上次未完成的」可把剩下的勾出来。")
         # 异常特征统计（零请求：都用会话列表里已给的字段）。
         # 用 getattr 兜一层：测试桩 App 只实现自己关心的那部分接口，
         # 一个统计日志不该把整套加载流程带崩。
@@ -4434,15 +4961,7 @@ class App:
                 self.tree.set(iid, "safe", txt)
         except Exception:
             pass
-        try:
-            if reason == "白名单":
-                self.tree.item(iid, tags=("wl",))
-            elif reason:
-                self.tree.item(iid, tags=("unleaveable",))
-            else:
-                self.tree.item(iid, tags=())
-        except Exception:
-            pass
+        self._set_row_tags(iid)      # 斑马纹 / 保护 / 异常分级一起算，别互相覆盖
 
     def _refresh_all_safe_cells(self):
         for iid in list(self.channels):
@@ -4469,6 +4988,7 @@ class App:
                               risk_cell_text(ent) if ent is not None else "")
         except Exception:
             pass
+        self._set_row_tags(iid)
 
     def _refresh_all_risk_cells(self):
         for iid in list(self.channels):
@@ -5781,6 +6301,7 @@ class App:
 
         # 筛选后重新套用当前排序，保证列头箭头与实际顺序一致（新恢复的行落到正确位置）
         self._apply_sort()
+        self._restripe()             # 可见顺序变了，斑马纹要跟着重算
 
         self.update_count()
         if verbose:
@@ -6160,6 +6681,308 @@ class App:
             self.log_msg(f"📋 已复制 {len(targets)} 条重新加入链接到剪贴板。")
         except Exception as e:
             self.log_msg(f"⚠️ 复制链接失败: {e}")
+
+    # ---------------- 批量任务：进度落盘 / 续跑 / ETA ----------------
+    def task_path(self):
+        key = self._current_key or DEFAULT_ACCOUNT_KEY
+        return os.path.join(BASE_DIR, TASK_FILE_NAME % key)
+
+    def load_task(self):
+        try:
+            with open(self.task_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except FileNotFoundError:
+            return None
+        except Exception as e:      # noqa: BLE001
+            self.log_msg(f"⚠️ 任务进度文件读取失败（忽略这次记录）: {e}")
+            return None
+
+    def save_task(self, ctx):
+        try:
+            with open(self.task_path(), "w", encoding="utf-8") as f:
+                json.dump(ctx, f, ensure_ascii=False)
+        except Exception:
+            pass            # 进度记不下不该影响正在跑的任务
+
+    def clear_task(self):
+        try:
+            os.remove(self.task_path())
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def pending_task(self):
+        """上次没跑完的任务（还剩几个）。没有就返回 None。"""
+        ctx = self.load_task()
+        if not ctx or ctx.get("finished"):
+            return None
+        done = set(str(x) for x in (ctx.get("done") or []))
+        ids = [str(x) for x in (ctx.get("ids") or [])]
+        remaining = [cid for cid in ids if cid not in done]
+        if not remaining:
+            return None
+        ctx["remaining"] = remaining
+        return ctx
+
+    def _new_task_ctx(self, action, sel):
+        """开跑前先把「要处理哪些」写盘 —— 中途被打断时才知道还剩谁。"""
+        ctx = {"action": action, "started": time.time(), "finished": False,
+               "ids": [str(self._cid_of(iid)) for iid in sel], "done": []}
+        self.save_task(ctx)
+        return ctx
+
+    def on_resume_task(self):
+        """继续上次没跑完的批量任务：**只把剩下的行勾上并提示**，不替用户直接开跑。"""
+        ctx = self.pending_task()
+        if not ctx:
+            messagebox.showinfo("提示", "没有未完成的批量任务。")
+            return
+        want = set(ctx["remaining"])
+        hit = [iid for iid in list(self.channels) if str(self._cid_of(iid)) in want]
+        if not hit:
+            self.log_msg(f"ℹ️ 上次的「{ctx.get('action', '')}」任务里，剩余 {len(want)} 个会话"
+                         "已经不在当前列表里（可能已处理或刷新掉了），记录已清除。")
+            self.clear_task()
+            return
+        visible = set(self._visible_ids())
+        for iid in hit:
+            try:
+                self.tree.set(iid, "sel", "☑")
+            except Exception:
+                continue
+            if iid in visible:
+                self._sel_hidden.discard(iid)
+            else:
+                self._sel_hidden.add(iid)    # 被筛选藏着的也如实标出来
+        self.update_count()
+        self.log_msg(f"⏯ 已勾选上次未完成的 {len(hit)} 个"
+                     f"（共 {len(ctx.get('ids') or [])} 个，已完成 "
+                     f"{len(ctx.get('done') or [])} 个）。点「🚪 退出 / 删除选中」继续。")
+
+    def on_discard_task(self):
+        if not self.load_task():
+            self.log_msg("ℹ️ 没有任务进度记录可清。")
+            return
+        self.clear_task()
+        self.log_msg("⏯ 已清除上次的任务进度记录。")
+
+    def _eta_text(self, started, done, total):
+        """进度条上的「剩余约 N · 速率」——让人知道还要等多久。"""
+        try:
+            elapsed = max(0.001, time.time() - started)
+        except Exception:
+            return ""
+        if not done or not total or done >= total:
+            return ""
+        rate = done / elapsed
+        if rate <= 0:
+            return ""
+        return f" · 剩余约 {fmt_duration((total - done) / rate)} · {rate:.1f} 个/秒"
+
+    # ---------------- 数据概览（图表） ----------------
+    def dashboard_data(self):
+        """当前列表的统计：类型分布 / 用户数量级 / 活跃度 / 异常类别。零请求。"""
+        kinds = []
+        try:
+            counts = self._count_kinds(list(self.channels.keys()))
+            kinds = [(k, counts.get(k, 0)) for k in TYPE_CHOICES if k != "全部"]
+        except Exception:
+            kinds = []
+        members, actives = [], []
+        for iid in list(self.channels):
+            try:
+                if is_member_kind(self._type_of(iid)):
+                    members.append(self._stat_num(iid, "members"))
+            except Exception:
+                members.append(None)
+            try:
+                actives.append(self._active_num(iid))
+            except Exception:
+                actives.append(None)
+        try:
+            rc = self._risk_counts()
+        except Exception:
+            rc = {}
+        return dashboard_stats(kinds, members, actives, [(c, rc.get(c, 0)) for c in RISK_CODES])
+
+    def on_show_dashboard(self):
+        """📊 数据概览：四张手绘图表（Canvas，零依赖、零请求）。"""
+        if getattr(self, "_dash", None) is not None:
+            try:
+                self._dash.lift()
+                self._render_dashboard()
+                return
+            except Exception:
+                self._dash = None
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"数据概览 — {APP_NAME}")
+        dlg.transient(self.root)
+        try:
+            dlg.geometry("780x560")
+        except Exception:
+            pass
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill="both", expand=True)
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        ttk.Label(head, text="数据概览（全部来自当前列表，零请求）").pack(side="left")
+        ttk.Button(head, text="刷新", command=self._render_dashboard).pack(side="right")
+        grid = ttk.Frame(body)
+        grid.pack(fill="both", expand=True, pady=(10, 0))
+        pal = theme_palette(getattr(self, "_dark", False))
+        self._dash_canvas = {}
+        specs = (("kinds", "类型分布"), ("members", "用户数量级"),
+                 ("active", "活跃度（最近消息）"), ("risk", "异常特征"))
+        for i, (key, title) in enumerate(specs):
+            cell = ttk.LabelFrame(grid, text=title, padding=6)
+            cell.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6)
+            grid.grid_columnconfigure(i % 2, weight=1)
+            grid.grid_rowconfigure(i // 2, weight=1)
+            cv = tk.Canvas(cell, width=500, height=180, highlightthickness=0, bg=pal["panel"])
+            cv.pack(fill="both", expand=True)
+            self._dash_canvas[key] = cv
+        self._dash = dlg
+
+        def _close():
+            self._dash = None
+            self._dash_canvas = {}
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        self._render_dashboard()
+
+    def _render_dashboard(self):
+        cvs = getattr(self, "_dash_canvas", None) or {}
+        if not cvs:
+            return
+        data = self.dashboard_data()
+        try:
+            draw_donut(cvs["kinds"], data["kinds"])
+        except Exception:
+            pass
+        for key in ("members", "active", "risk"):
+            try:
+                draw_bars(cvs[key], data[key])
+            except Exception:
+                pass
+        self.log_msg("📊 数据概览：" + "；".join(
+            f"{name} " + "、".join(f"{l} {n}" for l, n in data[key] if n)
+            for name, key in (("类型", "kinds"), ("用户数量级", "members"),
+                              ("活跃度", "active"), ("异常", "risk"))) or "无数据")
+        if data["members_unknown"]:
+            self.log_msg(f"   · 其中 {data['members_unknown']} 个会话的用户数还没获取"
+                         "（点「获取 / 更新统计」后图表才完整）。")
+
+    # ---------------- 会话快照与对比 ----------------
+    def snapshot_path(self):
+        key = self._current_key or DEFAULT_ACCOUNT_KEY
+        return os.path.join(BASE_DIR, SNAPSHOT_FILE_NAME % key)
+
+    def _snapshot_now(self):
+        out = {}
+        for iid in list(self.channels):
+            ent = self.channels.get(iid)
+            meta = {}
+            try:
+                meta = {"name": self.tree.set(iid, "name"),
+                        "members": self._stat_num(iid, "members"),
+                        "posts": self._stat_num(iid, "posts"),
+                        "active": self._active_num(iid),
+                        "risk": list(self._risk.get(iid, ()))}
+            except Exception:
+                meta = {}
+            try:
+                out[str(self._cid_of(iid))] = snapshot_row(ent, meta)
+            except Exception:
+                continue
+        return out
+
+    def on_export_snapshot(self):
+        """导出快照 JSON —— 以后可以拿它和未来的列表对比（谁被删了 / 谁改了名）。"""
+        if not self.channels:
+            messagebox.showinfo("提示", "列表是空的，先刷新列表。")
+            return
+        data = self._snapshot_now()
+        payload = {"ts": time.time(), "version": APP_VERSION, "items": data}
+        try:
+            with open(self.snapshot_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=1)
+        except Exception as e:      # noqa: BLE001
+            messagebox.showerror("导出失败", str(e))
+            return
+        self.log_msg(f"📸 已导出快照 {len(data)} 条 → {os.path.basename(self.snapshot_path())}"
+                     "（以后点「与上次快照对比」即可看变化）")
+
+    def on_compare_snapshot(self):
+        try:
+            with open(self.snapshot_path(), encoding="utf-8") as f:
+                old = json.load(f)
+        except FileNotFoundError:
+            messagebox.showinfo("提示", "还没有快照。先点「导出快照 JSON」存一份，之后再对比。")
+            return
+        except Exception as e:      # noqa: BLE001
+            messagebox.showerror("读取失败", str(e))
+            return
+        if not self.channels:
+            messagebox.showinfo("提示", "列表是空的，先刷新列表再对比。")
+            return
+        old_items = (old or {}).get("items") or {}
+        new_items = self._snapshot_now()
+        d = diff_snapshots(old_items, new_items)
+        when = time.strftime("%m-%d %H:%M", time.localtime((old or {}).get("ts") or 0))
+        self.log_msg(f"📊 与上次快照（{when}，{d['old_count']} 条）对比：现在 {d['new_count']} 条 —— "
+                     f"新增 {len(d['added'])} / 消失 {len(d['removed'])} / 改名 {len(d['renamed'])} / "
+                     f"用户数变化 {len(d['members'])} / 新增异常 {len(d['risk_added'])}")
+        for title, rows in (("新增", d["added"]), ("消失", d["removed"])):
+            for cid in rows[:10]:
+                src = new_items.get(cid) or old_items.get(cid) or {}
+                self.log_msg(f"   · {title}：{src.get('name') or cid}（id {cid}）")
+        for cid, oname, nname in d["renamed"][:10]:
+            self.log_msg(f"   · 改名：{oname} → {nname}（id {cid}）")
+        for cid, om, nm in d["members"][:10]:
+            self.log_msg(f"   · 用户数：{(new_items.get(cid) or {}).get('name') or cid} "
+                         f"{om} → {nm}")
+        for cid, codes in d["risk_added"][:10]:
+            names = "、".join(RISK_LABEL.get(c, c) for c in codes)
+            self.log_msg(f"   · 新增异常：{(new_items.get(cid) or {}).get('name') or cid} → {names}")
+        messagebox.showinfo("对比完成", "\n".join([
+            f"上次快照：{when}（{d['old_count']} 条）", f"本次：{d['new_count']} 条", "",
+            f"新增 {len(d['added'])} 个", f"消失 {len(d['removed'])} 个",
+            f"改名 {len(d['renamed'])} 个", f"用户数变化 {len(d['members'])} 个",
+            f"新增异常 {len(d['risk_added'])} 个", "", "明细已写进日志。"]))
+
+    # ---------------- 静音 / 归档（不退出） ----------------
+    def on_mute_archive(self, action, value):
+        """静音 / 归档选中的会话 —— 给「太吵但不想退」一个中间选项（都可逆）。"""
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接并刷新列表。")
+            return
+        iids = self.selected_items()
+        if not iids:
+            self._warn_no_selection()
+            return
+        verb = {("mute", True): "静音", ("mute", False): "取消静音",
+                ("archive", True): "归档", ("archive", False): "移出归档"}[(action, value)]
+        self.run_async(self._mute_archive_batch(iids, action, value, verb))
+
+    async def _mute_archive_batch(self, iids, action, value, verb):
+        async def _do(ent, name):
+            if action == "mute":
+                await set_mute(self.client, ent, value)
+            else:
+                await set_archive(self.client, ent, value)
+            return True, f"{'🔕' if action == 'mute' else '📦'} {verb}: {name}"
+
+        await self._run_destructive(iids, self._interval(), self._jitter(), _do, verb,
+                                    task_label=f"正在{verb}（共 {len(iids)} 个）…",
+                                    defer_drop=True)
+        self.log_msg(f"ℹ️ {verb} 不改变列表内容（行不会消失）；要看效果请在客户端里刷新，"
+                     "或点「🔄 刷新列表」核对分组列。")
 
     # ---------------- 订阅名额（500 / 1000） ----------------
     def quota_used(self):
@@ -6607,7 +7430,8 @@ class App:
             messagebox.showerror("导出失败", str(e))
 
     async def _run_destructive(self, sel, interval, jitter, do_one, verb,
-                               task_label=None, progress_verb=None, defer_drop=False):
+                               task_label=None, progress_verb=None, defer_drop=False,
+                               task_ctx=None):
         """退出 / 删除会话 / 销毁 三种破坏性批量操作的**公共执行器**。
 
         统一处理：限流退避重试、进度上报、成功行的行清理、按钮复位、结果汇总。
@@ -6632,6 +7456,7 @@ class App:
             self.root.after(0, lambda t=task_label: self.start_task(t))
 
         ok = fail = 0
+        started = time.time()
         for iid in sel:
             ent = self.channels.get(iid)
             if not ent:
@@ -6674,11 +7499,29 @@ class App:
                 fail += 1
                 self.log_msg(f"❌ {verb}失败: {name} -> {e}")
             done += 1
+            if task_ctx is not None:
+                # 每完成一个就把进度写盘：崩溃 / 断电 / 手动关窗口之后还能接着跑
+                try:
+                    cid = str(self._cid_of(iid))
+                    done_ids = task_ctx.setdefault("done", [])
+                    if cid not in done_ids:
+                        done_ids.append(cid)
+                    self.save_task(task_ctx)
+                except Exception:
+                    pass
             n, t = done, total
-            self.root.after(0, lambda n=n, t=t: self.set_progress(n, t, f"正在{pv} {n}/{t}"))
+            eta = self._eta_text(started, done, total)
+            self.root.after(0, lambda n=n, t=t, e=eta: self.set_progress(
+                n, t, f"正在{pv} {n}/{t}{e}"))
             if done < total:
                 wait = interval + (random.uniform(0, jitter) if jitter > 0 else 0)
                 await asyncio.sleep(max(1.0, wait))
+        if task_ctx is not None:
+            task_ctx["finished"] = True
+            try:
+                self.save_task(task_ctx)
+            except Exception:
+                pass
         if not defer_drop:
             # defer_drop 时**不能**在这里报总账：调用方还要跟服务端复核，
             # 有些「成功」会被复核推翻。等复核完由调用方报一次最终结果。
@@ -6742,7 +7585,8 @@ class App:
 
         _ok, _fail, made = await self._run_destructive(
             sel, interval, jitter, _do_leave, "退出",
-            task_label=f"正在处理选中的会话（共 {len(sel)} 个）…", defer_drop=True)
+            task_label=f"正在处理选中的会话（共 {len(sel)} 个）…", defer_drop=True,
+            task_ctx=self._new_task_ctx("退出", sel))
 
         # 退出也走同一套复核：私聊在「退出」里同样是删会话，不核对就报成功
         # 会变成同一个谎 —— 两条路要么都说真话，要么都在骗人。
@@ -6980,7 +7824,8 @@ class App:
         # 复核代码一次都没执行过（测试就是这么把它抓出来的）。
         _ok, _fail, made = await self._run_destructive(
             sel, interval, jitter, _do, "删除",
-            task_label=f"正在删除会话（共 {len(sel)} 个）…", defer_drop=True)
+            task_label=f"正在删除会话（共 {len(sel)} 个）…", defer_drop=True,
+            task_ctx=self._new_task_ctx("删除会话", sel))
 
         await self._finish_destructive(made, "删除", _ok, _fail)
 
@@ -7245,7 +8090,8 @@ class App:
 
         await self._run_destructive(
             sel, interval, jitter, _do, "删除",
-            task_label=f"正在删除自建{want_kind}（共 {len(sel)} 个）…")
+            task_label=f"正在删除自建{want_kind}（共 {len(sel)} 个）…",
+            task_ctx=self._new_task_ctx(f"销毁自建{want_kind}", sel))
 
     def _interval(self):
         try:
@@ -7669,6 +8515,20 @@ def selftest():
             assert parse_join_target("") == (None, "")
             assert app._log_level_vars and len(app._log_level_vars) == 3
             _selftest_say(lines, "v1.5.0：名额指示 / 退出历史·重新加入 / 日志分级 / 引导·提示·F1 OK")
+            # v1.6.0：概览 / 任务续跑 / 设备页 / 快照 / 静音归档 / 主题 tag
+            assert app.btn_task is not None and app.btn_more is not None
+            assert app.dev_tree is not None and app.btn_dev_refresh is not None
+            assert theme_palette(False)["bg"] != theme_palette(True)["bg"]
+            assert fmt_duration(75) == "1 分 15 秒" and fmt_duration(30) == "30 秒"
+            _hd, _unk = histogram([50, 500, 5000, 50000, 500000], MEMBER_BUCKETS)
+            assert [n for _l, n in _hd] == [1, 1, 1, 1, 1], _hd
+            assert histogram([None, 10], MEMBER_BUCKETS)[1] == 1
+            _dd = diff_snapshots({"1": {"name": "a", "members": 5}},
+                                 {"1": {"name": "b", "members": 9}, "2": {"name": "c"}})
+            assert _dd["added"] == ["2"] and _dd["renamed"] and _dd["members"]
+            assert parse_join_target("t.me/joinchat/AbC") == (REJOIN_INVITE, "AbC")
+            assert shortcut_rows(app) and any(k == "Ctrl+D" for k, _d in shortcut_rows(app))
+            _selftest_say(lines, "v1.6.0：数据概览 / 任务续跑·ETA / 设备管理 / 快照对比 / 静音归档 OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
