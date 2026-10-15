@@ -283,11 +283,32 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.3.2"
+APP_VERSION = "v1.4.0"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.4.0", "2026-10-15", [
+        "新增：**🚫 异常筛选**（列表上方按钮，或右键「只看这种异常」）。一次筛出**违规 / "
+        "已封禁 / 不可关注 / 被禁言**的频道与群组 —— 表格新增「异常」列，每行标出最重的那一类"
+        "（如「🚫 违规受限 +2」），鼠标右键选「为什么异常」会把每一条原因逐条写进日志",
+        "特征全部来自 **Telegram 已给的实体字段，零请求**：ChannelForbidden / ChatForbidden"
+        "（已封禁·不可访问）、restriction_reason（违规受限：版权 / 服务条款 / 色情 …）、"
+        "scam / fake（官方标记的诈骗 / 假冒）、deactivated（群已停用）、left（已不在，条目残留）、"
+        "join_request / join_to_send（不能直接关注 / 须先加入才能发言）、"
+        "banned_rights / default_banned_rights（你被禁言 / 全员禁言）、User.deleted（对方已注销）",
+        "**不按名字猜关键词**：靠 title 里出现「福利」「资源」这类词来判违规，会把大批正常频道"
+        "误判成违规。这里只认服务端标记，判不了就是判不了，理由与依据都摆在日志里",
+        "受限原因**代码优先、文案兜底**：restriction_reason.reason 是稳定代码（copyright / "
+        "terms / porn …），先认代码；代码不认识时才去匹配文案。社区里不少脚本只硬编码英文原文"
+        "（'This channel is unavailable due to copyright infringement.'），客户端换个语言或 "
+        "Telegram 改文案就静默失效",
+        "加载完列表自动打印分类统计（零请求）：共 N 个会话、命中 M 个、逐类明细；"
+        "「🚫 异常 ▾」菜单里各项都带**实时**计数（postcommand 重算，不会显示旧数字）",
+        "菜单还提供：**勾选全部异常行**（含被筛选藏起来的行；受保护项照样跳过但会把跳过数写清楚）、"
+        "**把异常统计写进日志**、**记住这些异常（写入白名单）** —— 想留下其中的一部分时先圈出来",
+        "导出 CSV 新增「异常特征」列，带完整原因（不只写个标记），方便先看清单再动手",
+    ]),
     ("v1.3.2", "2026-10-14", [
         "修复：**已注销账号的私聊会话「删不掉」的真相搞清了**。您发回来的日志显示："
         "60 个私聊全部「服务端确认仍在」。实测发现它们的聊天记录**已经被删掉**"
@@ -786,8 +807,180 @@ def session_kind(ent):
 
 def is_member_kind(kind):
     """是否「有成员、可退出」的类型 —— 只有频道/群组有成员数、
-    有创建者/管理员概念、需要也才能够做角色检测。"""
+   有创建者/管理员概念、需要也才能够做角色检测。"""
     return kind in (KIND_CHANNEL, KIND_GROUP)
+
+
+# ---------------- 异常 / 违规 频道·群组的特征提取 ----------------
+# 设计原则：**只认服务端给的字段，零请求，不猜名字**。
+# Telegram 自己在实体上带标记（scam / fake / restricted / restriction_reason /
+# ChannelForbidden …），会话列表里就已经把这些字段给全了，再发请求去查纯属浪费，
+# 而且按名字里的关键词猜（"福利""资源"…）会把正常频道大批误判成违规。
+RISK_FORBIDDEN = "forbidden"    # 已封禁 / 不可访问（ChannelForbidden / ChatForbidden）
+RISK_RESTRICTED = "restricted"  # 违规受限（服务端给了原因：版权 / 服务条款 / 色情 …）
+RISK_SCAM = "scam"              # Telegram 标记：诈骗
+RISK_FAKE = "fake"              # Telegram 标记：假冒
+RISK_DEAD = "dead"              # 群已停用 / 你已不在（条目残留）
+RISK_BANNED = "banned"          # 你被禁言 / 全员默认禁言
+RISK_NOJOIN = "nojoin"          # 不能直接关注（加入需管理员批准）
+RISK_NEEDJOIN = "needjoin"      # 必须先加入才能发言
+RISK_GHOST = "ghost"            # 对方账号已注销（私聊）
+
+# 类别码 -> 短标签（表格「异常」列用）与人话说明（日志 / 导出 / 提示用）
+RISK_META = (
+    (RISK_FORBIDDEN, "🚫 已封禁", "已封禁 / 不可访问"),
+    (RISK_RESTRICTED, "🚫 违规受限", "违规受限（版权 / 服务条款 / 色情等）"),
+    (RISK_SCAM, "🚫 诈骗", "Telegram 标记：诈骗"),
+    (RISK_FAKE, "🚫 假冒", "Telegram 标记：假冒"),
+    (RISK_DEAD, "🚫 已停用", "已停用 / 已不在（被踢或已退出，条目残留）"),
+    (RISK_BANNED, "🚫 禁言", "被禁言 / 全员禁言"),
+    (RISK_NOJOIN, "🚫 需审核", "不能直接关注（加入需管理员批准）"),
+    (RISK_NEEDJOIN, "🚫 须先加入", "必须先加入才能发言"),
+    (RISK_GHOST, "🚫 已注销", "对方账号已注销"),
+)
+RISK_CODES = tuple(c for c, _s, _l in RISK_META)
+RISK_SHORT = {c: s for c, s, _l in RISK_META}
+RISK_LABEL = {c: l for c, _s, l in RISK_META}
+# 严重度顺序（一个会话可能同时命中多个特征，表格列只显示最重的那一个 + 「＋N」）
+RISK_ORDER = (RISK_FORBIDDEN, RISK_RESTRICTED, RISK_SCAM, RISK_FAKE, RISK_DEAD,
+              RISK_BANNED, RISK_NOJOIN, RISK_NEEDJOIN, RISK_GHOST)
+
+# 菜单里的一键筛选项（把 9 类收成 8 项，避免菜单铺满一屏）
+RISK_GROUPS = (
+    ("违规 / 被封（全部）", (RISK_FORBIDDEN, RISK_RESTRICTED, RISK_SCAM, RISK_FAKE)),
+    ("已封禁 / 不可访问", (RISK_FORBIDDEN,)),
+    ("违规受限（版权 / 服务条款）", (RISK_RESTRICTED,)),
+    ("诈骗 / 假冒标记", (RISK_SCAM, RISK_FAKE)),
+    ("已停用 / 已不在", (RISK_DEAD,)),
+    ("被禁言 / 全员禁言", (RISK_BANNED,)),
+    ("不能关注 / 须先加入", (RISK_NOJOIN, RISK_NEEDJOIN)),
+    ("对方账号已注销", (RISK_GHOST,)),
+    ("任意异常", RISK_CODES),
+)
+
+# restriction_reason.reason 是**稳定代码**；text 是可读文案（随客户端语言/版本变）。
+# 只认英文原文（不少开源脚本就是这么写的）会在换语言或 Telegram 改文案时静默失效，
+# 所以这里代码优先、文案只做兜底。
+RESTRICTION_REASON_LABEL = {
+    "copyright": "版权投诉", "terms": "违反服务条款", "porn": "色情内容",
+    "spam": "垃圾信息", "violence": "暴力内容", "drugs": "违禁品",
+    "fake": "虚假信息", "geo": "地区限制", "impersonation": "冒充他人",
+    "scam": "诈骗", "illegal": "违法内容",
+}
+RESTRICTION_TEXT_HINTS = ("copyright", "terms of service", "violated", "unavailable",
+                          "infringement", "restricted")
+
+
+def restriction_reasons(ent):
+    """restriction_reason → [(短标签, 服务端原文), ...]。代码优先、文案兜底。"""
+    out = []
+    for r in (getattr(ent, "restriction_reason", None) or []):
+        reason = str(getattr(r, "reason", "") or "").strip()
+        text = str(getattr(r, "text", "") or "").strip()
+        label = RESTRICTION_REASON_LABEL.get(reason.lower())
+        if not label:
+            low = text.lower()
+            if any(h in low for h in RESTRICTION_TEXT_HINTS):
+                label = "服务端标注受限"
+            else:
+                label = reason or "受限"
+        out.append((label, text))
+    return out
+
+
+def restriction_text(ent):
+    """一句话说完所有受限原因（表格列 / 导出用）。"""
+    parts = []
+    for label, text in restriction_reasons(ent):
+        parts.append(label if (not text or text == label) else f"{label}：{text}")
+    return "；".join(parts)
+
+
+def _send_banned(rights):
+    """这份 ChatBannedRights 是否禁止发言 —— 禁言是「受限群」最直观的特征。"""
+    return bool(rights) and bool(getattr(rights, "send_messages", False))
+
+
+def risk_of(ent):
+    """提取一个会话的异常特征，返回 [(类别码, 人话原因), ...]；空列表 = 没发现异常。
+
+    **全部来自服务端已经给我们的字段，零请求**：
+      ChannelForbidden / ChatForbidden          -> 已封禁 / 不可访问
+      Channel.scam / Channel.fake               -> Telegram 官方标记
+      Channel.restricted + restriction_reason   -> 违规受限（版权 / 服务条款 / 色情 …）
+      Chat.deactivated                          -> 群已停用（通常是封禁）
+      Channel.left / Chat.left                  -> 已不在（会话条目残留）
+      Channel.join_request                      -> 加入需管理员批准（不能直接关注）
+      Channel.join_to_send                      -> 必须先加入才能发言
+      banned_rights / default_banned_rights     -> 你被禁言 / 全员禁言
+      User.deleted                              -> 对方账号已注销
+    """
+    out = []
+    if ent is None:
+        return out
+    if isinstance(ent, tl_types.ChannelForbidden):
+        return [(RISK_FORBIDDEN, "服务端返回 ChannelForbidden：频道已不可访问"
+                                 "（被封 / 被踢 / 频道已删）")]
+    if isinstance(ent, tl_types.ChatForbidden):
+        return [(RISK_FORBIDDEN, "服务端返回 ChatForbidden：群已不可访问"
+                                 "（被封 / 被踢 / 群已删）")]
+    if isinstance(ent, tl_types.Channel):
+        if getattr(ent, "scam", False):
+            out.append((RISK_SCAM, "Telegram 标记该频道为诈骗"))
+        if getattr(ent, "fake", False):
+            out.append((RISK_FAKE, "Telegram 标记该频道为假冒"))
+        detail = restriction_text(ent)
+        if detail:
+            out.append((RISK_RESTRICTED, "服务端标注受限 —— " + detail))
+        elif getattr(ent, "restricted", False):
+            out.append((RISK_RESTRICTED, "被服务端标记为受限（未给出具体原因）"))
+        if getattr(ent, "left", False):
+            out.append((RISK_DEAD, "你已经不在这个频道 / 群组里（会话条目残留）"))
+        if getattr(ent, "join_request", False):
+            out.append((RISK_NOJOIN, "加入需要管理员批准，不能直接关注"))
+        elif getattr(ent, "join_to_send", False):
+            out.append((RISK_NEEDJOIN, "必须先加入才能发言"))
+        if _send_banned(getattr(ent, "banned_rights", None)):
+            out.append((RISK_BANNED, "你在这个频道 / 群里被禁止发言"))
+        elif _send_banned(getattr(ent, "default_banned_rights", None)):
+            out.append((RISK_BANNED, "全员默认被禁止发言"))
+    elif isinstance(ent, tl_types.Chat):
+        if getattr(ent, "deactivated", False):
+            out.append((RISK_DEAD, "该群已被停用（通常是封禁）"))
+        if getattr(ent, "left", False):
+            out.append((RISK_DEAD, "你已经不在这个群里"))
+        if _send_banned(getattr(ent, "default_banned_rights", None)):
+            out.append((RISK_BANNED, "全员默认被禁止发言"))
+    elif isinstance(ent, tl_types.User):
+        if getattr(ent, "deleted", False):
+            out.append((RISK_GHOST, "对方账号已注销（客户端里是灰头像 / 纯数字名）"))
+        if getattr(ent, "scam", False):
+            out.append((RISK_SCAM, "Telegram 标记该用户为诈骗"))
+        if getattr(ent, "fake", False):
+            out.append((RISK_FAKE, "Telegram 标记该用户为假冒"))
+        if getattr(ent, "restricted", False):
+            out.append((RISK_RESTRICTED, "该账号被服务端标记为受限"))
+    return out
+
+
+def risk_codes_of(ent):
+    """只要类别码（去重、按严重度排序）—— 筛选与计数都走它。"""
+    codes = set(c for c, _why in risk_of(ent))
+    return tuple(c for c in RISK_ORDER if c in codes)
+
+
+def risk_cell_text(ent):
+    """表格「异常」列的文字：最重的一类 + 「＋N」。"""
+    codes = risk_codes_of(ent)
+    if not codes:
+        return ""
+    txt = RISK_SHORT.get(codes[0], codes[0])
+    return txt if len(codes) == 1 else f"{txt} +{len(codes) - 1}"
+
+
+def risk_detail_text(ent):
+    """把该会话的全部异常原因连成一串（日志 / 导出 / 提示用）。"""
+    return "；".join(why for _c, why in risk_of(ent))
 
 
 # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
@@ -1273,6 +1466,8 @@ class App:
         self._filter_posts_lt = None
         self._only_checked = False  # 是否「只看已勾选」
         self._search_after = None   # 搜索防抖的 after id
+        self._risk = {}             # 行 id -> (异常类别码, ...)：违规 / 已封禁 / 不可关注…
+        self._risk_filter = None    # 当前生效的异常筛选（None=不筛；否则是类别码元组）
         self._task_start = None     # 当前阶段任务开始时间（用于显示耗时）
         self._progress_running = False
         self._left_visible = True
@@ -2009,12 +2204,13 @@ class App:
 
         # 「id」「safe」保持在末尾：按位置构造行值的既有代码/测试不受影响，
         # 新增列一律插在 posts 之后、id 之前。
-        cols = ("sel", "name", "username", "type", "members", "posts", "active", "folder", "id", "safe")
+        cols = ("sel", "name", "username", "type", "members", "posts", "active",
+                "folder", "risk", "id", "safe")
         self.tree = ttk.Treeview(frm_list, columns=cols, show="headings", height=16, selectmode="extended")
         self._col_titles = {"sel": "选择", "name": "名称", "username": "用户名",
                             "type": "类型", "members": "用户数", "posts": "作品数",
-                            "active": "活跃", "folder": "分组", "id": "ID",
-                            "safe": "安全"}
+                            "active": "活跃", "folder": "分组", "risk": "异常",
+                            "id": "ID", "safe": "安全"}
         # 受保护行的整行着色：白名单=蓝，创建者/管理员=红（一眼看出哪些不会 / 不能退出）
         self.tree.tag_configure("wl", foreground="#185FA5")
         self.tree.tag_configure("unleaveable", foreground="#a32d2d")
@@ -2024,6 +2220,7 @@ class App:
                           ("members", 80, "用户数"), ("posts", 80, "作品数"),
                           ("active", 72, "活跃"),
                           ("folder", 120, "分组"),
+                          ("risk", 104, "异常"),
                           ("id", 110, "ID"), ("safe", 92, "安全")):
             # 除「选择」列外，点列头即可排序（注意：ttk 不接受 command=None，需分支设置）
             if c == "sel":
@@ -2031,7 +2228,8 @@ class App:
             else:
                 self.tree.heading(c, text=txt, command=lambda cc=c: self.sort_by(cc))
             self.tree.column(c, width=w,
-                             anchor="center" if c in ("sel", "type", "members", "posts", "active", "safe") else "w")
+                             anchor="center" if c in ("sel", "type", "members", "posts",
+                                                       "active", "risk", "safe") else "w")
         self.tree.bind("<ButtonRelease-1>", self.on_tree_click)
 
         vsb = ttk.Scrollbar(frm_list, orient="vertical", command=self.tree.yview)
@@ -2053,6 +2251,13 @@ class App:
         ttk.Button(frm_sel, text="清空全部", command=lambda: self.set_all(False, scope="all")).pack(side="left", padx=3)
         self.btn_whitelist = ttk.Button(frm_sel, text="🔒 白名单", command=self.on_toggle_whitelist_checked)
         self.btn_whitelist.pack(side="left", padx=3)
+        # 异常筛选：违规 / 已封禁 / 不可关注 / 禁言 …… 特征全部来自服务端字段（零请求）
+        self.btn_risk = ttk.Menubutton(frm_sel, text="🚫 异常 ▾")
+        self._risk_menu = tk.Menu(self.btn_risk, tearoff=0,
+                                  postcommand=self._refresh_risk_menu)
+        self.btn_risk["menu"] = self._risk_menu
+        self.btn_risk.pack(side="left", padx=3)
+        self._rebuild_risk_menu()
         # 分组操作：对一批行批量加入 / 移出分组（只改归属，不退出也不删除）
         self.btn_folder = ttk.Menubutton(frm_sel, text="📁 分组 ▾")
         # postcommand：菜单弹出前重算（勾选数 / 筛选结果数会一直变，静态菜单会显示旧数字）
@@ -2564,7 +2769,7 @@ class App:
         self.root.geometry("1200x780")
         for c, w in (("sel", 50), ("name", 220), ("username", 160), ("type", 60),
                      ("members", 80), ("posts", 80), ("active", 72), ("folder", 120),
-                     ("id", 110), ("safe", 92)):
+                     ("risk", 104), ("id", 110), ("safe", 92)):
             try:
                 self.tree.column(c, width=w)
             except Exception:
@@ -2596,6 +2801,8 @@ class App:
             m.add_command(label="在浏览器打开", command=self._ctx_open_link)
             m.add_separator()
             m.add_command(label="只看该类型", command=self._ctx_filter_type)
+            m.add_command(label="只看这种异常", command=self._ctx_filter_risk)
+            m.add_command(label="为什么异常（写日志）", command=self._ctx_explain_risk)
             m.add_command(label="搜索该名称", command=self._ctx_search_name)
             m.add_separator()
             m.add_command(label="只退出这一个", command=self._ctx_leave_one)
@@ -2685,6 +2892,35 @@ class App:
             return
         self.search_var.set(vals.get("name", ""))
         self._apply_search(verbose=True)
+
+    def _ctx_filter_risk(self):
+        """右键：只看这一行命中的异常类别。"""
+        iid = getattr(self, "_ctx_iid", None)
+        ent = self.channels.get(iid) if iid else None
+        codes = self._risk.get(iid, ())
+        if not codes:
+            self.log_msg("🚫 这一行没有命中任何异常特征"
+                         "（依据是服务端字段：封禁 / 违规受限 / 诈骗 / 假冒 / 停用 / 禁言 …）。")
+            return
+        self.set_risk_filter(codes)
+        self.log_msg("   · 原因：" + risk_detail_text(ent))
+
+    def _ctx_explain_risk(self):
+        """右键：把这一个会话的异常特征逐条写进日志（回答「凭什么说它异常」）。"""
+        iid = getattr(self, "_ctx_iid", None)
+        if not iid:
+            return
+        try:
+            name = self.tree.set(iid, "name")
+        except Exception:
+            name = str(iid)
+        rows = risk_of(self.channels.get(iid))
+        if not rows:
+            self.log_msg(f"🚫 {name}：未命中任何异常特征。")
+            return
+        self.log_msg(f"🚫 {name} 的异常特征（{len(rows)} 条，全部来自服务端字段）：")
+        for code, why in rows:
+            self.log_msg(f"   · {RISK_LABEL.get(code, code)}：{why}")
 
     def _ctx_leave_one(self):
         iid, vals = self._ctx_row()
@@ -3539,6 +3775,7 @@ class App:
         self._visible = set()
         self._sel_hidden = set()
         self._role = {}             # 行 id 变了，角色映射随之作废（白名单按频道 id 存，不受影响）
+        self._risk = {}             # 异常特征同样按行 id 记，行没了就必须一起清
         self.update_count()
         self._refresh_headings()
 
@@ -3562,7 +3799,7 @@ class App:
         active0 = NOT_APPLICABLE if typ == KIND_GONE else "…"
         cell = {"sel": sel, "name": title, "username": uname, "type": typ,
                 "members": members0, "posts": posts0, "active": active0,
-                "folder": "", "id": cid, "safe": ""}
+                "folder": "", "risk": "", "id": cid, "safe": ""}
         return tuple(cell.get(c, "") for c in self._tree_columns())
 
     def _append_rows(self, rows, scanned=None):
@@ -3580,6 +3817,7 @@ class App:
                 # 角色缓存按频道 id 命中，插入时就能标出创建者/管理员，不必等统计跑完
                 self._prime_role(iid, ent)
                 self._refresh_safe_cell(iid)
+                self._refresh_risk_cell(iid)
             except Exception:
                 pass
             try:
@@ -3604,6 +3842,12 @@ class App:
             self.log_msg("ℹ️ 当前筛选条件下暂无可显示的行：统计获取完成前多为未获取状态，"
                          "可取消勾选「隐藏统计未获取的行」，或等统计跑完。")
         self.finish_task(f"列表加载完成：{n} 个会话")
+        # 异常特征统计（零请求：都用会话列表里已给的字段）。
+        # 用 getattr 兜一层：测试桩 App 只实现自己关心的那部分接口，
+        # 一个统计日志不该把整套加载流程带崩。
+        _risk_log = getattr(self, "log_risk_summary", None)
+        if callable(_risk_log):
+            _risk_log()
         self.log_msg(f"已加载 {n} 个会话，开始读取用户数 / 作品数 / 活跃时间（命中本地缓存的不会发请求）...")
         self.run_async(self._fetch_stats(self._tree_epoch, force=False))
 
@@ -3691,6 +3935,169 @@ class App:
     def _refresh_all_safe_cells(self):
         for iid in list(self.channels):
             self._refresh_safe_cell(iid)
+
+    # ---------------- 异常特征：列回填 / 筛选 / 统计（零请求） ----------------
+    # 分类依据**全部来自服务端已经给我们的实体字段**（scam / fake / restricted /
+    # restriction_reason / ChannelForbidden / join_request / banned_rights …），
+    # 会话列表加载完就已经齐了，所以这一整套不发任何请求，也不会因为
+    # 「按名字里的关键词猜」把正常频道大批误判成违规。
+    def _refresh_risk_cell(self, iid):
+        """回填「异常」列，并记下该行的类别（筛选与计数都从这里读）。桩树无该列时静默跳过。"""
+        try:
+            ent = self.channels.get(iid)
+        except Exception:
+            return
+        try:
+            self._risk[iid] = risk_codes_of(ent) if ent is not None else ()
+        except Exception:
+            self._risk[iid] = ()
+        try:
+            if "risk" in self._tree_columns():
+                self.tree.set(iid, "risk",
+                              risk_cell_text(ent) if ent is not None else "")
+        except Exception:
+            pass
+
+    def _refresh_all_risk_cells(self):
+        for iid in list(self.channels):
+            self._refresh_risk_cell(iid)
+
+    def _risk_counts(self):
+        """按类别统计当前列表里的异常会话数（已从列表移除的行不再计入）。"""
+        counts = {}
+        for iid, codes in list(self._risk.items()):
+            if iid not in self.channels:
+                continue
+            for c in codes:
+                counts[c] = counts.get(c, 0) + 1
+        return counts
+
+    def _risk_hit_count(self, codes=None):
+        """命中指定类别（None = 任意异常）的会话数。"""
+        want = set(codes) if codes else None
+        n = 0
+        for iid, cs in list(self._risk.items()):
+            if iid not in self.channels or not cs:
+                continue
+            if want is None or (set(cs) & want):
+                n += 1
+        return n
+
+    def _rebuild_risk_menu(self):
+        """建「🚫 异常 ▾」菜单。计数是**实时**的 —— 菜单弹出前重算（postcommand）。"""
+        m = getattr(self, "_risk_menu", None)
+        if m is None:
+            return
+        try:
+            m.delete(0, "end")
+        except Exception:
+            return
+        for label, codes in RISK_GROUPS:
+            m.add_command(
+                label=f"只看：{label}（{self._risk_hit_count(codes)}）",
+                command=lambda c=codes: self.set_risk_filter(c))
+        m.add_separator()
+        cur = getattr(self, "_risk_filter", None)
+        m.add_command(label="清除异常筛选" + ("（当前生效）" if cur else ""),
+                      command=lambda: self.set_risk_filter(None))
+        m.add_command(label=f"勾选全部异常行（{self._risk_hit_count()}）",
+                      command=lambda: self.check_all_risk_rows())
+        m.add_command(label="把异常统计写进日志", command=self.log_risk_summary)
+        m.add_command(label="记住这些异常（写入白名单）", command=self.whitelist_risk_rows)
+
+    def _refresh_risk_menu(self):
+        """postcommand 回调：弹出前重算计数。"""
+        self._rebuild_risk_menu()
+
+    def set_risk_filter(self, codes):
+        """只看某几类异常特征（codes 为空 = 清除该筛选）。只影响显示，不动数据与勾选。"""
+        self._risk_filter = tuple(codes) if codes else None
+        if self._risk_filter:
+            names = "、".join(RISK_LABEL.get(c, c) for c in self._risk_filter)
+            self.log_msg(f"🚫 只看异常「{names}」：命中 "
+                         f"{self._risk_hit_count(self._risk_filter)} 个"
+                         "（依据是服务端字段：封禁 / 违规受限 / 诈骗 / 假冒 / 停用 / 禁言 …）")
+        else:
+            self.log_msg("🚫 已清除异常筛选。")
+        self.apply_filter(verbose=False)
+
+    def check_all_risk_rows(self, codes=None):
+        """勾选全部命中异常特征的行（含被当前筛选隐藏的）。
+
+        与「全选」保持同一套规矩：默认跳过受保护行（白名单 / 创建者 / 管理员），
+        但**把跳过数明说出来**，不做静默少选。"""
+        want = set(codes) if codes else None
+        hit = [iid for iid, cs in list(self._risk.items())
+               if iid in self.channels and cs
+               and (want is None or (set(cs) & want))]
+        if not hit:
+            self.log_msg("🚫 没有可勾选的行：当前列表里没有命中异常特征的会话。")
+            return 0
+        skip_protected = var_bool(self, "skip_protected_var", True)
+        visible = set(self._visible_ids())
+        skipped = 0
+        checked = 0
+        for iid in hit:
+            if skip_protected and self.protected_reason(iid):
+                skipped += 1
+                try:
+                    self.tree.set(iid, "sel", "☐")   # 受保护行绝不带着勾选
+                except Exception:
+                    pass
+                self._sel_hidden.discard(iid)
+                continue
+            try:
+                self.tree.set(iid, "sel", "☑")
+            except Exception:
+                continue
+            checked += 1
+            if iid in visible:
+                self._sel_hidden.discard(iid)
+            else:
+                self._sel_hidden.add(iid)   # 勾上了但被筛选藏着 → 状态栏会提示
+        self.update_count()
+        msg = f"☑ 已勾选 {checked} 个异常会话"
+        if skipped:
+            msg += f"（另有 {skipped} 个是受保护项，已跳过：白名单 / 创建者 / 管理员）"
+        self.log_msg(msg + "。分类依据是服务端字段，不是名字猜测。")
+        if getattr(self, "_only_checked", False):
+            self.apply_filter(verbose=False)
+        return checked
+
+    def whitelist_risk_rows(self, codes=None):
+        """把命中异常特征的行加入白名单。
+
+        用途：确认「这批异常里有一部分我还想留着」时，先圈出来再单独处置 ——
+        白名单行在任何批量退出 / 删除里都会自动跳过。"""
+        want = set(codes) if codes else None
+        hit = [iid for iid, cs in list(self._risk.items())
+               if iid in self.channels and cs
+               and (want is None or (set(cs) & want))]
+        if not hit:
+            self.log_msg("🚫 没有可加入白名单的行：列表里没有命中异常特征的会话。")
+            return 0
+        n = self.set_whitelist(hit, True)
+        self.log_msg(f"🔒 已把 {n} 个异常会话加入白名单（它们不会再被批量退出 / 删除）。")
+        return n
+
+    def log_risk_summary(self):
+        """把异常特征统计打进日志：**零请求**，全部来自会话列表已给的字段。"""
+        counts = self._risk_counts()
+        total = sum(1 for iid in self.channels if iid in self._risk)
+        hit = self._risk_hit_count()
+        self.log_msg(f"🚫 异常特征扫描：共 {total} 个会话，命中 {hit} 个"
+                     "（依据全部来自服务端已给的字段：零请求、不猜名字）")
+        if not counts:
+            self.log_msg("   · 未发现任何异常特征。")
+            return 0
+        for c, _short, label in RISK_META:
+            n = counts.get(c, 0)
+            if n:
+                self.log_msg(f"   · {label}：{n}")
+        self.log_msg("   · 点「🚫 异常 ▾」可按类别只看 / 一次勾选；"
+                     "导出的 CSV 里「异常」列带完整原因。")
+        return hit
+
 
     def set_whitelist(self, iids, on):
         """批量加入 / 移出白名单。返回实际改动的条数。"""
@@ -4729,6 +5136,8 @@ class App:
             return False
         if not self._match_folder(iid):
             return False
+        if not self._match_risk(iid):
+            return False
         if getattr(self, "_hide_protected", False) and self.protected_reason(iid):
             return False          # 「隐藏受保护项」：白名单 / 创建者 / 管理员不参与选择与退出
         if getattr(self, "_only_checked", False) and not self._is_checked(iid):
@@ -4758,6 +5167,14 @@ class App:
             if not (v > a_gt):        # 「活跃天数 > N」= 超过 N 天没有任何消息
                 return False
         return True
+
+    def _match_risk(self, iid):
+        """异常特征筛选：只要该行命中了所选类别之一就保留。
+        数据来自 _risk（插入行时由服务端字段算好），所以这里是纯内存判断。"""
+        want = getattr(self, "_risk_filter", None)
+        if not want:
+            return True
+        return bool(set(self._risk.get(iid, ())) & set(want))
 
     def _threshold_of(self, attr):
         """安全解析某个阈值输入框（属性可能不存在 —— 测试桩只有部分控件）。"""
@@ -4815,7 +5232,8 @@ class App:
         self._filter_active_gt = a_gt
         self._filter_active = (m_lt is not None or p_lt is not None or a_gt is not None
                                or has_kw or tsel != "全部" or self._only_checked
-                               or self._hide_protected or folder != FOLDER_ALL)
+                               or self._hide_protected or folder != FOLDER_ALL
+                               or bool(getattr(self, "_risk_filter", None)))
         self._filter_members_lt, self._filter_posts_lt = m_lt, p_lt
         self._sync_filter_preset_name()
 
@@ -4873,6 +5291,9 @@ class App:
                     cond.append("只看已勾选")
                 if getattr(self, "_hide_protected", False):
                     cond.append("隐藏受保护项")
+                if getattr(self, "_risk_filter", None):
+                    cond.append("异常=" + "、".join(
+                        RISK_LABEL.get(c, c) for c in self._risk_filter))
                 extra = "" if hide_unknown else "（统计未获取的行也一并保留）"
                 if self._sel_hidden:
                     extra += f" ⚠️ {len(self._sel_hidden)} 个已勾选的行被隐藏，退出时不会处理"
@@ -5432,6 +5853,7 @@ class App:
                     self.tree.set(iid, "folder"),
                     self.tree.set(iid, "id"),
                     self.protected_reason(iid) or "",
+                    risk_detail_text(self.channels.get(iid)),
                 ))
             except Exception:
                 pass
@@ -5451,7 +5873,7 @@ class App:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["名称", "用户名", "类型", "用户数", "作品数", "活跃(天前)",
-                            "分组", "ID", "安全防护"])
+                            "分组", "ID", "安全防护", "异常特征"])
                 w.writerows(rows)
             self.log_msg(f"✅ 已导出{label} {len(rows)} 条到 {path}")
             messagebox.showinfo("完成", f"已导出{label} {len(rows)} 条到：\n{path}")
@@ -5553,6 +5975,7 @@ class App:
         self._visible.discard(iid)
         self._sel_hidden.discard(iid)
         self._role.pop(iid, None)
+        self._risk.pop(iid, None)
         try:
             self._row_order.remove(iid)
         except ValueError:
@@ -6430,7 +6853,7 @@ def selftest():
             r.update_idletasks()
             cols = tuple(str(c) for c in app.tree.cget("columns"))
             assert cols == ("sel", "name", "username", "type", "members",
-                            "posts", "active", "folder", "id", "safe"), cols
+                            "posts", "active", "folder", "risk", "id", "safe"), cols
             assert app.btn_leave is not None and app.btn_destroy is not None
             # 按钮文案必须写明它同时会删除会话（私聊 / 机器人退不了，只能删）
             assert "退出" in str(app.btn_leave.cget("text"))
@@ -6472,6 +6895,17 @@ def selftest():
             # 空列表下三档都必须返回空（未连接 / 未加载时不能抛）
             assert app._folder_scope_iids(FOLDER_SCOPE_ALL) == []
             _selftest_say(lines, "批量划分分组：分组按钮 / 操作菜单 / 三档范围（勾选·筛选结果·全部）OK")
+            # 异常特征提取：按钮 + 菜单 + 分类器（全部来自服务端字段，零请求）
+            assert app.btn_risk is not None, "缺少「🚫 异常」按钮"
+            assert app._risk_menu is not None, "缺少异常筛选菜单"
+            assert risk_codes_of(tl_types.ChannelForbidden(
+                id=1, access_hash=1, title="x", broadcast=True)) == (RISK_FORBIDDEN,)
+            assert RISK_GHOST in risk_codes_of(tl_types.User(
+                id=2, is_self=False, access_hash=1, deleted=True))
+            assert risk_codes_of(tl_types.Channel(
+                id=3, title="ok", photo=None, date=None)) == ()
+            assert app._risk_hit_count() == 0 and app._risk_counts() == {}
+            _selftest_say(lines, "异常特征：🚫 异常按钮 / 分类菜单 / 零请求分类器（封禁·违规·诈骗·禁言…）OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
