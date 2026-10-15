@@ -283,11 +283,32 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.4.0"
+APP_VERSION = "v1.5.0"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.5.0", "2026-10-15", [
+        "新增：**订阅名额指示**。列表上方的统计条现在会写「🎯 名额 447/500（剩 53，按免费账号估算）」—— "
+        "这个工具本来就是为解决「订阅满 500 加不进去」而做的，以前却看不到自己用了多少、"
+        "这次能腾出几个。上限按 `me.premium` 取 500 / 1000（**这是客户端侧的知识，不是服务端返回值**，"
+        "所以文案写成「按…估算」）；批量退出后日志会报「本次腾出 N 个名额」",
+        "新增：**退出历史 + 一键重新加入（后悔药）**。退出 / 删除**经服务端复核确认**的会话会记到"
+        " `tg_history_<账号>.json`，菜单「🕘 历史 ▾」里可以看记录、复制链接、"
+        "**把公开频道重新加回来**（`channels.JoinChannelRequest`）；也能从 `t.me/xxx`、"
+        "`t.me/+邀请码`、`@用户名` 粘贴一批链接加入（邀请码会先 `CheckChatInviteRequest` 预检，"
+        "过期了直接说清，而不是甩一句 400）。加不进去的（私有邀请链接、已注销）会明确标「不可重加」",
+        "新增：**空会话筛选预设**（「空会话（作品数 = 0）」「空会话且 >90 天没消息」）—— "
+        "僵尸会话最典型的判据。注意这类是**我们推断**的，所以只进筛选预设，"
+        "**不塞进「异常」列**（那一列只放服务端标记，混着会让人不敢信）",
+        "新增：**日志面板可过滤**。每行按前缀自动分级（❌/⛔/🔥 错误、⚠/❓/⏳ 警告、其余信息），"
+        "顶部可勾选显示哪几级、可按关键词搜索、可一键「复制全部」；"
+        "**过滤只改显示，不改已写下的事实**（关掉信息级不会让那几行消失），自动滚动可关",
+        "新增：**工具提示**（鼠标停留 0.45 秒，关键按钮都有说明）、**F1 快捷键面板**"
+        "（顺带把「退出 / 删除会话 / 销毁」三者的区别钉在面板上）、"
+        "**首次使用引导卡片**（未加载时给三步走，而不是一片空白表格）",
+        "快捷键补充：Ctrl+H 退出历史、Ctrl+L 清空日志、F1 快捷键面板",
+    ]),
     ("v1.4.0", "2026-10-15", [
         "新增：**🚫 异常筛选**（列表上方按钮，或右键「只看这种异常」）。一次筛出**违规 / "
         "已封禁 / 不可关注 / 被禁言**的频道与群组 —— 表格新增「异常」列，每行标出最重的那一类"
@@ -983,6 +1004,228 @@ def risk_detail_text(ent):
     return "；".join(why for _c, why in risk_of(ent))
 
 
+# ---------------- 日志级别 ----------------
+# 级别不是让调用方多写一个参数，而是**从文案前缀推断** —— 200 多个 log_msg 调用点
+# 不用改签名，新增的日志也自动带上级别（前缀本来就是人眼一眼能看出的约定）。
+LOG_INFO = "info"
+LOG_WARN = "warn"
+LOG_ERROR = "error"
+LOG_LEVEL_META = ((LOG_INFO, "信息"), (LOG_WARN, "警告"), (LOG_ERROR, "错误"))
+LOG_LEVEL_COLOR = {LOG_INFO: "#8a8f98", LOG_WARN: "#c8871a", LOG_ERROR: "#d4574e"}
+_LOG_ERR_TOKENS = ("❌", "⛔", "🔥")
+_LOG_WARN_TOKENS = ("⚠", "❓", "⏹", "⏳", "↻")
+
+
+def log_level_of(msg):
+    """按前缀判断日志级别：❌/⛔/🔥 = 错误，⚠/❓/⏳/↻/⏹ = 警告，其余 = 信息。"""
+    head = str(msg).lstrip(" 　·.-")[:4]
+    if any(t in head for t in _LOG_ERR_TOKENS):
+        return LOG_ERROR
+    if any(t in head for t in _LOG_WARN_TOKENS):
+        return LOG_WARN
+    return LOG_INFO
+
+
+# ---------------- 订阅名额（500 / 1000） ----------------
+# ⚠️ 这个上限是**客户端侧的知识**（免费账号 500、Premium 1000），服务端不会返回它。
+# 所以界面上必须写成「按…估算」，不能说得像服务端权威值。
+QUOTA_FREE = 500
+QUOTA_PREMIUM = 1000
+
+
+def quota_limit_for(premium):
+    return QUOTA_PREMIUM if premium else QUOTA_FREE
+
+
+def quota_text(used, limit, premium=False):
+    """名额文案。used/limit 都可为 None（未连接 / 未加载）时返回空串。"""
+    try:
+        used = int(used)
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return ""
+    left = max(0, limit - used)
+    tag = "Premium" if premium else "免费账号"
+    return f"🎯 名额 {used}/{limit}（剩 {left}，按{tag}估算）"
+
+
+# ---------------- 退出历史 / 重新加入 ----------------
+HISTORY_FILE_NAME = "tg_history_%s.json"
+HISTORY_MAX = 2000          # 只保留最近这么多条，避免文件无限增长
+REJOIN_USERNAME = "username"
+REJOIN_INVITE = "invite"
+
+
+def parse_join_target(raw):
+    """把用户粘贴的东西解析成 (类型, 值)：
+      @name / name                      -> ("username", "name")
+      t.me/name / https://t.me/name     -> ("username", "name")
+      t.me/+HASH / joinchat/HASH        -> ("invite", "HASH")
+    解析不出来返回 (None, "")。"""
+    s = str(raw or "").strip()
+    if not s:
+        return None, ""
+    s = s.split("?", 1)[0].split("#", 1)[0] if s.startswith("http") else s
+    low = s.lower()
+    for host in ("https://t.me/", "http://t.me/", "t.me/", "https://telegram.me/",
+                 "telegram.me/", "https://www.t.me/"):
+        if low.startswith(host):
+            s = s[len(host):]
+            break
+    s = s.strip().strip("/")
+    low = s.lower()
+    if low.startswith("joinchat/"):
+        h = s[len("joinchat/"):].strip()
+        return (REJOIN_INVITE, h) if h else (None, "")
+    if s.startswith("+"):
+        h = s[1:].strip()
+        return (REJOIN_INVITE, h) if h else (None, "")
+    s = s.lstrip("@").strip()
+    if not s or any(ch.isspace() for ch in s):
+        return None, ""
+    return REJOIN_USERNAME, s
+
+
+def rejoin_public_link(username):
+    return f"https://t.me/{username}" if username else ""
+
+
+def history_entry(ent, name, action):
+    """把一条「已确认退出 / 删除」的会话记成历史项（供以后重新加入）。"""
+    kind = session_kind(ent)
+    user = (getattr(ent, "username", None) or "").strip()
+    target = REJOIN_USERNAME if user else None
+    try:
+        eid = int(getattr(ent, "id", 0) or 0)
+    except (TypeError, ValueError):
+        eid = 0
+    return {
+        "ts": time.time(),
+        "action": action,                     # 退出 / 删除
+        "id": eid,
+        "kind": kind,
+        "name": str(name or ""),
+        "username": user,
+        "rejoin": bool(user) and is_member_kind(kind),   # 私聊 / 机器人不谈「重新加入」
+        "target": target,
+    }
+
+
+def history_summary_text(items, limit=20):
+    """历史列表 → 日志行（最近 limit 条，新的在前）。"""
+    rows = sorted(items or [], key=lambda x: x.get("ts", 0), reverse=True)[:limit]
+    out = []
+    for it in rows:
+        when = time.strftime("%m-%d %H:%M", time.localtime(it.get("ts", 0)))
+        can = "可重新加入" if it.get("rejoin") else "不可重加"
+        out.append(f"   · [{when}] {it.get('action', '')} {it.get('name', '')}"
+                   f"（{it.get('kind', '')}）{can}"
+                   + (f"  t.me/{it['username']}" if it.get("username") else ""))
+    return out
+
+
+# ---------------- 快捷键一览 / 工具提示 ----------------
+SHORTCUTS = (
+    ("Ctrl+F / F3", "聚焦搜索框"),
+    ("Esc", "清空搜索"),
+    ("Ctrl+A", "全选（筛选生效时=全选筛选结果）"),
+    ("空格", "勾选 / 取消勾选选中行"),
+    ("F5", "刷新列表"),
+    ("Ctrl+G", "批量划分到分组"),
+    ("Ctrl+H", "退出历史 / 重新加入"),
+    ("Ctrl+D", "数据概览（图表）"),
+    ("Ctrl+L", "清空日志"),
+    ("F1", "打开这个快捷键面板"),
+)
+
+
+SHORTCUT_HANDLERS = {
+    "Ctrl+H": "_on_history_key",
+    "Ctrl+D": "_on_dashboard_key",
+    "Ctrl+L": "_on_clear_log_key",
+    "F1": "_on_shortcuts_key",
+}
+
+
+def shortcut_rows(app=None):
+    """快捷键一览：handler 还没实现的先不列（避免面板上写着、按了没反应）。"""
+    out = []
+    for key, desc in SHORTCUTS:
+        need = SHORTCUT_HANDLERS.get(key)
+        if need and app is not None and not hasattr(app, need):
+            continue
+        out.append((key, desc))
+    return tuple(out)
+
+
+class Tooltip:
+    """极简工具提示：鼠标停留 450ms 后在指针旁弹一个小窗，移开即消失。
+
+    用 Toplevel 而不是 ttk 的 tooltip（标准库没有），也不引第三方依赖。"""
+
+    def __init__(self, widget, text, delay=450, wraplength=320):
+        self.widget = widget
+        self.text = str(text)
+        self.delay = delay
+        self.wraplength = wraplength
+        self._after = None
+        self._tip = None
+        try:
+            widget.bind("<Enter>", self._schedule, add="+")
+            widget.bind("<Leave>", self._hide, add="+")
+            widget.bind("<ButtonPress>", self._hide, add="+")
+        except Exception:
+            pass
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        try:
+            self._after = self.widget.after(self.delay, self._show)
+        except Exception:
+            self._after = None
+
+    def _cancel(self):
+        try:
+            if self._after:
+                self.widget.after_cancel(self._after)
+        except Exception:
+            pass
+        self._after = None
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=self.text, justify="left", wraplength=self.wraplength,
+                     background="#ffffe1", foreground="#1f2328", relief="solid",
+                     borderwidth=1, padx=6, pady=4).pack()
+            self._tip = tip
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _e=None):
+        self._cancel()
+        tip, self._tip = self._tip, None
+        try:
+            if tip is not None:
+                tip.destroy()
+        except Exception:
+            pass
+
+
+def add_tip(widget, text):
+    """给控件挂提示；控件或环境不支持时静默跳过（测试桩里没有 winfo_rootx）。"""
+    try:
+        return Tooltip(widget, text)
+    except Exception:
+        return None
+
+
 # ---------------- 删除会话 / 销毁自己创建的群组·频道 ----------------
 # ⚠️ 三个概念必须分清楚，混用会做出「以为删了、其实只是退出了」或者相反的功能：
 #
@@ -1072,6 +1315,39 @@ def build_destroy_request(ent):
 def can_destroy_kind(kind):
     """只有频道 / 群组才谈得上「被创建者销毁」。私聊、机器人、已不在都不行。"""
     return kind in (KIND_CHANNEL, KIND_GROUP)
+
+
+async def rejoin_one(client, kind, value):
+    """重新加入一个频道 / 群组。返回 (状态, 说明)：ok / already / fail。
+
+    公开频道用 channels.JoinChannelRequest，私有邀请用 messages.ImportChatInviteRequest
+    （先用 CheckChatInviteRequest 预检，链接过期能直接说清楚，而不是甩一句 400）。"""
+    if not value:
+        return "fail", "空的目标"
+    try:
+        if kind == REJOIN_INVITE:
+            try:
+                await client(tl_messages.CheckChatInviteRequest(value))
+            except Exception as e:      # noqa: BLE001
+                return "fail", f"邀请链接不可用（可能已过期 / 已被撤销）：{e}"
+            await client(tl_messages.ImportChatInviteRequest(value))
+            return "ok", "已通过邀请链接加入"
+        entity = await client.get_entity(value)      # 先解析实体，别把字符串塞进请求
+        await client(tl_channels.JoinChannelRequest(entity))
+        return "ok", "已加入公开频道 / 群组"
+    except telethon_errors.UserAlreadyParticipantError:
+        return "already", "已经是成员"
+    except (telethon_errors.InviteHashExpiredError,
+            telethon_errors.InviteHashInvalidError) as e:
+        return "fail", f"邀请链接失效：{e}"
+    except telethon_errors.FloodWaitError as e:
+        return "fail", f"被限流，请等 {getattr(e, 'seconds', '?')} 秒后重试"
+    except telethon_errors.UsernameNotOccupiedError:
+        return "fail", "这个用户名已经不存在（频道可能已注销或改名）"
+    except telethon_errors.ChannelPrivateError:
+        return "fail", "该频道已不可访问（被封 / 私密 / 你被拉黑）"
+    except Exception as e:      # noqa: BLE001
+        return "fail", str(e)
 
 
 async def delete_history_entity(client, ent):
@@ -1366,6 +1642,8 @@ FILTER_PRESETS = [
     ("活跃 > 90 天没消息", None, None, 90),
     ("活跃 > 180 天没消息", None, None, 180),
     ("活跃 > 365 天没消息", None, None, 365),
+    ("空会话（作品数 = 0）", None, 1, None),
+    ("空会话且 >90 天没消息", None, 1, 90),
     ("用户数<10 且 作品数<10", 10, 10, None),
     ("用户数<100 且 作品数<10", 100, 10, None),
     ("用户数<10 且 作品数<100", 10, 100, None),
@@ -1468,6 +1746,15 @@ class App:
         self._search_after = None   # 搜索防抖的 after id
         self._risk = {}             # 行 id -> (异常类别码, ...)：违规 / 已封禁 / 不可关注…
         self._risk_filter = None    # 当前生效的异常筛选（None=不筛；否则是类别码元组）
+        self._premium = False       # 当前账号是否 Premium（决定名额上限 500 / 1000）
+        self._log_records = []      # 日志完整记录 [(级别, 文案)]：过滤/搜索只改显示，不改已写下的事实
+        self._log_levels = {LOG_INFO: True, LOG_WARN: True, LOG_ERROR: True}
+        self._log_level_vars = {}
+        self._log_query = ""        # 日志面板里只显示包含这个子串的行
+        self._history = None        # 退出历史（按账号懒加载）
+        self._history_key = None
+        self._guide = None          # 未加载 / 未连接时的引导卡片
+        self._tips = []             # 工具提示（持有引用，别让 GC 收掉）
         self._task_start = None     # 当前阶段任务开始时间（用于显示耗时）
         self._progress_running = False
         self._left_visible = True
@@ -1753,6 +2040,7 @@ class App:
 
         self.on_proxy_toggle()
         self._bind_shortcuts()
+        self._attach_tips()
 
         # 输入项改动即自动保存（API/手机号/代理/统计/筛选/退出节奏），避免每次重填；关窗时再兜底保存
         for var in (self.api_id_var, self.api_hash_var, self.phone_var,
@@ -2127,11 +2415,13 @@ class App:
         self.remember_layout_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="记住窗口大小 / 列宽 / 面板开合", variable=self.remember_layout_var,
                         command=self.save_config).grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Button(f, text="快捷键一览（F1）", command=self.on_show_shortcuts).grid(
+            row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         self.btn_reset_layout = ttk.Button(f, text="恢复默认布局", command=self.on_reset_layout)
-        self.btn_reset_layout.grid(row=2, column=0, sticky="ew", padx=4, pady=(10, 4))
-        ttk.Label(f, text="快捷键：Ctrl+F 搜索 / Ctrl+A 全选 / 空格 勾选 / F5 刷新 / Esc 清搜索",
+        self.btn_reset_layout.grid(row=3, column=0, sticky="ew", padx=4, pady=(10, 4))
+        ttk.Label(f, text="快捷键：Ctrl+F 搜索 / Ctrl+A 全选 / 空格 勾选 / F5 刷新 / Esc 清搜索 / F1 全部",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=3, column=0, sticky="w", padx=4, pady=(10, 2))
+            row=4, column=0, sticky="w", padx=4, pady=(10, 2))
 
     # ---------------- 右主区：筛选 + 表格 + 选择 + 退出 ----------------
     def _build_main_area(self, parent):
@@ -2236,6 +2526,7 @@ class App:
         hsb = ttk.Scrollbar(frm_list, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.tree.grid(row=1, column=0, sticky="nsew")
+        self._build_guide(frm_list)
         vsb.grid(row=1, column=1, sticky="ns")
         hsb.grid(row=2, column=0, sticky="ew")
 
@@ -2258,6 +2549,18 @@ class App:
         self.btn_risk["menu"] = self._risk_menu
         self.btn_risk.pack(side="left", padx=3)
         self._rebuild_risk_menu()
+        # 退出历史：退出是不可逆操作，这里给一次「后悔药」（Ctrl+H）
+        self.btn_history = ttk.Menubutton(frm_sel, text="🕘 历史 ▾")
+        self._history_menu = tk.Menu(self.btn_history, tearoff=0)
+        self._history_menu.add_command(label="查看最近 20 条", command=lambda: self.show_history(20))
+        self._history_menu.add_command(label="重新加入历史里可重加的全部…", command=self.on_rejoin_history)
+        self._history_menu.add_separator()
+        self._history_menu.add_command(label="从链接 / 用户名重新加入…", command=self.on_rejoin_links)
+        self._history_menu.add_command(label="复制全部重新加入链接", command=self.on_copy_history_links)
+        self._history_menu.add_separator()
+        self._history_menu.add_command(label="清空历史…", command=self.on_clear_history)
+        self.btn_history["menu"] = self._history_menu
+        self.btn_history.pack(side="left", padx=3)
         # 分组操作：对一批行批量加入 / 移出分组（只改归属，不退出也不删除）
         self.btn_folder = ttk.Menubutton(frm_sel, text="📁 分组 ▾")
         # postcommand：菜单弹出前重算（勾选数 / 筛选结果数会一直变，静态菜单会显示旧数字）
@@ -2308,6 +2611,74 @@ class App:
         ttk.Label(frm_act, text="随机抖动(秒):").pack(side="left", padx=(10, 2))
         ttk.Spinbox(frm_act, from_=0, to=60, textvariable=self.jitter_var, width=5).pack(side="left", padx=2)
 
+    # ---------------- 首次使用引导（空列表时盖在表格上） ----------------
+    def _build_guide(self, parent):
+        """未连接 / 未加载时给一张引导卡片，而不是让人对着一片空白表格发呆。"""
+        self._guide = ttk.Frame(parent, padding=24)
+        self._guide.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(self._guide, text="三步开始", font=("", 13)).pack(anchor="w", pady=(0, 8))
+        steps = (
+            "1. 到 my.telegram.org 申请 api_id / api_hash，填到左侧「网络」页（只需一次）",
+            "2. 左侧「账号」页填手机号 → 点「添加账号并登录」，按提示输验证码",
+            "3. 回到这里点「刷新列表」→ 勾选要处理的会话 → 底部「🚪 退出 / 删除选中」",
+        )
+        for t in steps:
+            ttk.Label(self._guide, text=t, foreground="#6b7280", wraplength=560,
+                      justify="left").pack(anchor="w", pady=2)
+        row = ttk.Frame(self._guide)
+        row.pack(anchor="w", pady=(12, 0))
+        ttk.Button(row, text="连接 / 登录", command=self.on_connect).pack(side="left")
+        ttk.Button(row, text="刷新列表", command=self.on_refresh).pack(side="left", padx=6)
+        ttk.Button(row, text="快捷键（F1）", command=self.on_show_shortcuts).pack(side="left")
+        ttk.Label(self._guide, text="提示：删 / 退之后都会回头向服务端复核，"
+                                    "没确认的行会留在列表里，不会谎报成功。",
+                  foreground="#6b7280", wraplength=560, justify="left").pack(anchor="w", pady=(12, 0))
+        self._guide.lift()
+
+    def _update_guide(self):
+        """列表里有行就藏起引导卡片；空了再显示。任何异常都不能影响加载流程。"""
+        g = getattr(self, "_guide", None)
+        if g is None:
+            return
+        try:
+            if self.channels:
+                g.grid_remove()
+            else:
+                g.grid()
+                g.lift()
+        except Exception:
+            pass
+
+    # ---------------- 工具提示 ----------------
+    def _attach_tips(self):
+        """给关键控件挂上说明（鼠标停留 0.45 秒出现）。测试桩里控件可能是假的，全部兜住。"""
+        tips = (
+            ("btn_connect", "连接 / 登录当前账号（登录态会保存，下次不用再收验证码）"),
+            ("btn_refresh", "重新拉取全部会话（分页加载，几百上千个也不会卡）"),
+            ("btn_stats", "批量获取用户数 / 作品数 / 最后活跃时间（命中本地缓存不发请求）"),
+            ("btn_stats_stop", "停止统计任务"),
+            ("btn_stop_all", "停止当前所有任务（列表加载 / 统计 / 退出）"),
+            ("btn_sel_all", "全选：筛选生效时只选当前显示出来的行"),
+            ("btn_sel_invert", "反选当前显示出来的行"),
+            ("btn_whitelist", "把勾选的行加入 / 移出白名单：白名单行永不被批量退出或删除"),
+            ("btn_risk", "按服务端标记筛选：违规受限 / 已封禁 / 不可访问 / 诈骗 / 假冒 / 禁言 / 已注销"),
+            ("btn_folder", "把勾选（或筛选结果 / 全部）的会话批量加入或移出某个分组"),
+            ("btn_history", "退出历史：退出是不可逆的，这里可以看记录并把公开频道重新加回来"),
+            ("btn_export", "导出 CSV：当前显示 / 全部 / 仅已勾选（含异常特征列）"),
+            ("btn_leave", "退出频道 / 群组；私聊与机器人会被删除会话。删完都会回头向服务端复核"),
+            ("btn_destroy", "删除【你本人创建】的频道 / 群组（对所有成员消失，不可恢复）"),
+            ("chk_hide_protected", "把白名单 / 创建者 / 管理员这些「不该动」的行从列表里藏起来"),
+            ("chk_only_checked", "只看已勾选的行（复核用）"),
+        )
+        for attr, text in tips:
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                self._tips.append(add_tip(w, text))
+            except Exception:
+                continue
+
     def _build_statusbar(self):
         bar = ttk.Frame(self.root, padding=(10, 2, 10, 2))
         bar.grid(row=3, column=0, sticky="ew")
@@ -2333,12 +2704,31 @@ class App:
         ttk.Label(head, text="运行日志").pack(side="left")
         ttk.Button(head, text="清空", width=6, command=self.on_clear_log).pack(side="left", padx=6)
         ttk.Button(head, text="导出", width=6, command=self.on_export_log).pack(side="left")
+        ttk.Button(head, text="复制全部", width=9, command=self.on_copy_log).pack(side="left", padx=(6, 0))
+        # 级别过滤：长任务一次刷上百行，只想看失败时把「信息」关掉即可
+        ttk.Label(head, text="　显示:").pack(side="left")
+        for lv, label in LOG_LEVEL_META:
+            var = tk.BooleanVar(value=True)
+            self._log_level_vars[lv] = var
+            ttk.Checkbutton(head, text=label, variable=var,
+                            command=self.on_log_filter_changed).pack(side="left", padx=(6, 0))
+        ttk.Label(head, text=" 搜索:").pack(side="left", padx=(8, 0))
+        self.log_query_var = tk.StringVar()
+        ent_lq = ttk.Entry(head, textvariable=self.log_query_var, width=18)
+        ent_lq.pack(side="left", padx=(2, 0))
+        ent_lq.bind("<Return>", lambda e: self.on_log_filter_changed())
+        self.log_query_var.trace_add("write", lambda *_a: self.on_log_filter_changed())
         self.log_autoscroll_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(head, text="自动滚动", variable=self.log_autoscroll_var).pack(side="left", padx=10)
         ttk.Label(head, text="提示：退出间隔太短容易触发限流；日志区可用顶部「🗒 日志」收起。",
                   foreground="#6b7280").pack(side="right")
         self.log = scrolledtext.ScrolledText(self.frm_log, height=7, state="normal")
         self.log.pack(fill="both", expand=True, pady=(3, 0))
+        for lv, _label in LOG_LEVEL_META:
+            try:
+                self.log.tag_configure(lv, foreground=LOG_LEVEL_COLOR.get(lv, "#1f2328"))
+            except Exception:
+                pass
 
     # ---------------- 更新日志 ----------------
     def on_show_changelog(self):
@@ -2461,9 +2851,27 @@ class App:
         self.root.bind("<Control-g>", self._on_folder_bulk_key)
         self.root.bind("<Control-G>", self._on_folder_bulk_key)
         self.root.bind("<F5>", self._on_refresh_key)
+        self.root.bind("<F1>", self._on_shortcuts_key)
+        self.root.bind("<Control-h>", self._on_history_key)
+        self.root.bind("<Control-H>", self._on_history_key)
+        self.root.bind("<Control-l>", self._on_clear_log_key)
+        self.root.bind("<Control-L>", self._on_clear_log_key)
         self.root.bind("<Escape>", self._on_escape)
         self.tree.bind("<space>", self._on_space_toggle)
         self.tree.bind("<Button-3>", self.on_tree_right_click)
+
+    def _on_shortcuts_key(self, event=None):
+        self.on_show_shortcuts()
+        return "break"
+
+    def _on_history_key(self, event=None):
+        """Ctrl+H：打开退出历史（重新加入就在这里）。"""
+        self.show_history()
+        return "break"
+
+    def _on_clear_log_key(self, event=None):
+        self.on_clear_log()
+        return "break"
 
     def _on_folder_bulk_key(self, event=None):
         """Ctrl+G：打开「批量划分到分组」。搜索 / 筛选完直接按它，把整批结果一次划进分组。"""
@@ -2595,6 +3003,7 @@ class App:
             self.log.delete("1.0", "end")
         except Exception:
             pass
+        self._log_records = []      # 记录一起清掉，否则「重画」会把清掉的行又变回来
 
     def on_export_log(self):
         try:
@@ -2759,6 +3168,32 @@ class App:
                                insertbackground=fg)
         except Exception:
             pass
+
+    def on_show_shortcuts(self):
+        """F1：快捷键面板（顺带把「三个概念」的颜色约定写进去）。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"快捷键 — {APP_NAME}")
+        dlg.transient(self.root)
+        try:
+            dlg.geometry("460x420")
+        except Exception:
+            pass
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="快捷键", font=("", 13)).pack(anchor="w", pady=(0, 8))
+        grid = ttk.Frame(body)
+        grid.pack(fill="x")
+        for i, (key, desc) in enumerate(shortcut_rows(self)):
+            ttk.Label(grid, text=key, width=14).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Label(grid, text=desc, foreground="#6b7280").grid(row=i, column=1, sticky="w", pady=2)
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(body, text="三个动作不是一回事", font=("", 12)).pack(anchor="w")
+        for txt in ("🔓 退出：不再是成员（频道 / 群组；创建者退不出去）",
+                    "🗑 删除会话：只从你这边删掉会话与聊天记录，对方不受影响",
+                    "🔥 销毁：删除你本人创建的频道 / 群组，对所有成员消失、不可恢复"):
+            ttk.Label(body, text=txt, foreground="#6b7280", wraplength=420,
+                      justify="left").pack(anchor="w", pady=1)
+        ttk.Button(body, text="关闭", command=dlg.destroy).pack(anchor="e", pady=(12, 0))
 
     def on_reset_layout(self):
         if not messagebox.askyesno("确认", "恢复默认布局（窗口大小 / 列宽 / 面板开合）？"):
@@ -3056,18 +3491,78 @@ class App:
         self.root.after(0, lambda: self._log(msg))
 
     def _log(self, msg):
+        """写日志。**先把完整记录存下来**，再按当前过滤条件决定要不要显示 ——
+        过滤/搜索只改显示，不改已经写下的事实（否则「关掉信息级」会让人以为那几行没发生过）。"""
+        text = str(msg)
+        lvl = log_level_of(text)
         try:
-            self.log.insert("end", msg + "\n")
-            if getattr(self, "log_autoscroll_var", None) is None or self.log_autoscroll_var.get():
-                self.log.see("end")
-            # 日志过长时裁掉最前面的旧内容，避免长时间运行后界面变卡
-            try:
-                if int(str(self.log.index("end-1c")).split(".")[0]) > 4000:
-                    self.log.delete("1.0", "1500.0")
-            except Exception:
-                pass
+            self._log_records.append((lvl, text))
+            if len(self._log_records) > 4000:
+                del self._log_records[:1500]
         except Exception:
             pass
+        if not self._log_level_shown(lvl) or not self._log_match(text):
+            return
+        self._log_write(lvl, text)
+
+    def _log_level_shown(self, lvl):
+        try:
+            return bool(self._log_levels.get(lvl, True))
+        except Exception:
+            return True
+
+    def _log_match(self, text):
+        q = getattr(self, "_log_query", "") or ""
+        return (not q) or (q.lower() in text.lower())
+
+    def _log_write(self, lvl, text):
+        try:
+            self.log.insert("end", text + "\n", (lvl,))
+            if getattr(self, "log_autoscroll_var", None) is None or self.log_autoscroll_var.get():
+                self.log.see("end")
+            if int(str(self.log.index("end-1c")).split(".")[0]) > 4000:
+                self.log.delete("1.0", "1500.0")
+        except Exception:
+            pass
+
+    def _rerender_log(self):
+        """按当前级别 / 搜索条件重画日志区（记录本身不动）。"""
+        try:
+            self.log.delete("1.0", "end")
+        except Exception:
+            return
+        shown = 0
+        for lvl, text in list(getattr(self, "_log_records", [])):
+            if not self._log_level_shown(lvl) or not self._log_match(text):
+                continue
+            self._log_write(lvl, text)
+            shown += 1
+        if shown == 0 and getattr(self, "_log_records", None):
+            self._log_write(LOG_INFO, "（当前过滤条件下没有可显示的日志行）")
+
+    def on_log_filter_changed(self):
+        """级别勾选 / 搜索词变化：重画日志区。搜索词也要同步到 _log_query（新行按同条件过滤）。"""
+        try:
+            self._log_query = (self.log_query_var.get() or "").strip()
+        except Exception:
+            self._log_query = ""
+        for lv, _label in LOG_LEVEL_META:
+            var = self._log_level_vars.get(lv)
+            try:
+                self._log_levels[lv] = bool(var.get()) if var is not None else True
+            except Exception:
+                pass
+        self._rerender_log()
+
+    def on_copy_log(self):
+        """复制**完整**日志（不受级别 / 搜索过滤影响）到剪贴板 —— 报障时直接粘贴。"""
+        text = "\n".join(t for _l, t in getattr(self, "_log_records", []))
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log_msg(f"📋 已复制 {len(getattr(self, '_log_records', []))} 行日志到剪贴板。")
+        except Exception as e:
+            self.log_msg(f"⚠️ 复制日志失败: {e}")
 
     # ---------------- 登录验证（界面内嵌输入框，避免弹窗不可见）----------------
     def enable_code_input(self, prompt_text, fut):
@@ -3401,6 +3896,11 @@ class App:
         if me is not None:
             acc["user_id"] = getattr(me, "id", None)
             acc["username"] = getattr(me, "username", None) or ""
+            # Premium 决定订阅名额上限（免费 500 / Premium 1000）—— 这个上限是客户端侧
+            # 知识，服务端不返回，所以只能登录时从 me.premium 读一次并记在账号上。
+            acc["premium"] = bool(getattr(me, "premium", False))
+            if acc["key"] == self._current_key:
+                self._premium = acc["premium"]
             full = " ".join(str(x) for x in (getattr(me, "first_name", None),
                                              getattr(me, "last_name", None)) if x).strip()
             if full:
@@ -3675,6 +4175,9 @@ class App:
         self._clients[acc["key"]] = client
         switched = (self._current_key != acc["key"])
         self._current_key = acc["key"]
+        self._premium = bool(acc.get("premium", False))   # 名额上限跟着账号走
+        self._history = None                              # 退出历史也是按账号的，切号后重新读
+        self._history_key = None
         self.client = client
         self.log_msg("✅ 登录成功！")
         status_text = f"🟢 已连接：{account_label(acc)}"
@@ -3776,6 +4279,9 @@ class App:
         self._sel_hidden = set()
         self._role = {}             # 行 id 变了，角色映射随之作废（白名单按频道 id 存，不受影响）
         self._risk = {}             # 异常特征同样按行 id 记，行没了就必须一起清
+        _guide = getattr(self, "_update_guide", None)   # 测试桩 App 没有这个方法
+        if callable(_guide):
+            _guide()                # 列表清空了：把引导卡片放回来
         self.update_count()
         self._refresh_headings()
 
@@ -3824,6 +4330,9 @@ class App:
                 self._fill_folder_cell(iid, ent)   # 分组归属（filters 已在加载前拉好）
             except Exception:
                 pass
+        _guide = getattr(self, "_update_guide", None)   # 测试桩 App 没有这个方法，别把它带崩
+        if callable(_guide):
+            _guide()                                  # 有行了就把引导卡片收起来
         if self._filter_active:
             self.apply_filter(verbose=False)      # 新行按当前筛选条件决定是否显示
         else:
@@ -3842,6 +4351,9 @@ class App:
             self.log_msg("ℹ️ 当前筛选条件下暂无可显示的行：统计获取完成前多为未获取状态，"
                          "可取消勾选「隐藏统计未获取的行」，或等统计跑完。")
         self.finish_task(f"列表加载完成：{n} 个会话")
+        _quota = getattr(self, "log_quota", None)   # 测试桩 App 没有这个方法
+        if callable(_quota):
+            _quota()              # 名额（频道 + 群组）—— 这个工具就是为它而生的
         # 异常特征统计（零请求：都用会话列表里已给的字段）。
         # 用 getattr 兜一层：测试桩 App 只实现自己关心的那部分接口，
         # 一个统计日志不该把整套加载流程带崩。
@@ -5467,7 +5979,221 @@ class App:
         else:
             head = f"共 {total} 个"
             body = self._kinds_text(self._count_kinds(list(self.channels.keys())))
-        return f"{head}　│　{body}" if body else head
+        main = f"{head}　│　{body}" if body else head
+        # 测试桩 App 没有 _quota_hint —— 统计条本身不能因为这个整条刷不出来
+        _qh = getattr(self, "_quota_hint", None)
+        quota = _qh() if callable(_qh) else ""
+        return f"{main}　│　{quota}" if quota else main
+
+    # ---------------- 退出历史 / 重新加入 ----------------
+    def history_path(self):
+        key = self._current_key or DEFAULT_ACCOUNT_KEY
+        return os.path.join(BASE_DIR, HISTORY_FILE_NAME % key)
+
+    def load_history(self, force=False):
+        """读当前账号的退出历史（懒加载 + 切号自动失效）。"""
+        key = self._current_key or DEFAULT_ACCOUNT_KEY
+        if not force and self._history is not None and self._history_key == key:
+            return self._history
+        items = []
+        try:
+            with open(self.history_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                items = [x for x in data if isinstance(x, dict)]
+        except FileNotFoundError:
+            items = []
+        except Exception as e:      # noqa: BLE001
+            self.log_msg(f"⚠️ 退出历史读取失败（当作空历史继续）: {e}")
+            items = []
+        self._history = items
+        self._history_key = key
+        return items
+
+    def save_history(self, items):
+        items = list(items or [])[-HISTORY_MAX:]
+        self._history = items
+        self._history_key = self._current_key or DEFAULT_ACCOUNT_KEY
+        try:
+            with open(self.history_path(), "w", encoding="utf-8") as f:
+                json.dump(items, f, ensure_ascii=False, indent=1)
+        except Exception as e:      # noqa: BLE001
+            self.log_msg(f"⚠️ 退出历史写入失败（不影响本次操作）: {e}")
+
+    def record_history(self, rows, action):
+        """把**服务端已确认**退出 / 删除的行记进历史。rows = [(iid, ent, name)]。"""
+        if not rows:
+            return
+        items = self.load_history()
+        for _iid, ent, name in rows:
+            if ent is None:
+                continue
+            try:
+                items.append(history_entry(ent, name, action))
+            except Exception:
+                continue
+        self.save_history(items)
+        self.log_msg(f"🕘 已记入退出历史 {len(rows)} 条"
+                     f"（文件 {os.path.basename(self.history_path())}；误退了可以用它重新加入）。")
+
+    def show_history(self, limit=20):
+        """Ctrl+H / 菜单：把退出历史写进日志。"""
+        items = self.load_history()
+        if not items:
+            self.log_msg("🕘 退出历史是空的：还没有通过本工具退出 / 删除过会话。")
+            return 0
+        reusable = [x for x in items if x.get("rejoin")]
+        self.log_msg(f"🕘 退出历史：共 {len(items)} 条，其中 {len(reusable)} 条可以重新加入"
+                     f"（有公开用户名；邀请链接进的私有频道无法重加）：")
+        for line in history_summary_text(items, limit):
+            self.log_msg(line)
+        if len(items) > limit:
+            self.log_msg(f"   · …另有 {len(items) - limit} 条更早的记录（点「导出」可看全量文件）。")
+        return len(items)
+
+    def history_targets(self):
+        """可重新加入的目标：优先用户名，其次历史里存过的邀请链接 hash。"""
+        out, seen = [], set()
+        for it in reversed(self.load_history()):     # 新的优先
+            if not it.get("rejoin"):
+                continue
+            user = (it.get("username") or "").strip()
+            if not user or user in seen:
+                continue
+            seen.add(user)
+            out.append((REJOIN_USERNAME, user, it))
+        return out
+
+    def on_rejoin_history(self):
+        """重新加入历史里所有可重加的频道 / 群组（先给确认清单）。"""
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接并刷新列表。")
+            return
+        targets = self.history_targets()
+        if not targets:
+            messagebox.showinfo("提示", "历史里没有可重新加入的条目（私聊 / 机器人 / 私有邀请频道无法重加）。")
+            return
+        preview = "\n".join(f"· {t[2].get('name') or t[1]}   t.me/{t[1]}" for t in targets[:15])
+        more = f"\n…另有 {len(targets) - 15} 个" if len(targets) > 15 else ""
+        if not messagebox.askyesno(
+                "重新加入确认",
+                f"要把这 {len(targets)} 个频道 / 群组重新加入吗？\n\n{preview}{more}\n\n"
+                "（按 Telegram 的限流，会逐个加并自动等待）"):
+            return
+        self.run_async(self._rejoin_batch(targets))
+
+    def on_rejoin_links(self):
+        """从粘贴的链接 / 用户名加入（补充历史里没有的）。"""
+        if not self.client:
+            messagebox.showinfo("提示", "请先连接并刷新列表。")
+            return
+        raw = simpledialog.askstring(
+            "从链接重新加入", "粘贴频道 / 群组的链接或用户名，一行一个：\n"
+                              "（支持 t.me/name、@name、t.me/+邀请码）", parent=self.root)
+        if not raw:
+            return
+        targets, bad = [], 0
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            kind, value = parse_join_target(line)
+            if not kind:
+                bad += 1
+                continue
+            targets.append((kind, value, {"name": value, "action": "手工加入", "ts": 0}))
+        if bad:
+            self.log_msg(f"⚠️ 有 {bad} 行没看懂（既不是用户名也不是 t.me 链接），已跳过。")
+        if not targets:
+            messagebox.showinfo("提示", "没有解析出可用的链接或用户名。")
+            return
+        self.run_async(self._rejoin_batch(targets))
+
+    async def _rejoin_batch(self, targets):
+        """逐个重新加入。每个都单独报结果 —— 不拿「没抛异常」当成功。"""
+        self.root.after(0, lambda n=len(targets): self.start_task(f"正在重新加入 {n} 个…"))
+        ok = fail = 0
+        for idx, (kind, value, meta) in enumerate(targets, 1):
+            name = (meta or {}).get("name") or value
+            self.root.after(0, lambda i=idx, n=len(targets): self.set_progress(
+                i - 1, n, f"正在重新加入 {i}/{n}"))
+            try:
+                status, note = await rejoin_one(self.client, kind, value)
+            except Exception as e:      # noqa: BLE001
+                status, note = "fail", str(e)
+            if status == "ok":
+                ok += 1
+                self.log_msg(f"➕ 已重新加入: {name}（{note or '服务端已确认'}）")
+            elif status == "already":
+                ok += 1
+                self.log_msg(f"➖ 本就在里面，无需重复加入: {name}")
+            else:
+                fail += 1
+                self.log_msg(f"❌ 重新加入失败: {name} → {note}")
+            await asyncio.sleep(max(1.0, self._interval()))
+        self.log_msg(f"🏁 重新加入完成：成功 {ok} 个，失败 {fail} 个。"
+                     "（列表不会自动刷新，点「🔄 刷新列表」即可看到它们回来）")
+        self.root.after(0, lambda o=ok, f=fail: self.finish_task(
+            f"重新加入完成：成功 {o} 个，失败 {f} 个"))
+        self.root.after(0, self.update_count)
+
+    def on_clear_history(self):
+        items = self.load_history()
+        if not items:
+            self.log_msg("🕘 退出历史本来就是空的。")
+            return
+        if not messagebox.askyesno("确认", f"清空退出历史（{len(items)} 条）？\n\n"
+                                          "清掉之后就没法再用它重新加入了。"):
+            return
+        self.save_history([])
+        self.log_msg("🕘 退出历史已清空。")
+
+    def on_copy_history_links(self):
+        targets = self.history_targets()
+        if not targets:
+            self.log_msg("🕘 历史里没有可重新加入的链接。")
+            return
+        text = "\n".join(rejoin_public_link(t[1]) for t in targets)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log_msg(f"📋 已复制 {len(targets)} 条重新加入链接到剪贴板。")
+        except Exception as e:
+            self.log_msg(f"⚠️ 复制链接失败: {e}")
+
+    # ---------------- 订阅名额（500 / 1000） ----------------
+    def quota_used(self):
+        """已占用的名额 = 频道 + 群组（「已不在」的不算 —— 那已经不是成员了）。"""
+        n = 0
+        for ent in list(self.channels.values()):
+            try:
+                if is_member_kind(session_kind(ent)):
+                    n += 1
+            except Exception:
+                continue
+        return n
+
+    def quota_limit(self):
+        return quota_limit_for(bool(getattr(self, "_premium", False)))
+
+    def _quota_hint(self):
+        """统计条尾部的名额提示（未加载任何会话时不显示，免得开机就是 0/500）。"""
+        if not self.channels:
+            return ""
+        return quota_text(self.quota_used(), self.quota_limit(),
+                          bool(getattr(self, "_premium", False)))
+
+    def log_quota(self, before=None):
+        """把名额写进日志。before 给了就顺便报「本次腾出几个」。"""
+        if not self.channels and before is None:
+            return
+        used = self.quota_used()
+        limit = self.quota_limit()
+        line = f"🎯 订阅名额：{used}/{limit}（剩 {max(0, limit - used)}）"
+        line += "——Premium 上限 1000" if self._premium else "——免费账号上限 500"
+        self.log_msg(line)
+        if before is not None and before > used:
+            self.log_msg(f"   · 本次腾出 {before - used} 个名额（{before} → {used}）。")
 
     def _update_stats(self):
         """刷新列表上方的类型统计条。任何异常都不能打断列表加载/统计回填。"""
@@ -5975,7 +6701,9 @@ class App:
         self._visible.discard(iid)
         self._sel_hidden.discard(iid)
         self._role.pop(iid, None)
-        self._risk.pop(iid, None)
+        _risk = getattr(self, "_risk", None)
+        if isinstance(_risk, dict):
+            _risk.pop(iid, None)
         try:
             self._row_order.remove(iid)
         except ValueError:
@@ -6282,6 +7010,11 @@ class App:
             if iid in kept_ids or iid in unver:
                 continue        # 没被确认的一律留在列表，别让界面看起来「都成了」
             self.root.after(0, lambda i=iid: self._drop_row(i))
+        confirmed = [(iid, ent, name) for iid, ent, name in made
+                     if iid not in kept_ids and iid not in unver]
+        if confirmed:
+            # 只有**服务端确认没了**的行才进历史 —— 没确认的还在列表里，重加也无从谈起。
+            self.record_history(confirmed, verb)
         real_ok = ok - len(kept) - len(unver)
         real_fail = fail + len(kept)
         bits = [f"成功 {real_ok} 个", f"失败 {real_fail} 个"]
@@ -6294,6 +7027,19 @@ class App:
         else:
             note = "。"
         self.log_msg("🏁 完成：" + "，".join(bits) + note)
+        freed = 0
+        for _i, _e, _n in confirmed:
+            try:
+                if is_member_kind(session_kind(_e)):
+                    freed += 1
+            except Exception:
+                continue
+        if freed:
+            self.log_msg(f"🎯 本次腾出 {freed} 个订阅名额。")
+        try:
+            self.log_quota()
+        except Exception:
+            pass
         self.root.after(0, lambda o=real_ok, f=real_fail, v=verb: self.finish_task(
             f"{v}完成：成功 {o} 个，失败 {f} 个"))
         self.root.after(0, self.update_count)
@@ -6906,6 +7652,23 @@ def selftest():
                 id=3, title="ok", photo=None, date=None)) == ()
             assert app._risk_hit_count() == 0 and app._risk_counts() == {}
             _selftest_say(lines, "异常特征：🚫 异常按钮 / 分类菜单 / 零请求分类器（封禁·违规·诈骗·禁言…）OK")
+            # v1.5.0：名额指示 / 退出历史 / 日志分级 / 引导与提示
+            assert app.lbl_kind_stats is not None and app.btn_history is not None
+            assert app._history_menu is not None, "缺少退出历史菜单"
+            assert app._guide is not None, "缺少首次使用引导卡片"
+            assert shortcut_rows() and any(k == "F1" for k, _d in shortcut_rows())
+            assert quota_limit_for(False) == QUOTA_FREE and quota_limit_for(True) == QUOTA_PREMIUM
+            assert "500" in quota_text(447, 500) and "53" in quota_text(447, 500)
+            assert app.quota_used() == 0 and app.quota_limit() in (QUOTA_FREE, QUOTA_PREMIUM)
+            assert log_level_of("❌ 失败") == LOG_ERROR
+            assert log_level_of("⚠️ 注意") == LOG_WARN
+            assert log_level_of("✅ 成功") == LOG_INFO
+            assert parse_join_target("t.me/durov") == (REJOIN_USERNAME, "durov")
+            assert parse_join_target("https://t.me/+AbCdEf") == (REJOIN_INVITE, "AbCdEf")
+            assert parse_join_target("@some_channel") == (REJOIN_USERNAME, "some_channel")
+            assert parse_join_target("") == (None, "")
+            assert app._log_level_vars and len(app._log_level_vars) == 3
+            _selftest_say(lines, "v1.5.0：名额指示 / 退出历史·重新加入 / 日志分级 / 引导·提示·F1 OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
