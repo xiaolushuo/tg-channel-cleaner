@@ -39,13 +39,22 @@ try:
     from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 except ModuleNotFoundError:
     base = os.path.dirname(os.path.abspath(__file__))
-    exe_path = os.path.join(base, "dist", "TG频道批量退出工具.exe")
+    # 从源码读取版本号，指向带版本号的 exe 文件名（如 TG频道批量退出工具.v1.7.6.exe）
+    _ver = "v?"
+    try:
+        with open(os.path.abspath(__file__), encoding="utf-8") as _vf:
+            _m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', _vf.read())
+            if _m:
+                _ver = _m.group(1)
+    except Exception:
+        pass
+    exe_path = os.path.join(base, "dist", "TG频道批量退出工具.%s.exe" % _ver)
     has_exe = os.path.isfile(exe_path)
 
     guide = (
         "[错误] 当前 Python 未包含 tkinter（GUI 模块），无法启动界面。\n"
         "解决办法（任选其一）：\n"
-        "  1) 直接用已打包好的单文件程序：dist/TG频道批量退出工具.exe（无需安装 Python）。\n"
+        "  1) 直接用已打包好的单文件程序：dist/TG频道批量退出工具.%s.exe（无需安装 Python）。\n" % _ver
         "  2) 换用带 tkinter 的完整版 Python：\n"
         "     - Windows：从 https://www.python.org 安装官方 CPython（默认即含 tkinter）。\n"
         "     - Linux(Debian/Ubuntu)：sudo apt install python3-tk\n"

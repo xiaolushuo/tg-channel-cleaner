@@ -1,5 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+# 自动从源码读取版本号，让产物文件名带版本（如 TG频道批量退出工具.v1.7.6.exe）
+import re as _re
+with open('tg_channel_leave.py', encoding='utf-8') as _f:
+    _src = _f.read()
+APP_VERSION = _re.search(r'APP_VERSION\s*=\s*"([^"]+)"', _src).group(1)
+EXE_NAME = 'TG频道批量退出工具.%s' % APP_VERSION
 
 a = Analysis(
     ['tg_channel_leave.py'],
@@ -22,7 +28,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='TG频道批量退出工具',
+    name=EXE_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

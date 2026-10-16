@@ -317,7 +317,7 @@ Telegram 里只有**频道 / 群组**谈得上「退出」，**私聊和机器�
 
 **方式一（推荐）**：到 [Releases](https://github.com/xiaolushuo/tg-channel-cleaner/releases/latest) 下载 exe。
 
-**方式二**：直接下载仓库里的 `dist/TG频道批量退出工具.exe`（两者是同一个文件）。
+**方式二**：直接下载仓库 `dist/` 目录里的 `TG频道批量退出工具.vX.Y.Z.exe`（文件名带版本号，例如当前为 `TG频道批量退出工具.v1.7.6.exe`）。
 
 双击运行即可。**Windows，绿色单文件，不需要安装 Python。**
 
@@ -332,7 +332,7 @@ pyinstaller --noconfirm "TG频道批量退出工具_调试版.spec"
 **想确认打出来的包是否完整？** 任意一个版本都支持自检：
 
 ```bash
-"dist/TG频道批量退出工具.exe" --selftest
+"dist/TG频道批量退出工具.v1.7.6.exe" --selftest
 ```
 
 它会检查解释器 / tkinter / telethon 是否被正确打进包、关键请求能否构造、界面骨架能否建起来，然后以**退出码**给出结论（`0` = 通过），并把结果写到 exe 同目录的 `tg_selftest.log`。自检过程会把数据文件重定向到临时目录，**不会碰你的登录态与配置**。

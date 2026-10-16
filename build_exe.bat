@@ -31,8 +31,13 @@ python -m PyInstaller --noconfirm --onefile --windowed --name "TG频道批量退
   tg_channel_leave.py
 
 echo.
+
+REM 自动读取版本号，把产物改名为带版本号的形式（如 TG频道批量退出工具.v1.7.6.exe）
+for /f "delims=" %%v in ('python -c "import re;print(re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"', open('tg_channel_leave.py', encoding='utf-8').read()).group(1))"') do set APP_VER=%%v
+
 if exist "dist\TG频道批量退出工具.exe" (
-  echo 构建完成，exe 位于：dist\TG频道批量退出工具.exe
+  move /Y "dist\TG频道批量退出工具.exe" "dist\TG频道批量退出工具.%APP_VER%.exe" >NUL
+  echo 构建完成，exe 位于：dist\TG频道批量退出工具.%APP_VER%.exe
 ) else (
   echo 构建似乎未完成，请检查上方输出。
 )
