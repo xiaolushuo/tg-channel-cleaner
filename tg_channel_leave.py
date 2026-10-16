@@ -285,11 +285,28 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.3"
+APP_VERSION = "v1.7.4"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.4", "2026-10-16", [
+        "修复：**顶部的筛选功能「没有了」**（用户反馈）。上一版只修了顶部筛选条与日志面板头部，"
+        "**漏了表格上方那条选择 / 筛选栏**（全选 / 反选 / 清空全部 / 🔒 白名单 / 🚫 异常 / 🕘 历史 / "
+        "📊 概览 / ⏯ 任务 / 📁 分组 / 隐藏受保护项 / 导出 CSV / 计数）—— 同样的毛病："
+        "一排控件用 pack 铺开，空间不足时后面的被静默裁掉",
+        "实测复现：**左侧设置栏展开**（用户的正常用法）后主区只剩 835px，而这一排需要 1045px —— "
+        "「📁 分组 ▾」被挤成 **32px** 宽（只剩一个「📁…」几乎看不见），"
+        "「隐藏受保护项」「导出 CSV ▾」「共 N 个」直接溢出到主区外面",
+        "改法：这条选择栏与底部操作条一起改用 `FlowBar`（放不下就折到下一行）。"
+        "左栏展开 + 主区 715px（窗口 1080）下也全部可见；「📁 分组 ▾」恢复成完整宽度",
+        "顺带修：**折行会把「标签」和它的输入框拆到两行** —— v1.7.3 实测出现过"
+        "「分组:」留在第一行、下拉框被甩到第二行，看起来就像筛选功能没了。"
+        "现在「类型: + 下拉」「分组: + 下拉」「退出间隔(秒): + 输入框」都绑成不可拆分的一组",
+        "新增**通用扫描**（写进测试与自检）：遍历整棵控件树，找出**任何**超出父容器右边界的控件。"
+        "上一版是「逐排点名检查」，所以漏掉了第三条 —— 现在改成不管有几排都能扫出来，"
+        "并在测试里跑「左栏开合 × 5 档窗口宽度」共 10 种布局组合",
+    ]),
     ("v1.7.3", "2026-10-15", [
         "修复：**「🗒 日志」按钮被窗口挡住**（用户反馈）。实测默认窗口宽度 1200 下，顶部那一排"
         "控件的右边界到了 **1368px** —— 超出窗口的那部分被直接裁掉，不只是「🗒 日志」，"
@@ -3023,19 +3040,25 @@ class App:
         self.lbl_search_hit.pack(side="left", padx=(6, 0))
         bar.add(sfrm, stretch=True)
 
-        bar.add(ttk.Label(bar, text="类型:"))
+        # 标签 + 它的下拉框绑成一组：不绑的话折行可能把「类型:」留在第一行、
+        # 把下拉框甩到第二行（上一版实测就出现了这种错位，看起来像功能没了）
+        _gt = ttk.Frame(bar)
+        ttk.Label(_gt, text="类型:").pack(side="left")
         self.type_filter_var = tk.StringVar(value="全部")
-        self.cmb_type = ttk.Combobox(bar, textvariable=self.type_filter_var, state="readonly",
+        self.cmb_type = ttk.Combobox(_gt, textvariable=self.type_filter_var, state="readonly",
                                      width=7, values=TYPE_CHOICES)
-        bar.add(self.cmb_type, tail=4)
+        self.cmb_type.pack(side="left", padx=(4, 0))
+        bar.add(_gt, tail=4)
         self.cmb_type.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
         # 分组筛选：取值在连上账号、读到 dialog filters 后填充（见 refresh_folders）
-        bar.add(ttk.Label(bar, text="分组:"))
+        _gf = ttk.Frame(bar)
+        ttk.Label(_gf, text="分组:").pack(side="left")
         self.folder_filter_var = tk.StringVar(value=FOLDER_ALL)
-        self.cmb_folder = ttk.Combobox(bar, textvariable=self.folder_filter_var, state="readonly",
+        self.cmb_folder = ttk.Combobox(_gf, textvariable=self.folder_filter_var, state="readonly",
                                        width=12, values=(FOLDER_ALL, FOLDER_NONE))
-        bar.add(self.cmb_folder, tail=4)
+        self.cmb_folder.pack(side="left", padx=(4, 0))
+        bar.add(_gf, tail=4)
         self.cmb_folder.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
         self.only_checked_var = tk.BooleanVar(value=False)
@@ -3574,21 +3597,28 @@ class App:
         # 3) 选择条
         # 范围说明：筛选生效时「全选 / 反选」只作用于**当前显示出来的筛选结果**，
         # 被隐藏的行既不会被勾上、也不会被反选；要连隐藏行一起清掉用「清空全部」。
-        frm_sel = ttk.Frame(parent)
+        # ⚠️ 这一排 12 个控件加起来约 1045px，而**左侧设置栏展开后主区只剩 ~835px**
+        #（1080 的窗口下更窄）。以前用 pack 铺一排，空间不足时后面的被静默裁掉 ——
+        # 用户看到的「📁 分组 ▾ 没了」「导出 / 隐藏受保护项 / 计数都没了」就是这个：
+        # 「📁 分组 ▾」还会被挤成 32px 宽，只剩一个「📁…」几乎看不见。
+        # 改用 FlowBar：放不下就折到下一行，任何主区宽度下都点得到。
+        frm_sel = FlowBar(parent, gap=6)
         frm_sel.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        self._flow_sel = frm_sel      # 供自检 / 测试检查折行情况
         self.btn_sel_all = ttk.Button(frm_sel, text="全选", command=self.select_all_visible)
-        self.btn_sel_all.pack(side="left", padx=3)
+        frm_sel.add(self.btn_sel_all)
         self.btn_sel_invert = ttk.Button(frm_sel, text="反选", command=self.invert)
-        self.btn_sel_invert.pack(side="left", padx=3)
-        ttk.Button(frm_sel, text="清空全部", command=lambda: self.set_all(False, scope="all")).pack(side="left", padx=3)
+        frm_sel.add(self.btn_sel_invert)
+        frm_sel.add(ttk.Button(frm_sel, text="清空全部",
+                               command=lambda: self.set_all(False, scope="all")))
         self.btn_whitelist = ttk.Button(frm_sel, text="🔒 白名单", command=self.on_toggle_whitelist_checked)
-        self.btn_whitelist.pack(side="left", padx=3)
+        frm_sel.add(self.btn_whitelist)
         # 异常筛选：违规 / 已封禁 / 不可关注 / 禁言 …… 特征全部来自服务端字段（零请求）
         self.btn_risk = ttk.Menubutton(frm_sel, text="🚫 异常 ▾")
         self._risk_menu = tk.Menu(self.btn_risk, tearoff=0,
                                   postcommand=self._refresh_risk_menu)
         self.btn_risk["menu"] = self._risk_menu
-        self.btn_risk.pack(side="left", padx=3)
+        frm_sel.add(self.btn_risk)
         self._rebuild_risk_menu()
         # 退出历史：退出是不可逆操作，这里给一次「后悔药」（Ctrl+H）
         self.btn_history = ttk.Menubutton(frm_sel, text="🕘 历史 ▾")
@@ -3601,29 +3631,28 @@ class App:
         self._history_menu.add_separator()
         self._history_menu.add_command(label="清空历史…", command=self.on_clear_history)
         self.btn_history["menu"] = self._history_menu
-        self.btn_history.pack(side="left", padx=3)
-        ttk.Button(frm_sel, text="📊 概览", command=self.on_show_dashboard).pack(
-            side="left", padx=3)
+        frm_sel.add(self.btn_history)
+        frm_sel.add(ttk.Button(frm_sel, text="📊 概览", command=self.on_show_dashboard))
         # 批量任务：中断续跑（进度每完成一个就落盘）
         self.btn_task = ttk.Menubutton(frm_sel, text="⏯ 任务 ▾")
         self._task_menu = tk.Menu(self.btn_task, tearoff=0)
         self._task_menu.add_command(label="继续上次未完成的…", command=self.on_resume_task)
         self._task_menu.add_command(label="清除任务进度记录", command=self.on_discard_task)
         self.btn_task["menu"] = self._task_menu
-        self.btn_task.pack(side="left", padx=3)
+        frm_sel.add(self.btn_task)
         # 分组操作：对一批行批量加入 / 移出分组（只改归属，不退出也不删除）
         self.btn_folder = ttk.Menubutton(frm_sel, text="📁 分组 ▾")
         # postcommand：菜单弹出前重算（勾选数 / 筛选结果数会一直变，静态菜单会显示旧数字）
         self._folder_menu = tk.Menu(self.btn_folder, tearoff=0,
                                     postcommand=self._refresh_folder_menu)
         self.btn_folder["menu"] = self._folder_menu
-        self.btn_folder.pack(side="left", padx=3)
+        frm_sel.add(self.btn_folder)
         self._rebuild_folder_menu()
         self.hide_protected_var = tk.BooleanVar(value=False)
         self.chk_hide_protected = ttk.Checkbutton(frm_sel, text="隐藏受保护项",
                                                   variable=self.hide_protected_var,
                                                   command=self.on_quick_filter_changed)
-        self.chk_hide_protected.pack(side="left", padx=(6, 0))
+        frm_sel.add(self.chk_hide_protected)
         self.btn_export = ttk.Menubutton(frm_sel, text="导出 CSV ▾", state="disabled")
         self._export_menu = tk.Menu(self.btn_export, tearoff=0)
         self._export_menu.add_command(label="CSV：当前显示的行",
@@ -3643,15 +3672,17 @@ class App:
         self._export_menu.add_command(label="导出快照 JSON（供以后对比）", command=self.on_export_snapshot)
         self._export_menu.add_command(label="与上次快照对比…", command=self.on_compare_snapshot)
         self.btn_export["menu"] = self._export_menu
-        self.btn_export.pack(side="left", padx=3)
+        frm_sel.add(self.btn_export)
         self.lbl_count = ttk.Label(frm_sel, text="共 0 个，已选 0 个")
-        self.lbl_count.pack(side="right", padx=4)
+        frm_sel.add(self.lbl_count, tail=4)
 
         # 4) 退出条（主操作，固定在列表下方）
-        frm_act = ttk.Frame(parent)
+        # 同样是一排控件（退出 / 删除 / 更多 / 待退出数 / 两个节奏输入），主区窄时一起折行
+        frm_act = FlowBar(parent, gap=6)
         frm_act.grid(row=4, column=0, sticky="ew", pady=(5, 0))
+        self._flow_act = frm_act
         self.btn_leave = ttk.Button(frm_act, text="🚪 退出 / 删除选中", command=self.on_leave, state="disabled")
-        self.btn_leave.pack(side="left", padx=3)
+        frm_act.add(self.btn_leave)
         # 删除类操作收进下拉菜单：破坏性高、使用频率低，
         # 平铺在主按钮旁边反而容易连同「退出」一起误点。
         self.btn_destroy = ttk.Menubutton(frm_act, text="🗑 删除 ▾", state="disabled")
@@ -3666,7 +3697,7 @@ class App:
             label="删除我创建的群组（不可恢复）…",
             command=lambda: self.on_destroy_created(KIND_GROUP))
         self.btn_destroy["menu"] = self._destroy_menu
-        self.btn_destroy.pack(side="left", padx=3)
+        frm_act.add(self.btn_destroy)
         # 静音 / 归档：给「太吵但不想退」一个中间选项（都可逆，不改变列表）
         self.btn_more = ttk.Menubutton(frm_act, text="🔕 更多 ▾")
         self._more_menu = tk.Menu(self.btn_more, tearoff=0)
@@ -3680,13 +3711,20 @@ class App:
         self._more_menu.add_command(label="移出归档选中",
                                     command=lambda: self.on_mute_archive("archive", False))
         self.btn_more["menu"] = self._more_menu
-        self.btn_more.pack(side="left", padx=3)
+        frm_act.add(self.btn_more)
         self.lbl_pending = ttk.Label(frm_act, text="待退出 0 个")
-        self.lbl_pending.pack(side="left", padx=8)
-        ttk.Label(frm_act, text="退出间隔(秒):").pack(side="left", padx=(10, 2))
-        ttk.Spinbox(frm_act, from_=1, to=120, textvariable=self.interval_var, width=5).pack(side="left", padx=2)
-        ttk.Label(frm_act, text="随机抖动(秒):").pack(side="left", padx=(10, 2))
-        ttk.Spinbox(frm_act, from_=0, to=60, textvariable=self.jitter_var, width=5).pack(side="left", padx=2)
+        frm_act.add(self.lbl_pending, tail=4)
+        # 「标签 + 输入框」成组：不这样绑的话折行会把标签和它的输入框拆到两行（很难看懂）
+        _g1 = ttk.Frame(frm_act)
+        ttk.Label(_g1, text="退出间隔(秒):").pack(side="left")
+        ttk.Spinbox(_g1, from_=1, to=120, textvariable=self.interval_var, width=5).pack(
+            side="left", padx=(3, 0))
+        frm_act.add(_g1)
+        _g2 = ttk.Frame(frm_act)
+        ttk.Label(_g2, text="随机抖动(秒):").pack(side="left")
+        ttk.Spinbox(_g2, from_=0, to=60, textvariable=self.jitter_var, width=5).pack(
+            side="left", padx=(3, 0))
+        frm_act.add(_g2)
 
     # ---------------- 首次使用引导（空列表时盖在表格上） ----------------
     def _build_guide(self, parent):
@@ -9455,6 +9493,44 @@ def selftest():
                         + app.btn_log_toggle.winfo_width()) <= app.root.winfo_width(), \
                     "「🗒 日志」按钮被窗口挡住了"
             _selftest_say(lines, "v1.7.3：横排自动折行（任何窗口宽度下按钮都可见可点）OK")
+            # v1.7.4：选择条 / 操作条也折行 —— 通用扫描「谁被父容器裁掉了」
+            assert isinstance(app._flow_sel, FlowBar), "选择条没有用 FlowBar"
+            assert isinstance(app._flow_act, FlowBar), "操作条没有用 FlowBar"
+            assert not app._flow_sel._errors and not app._flow_act._errors, "摆放有静默失败"
+            for _fl in (app._flow_header, app._flow_sel, app._flow_act, app._flow_log_head):
+                assert sum(len(l) for l in _fl._lines_for(700)) == len(_fl._items), \
+                    "按窄主区折行后丢了控件"
+                assert sum(len(l) for l in _fl._lines_for(1900)) == len(_fl._items)
+            try:
+                app.root.update_idletasks()
+            except Exception:
+                pass
+            if app.root.winfo_width() > 100:      # 已布局才做坐标扫描
+                _bad = []
+
+                def _scan(w):
+                    try:
+                        _kids = w.winfo_children()
+                    except Exception:
+                        return
+                    _ww = w.winfo_width()
+                    if _ww > 1:
+                        for _k in _kids:
+                            try:
+                                if (_k.winfo_ismapped() and _k.winfo_width() > 1
+                                        and (_k.winfo_rootx() + _k.winfo_width())
+                                        > (w.winfo_rootx() + _ww + 1)):
+                                    _bad.append(_k.winfo_class())
+                            except Exception:
+                                pass
+                    for _k in _kids:
+                        _scan(_k)
+
+                _scan(app.root)
+                assert not _bad, "有控件被父容器裁掉: %s" % _bad[:6]
+            assert app.btn_folder.winfo_width() != 32 or app.root.winfo_width() <= 100, \
+                "「📁 分组」按钮被挤扁了"
+            _selftest_say(lines, "v1.7.4：选择条 / 操作条折行 + 全界面无控件被裁 OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
