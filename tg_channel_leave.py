@@ -285,11 +285,42 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.5"
+APP_VERSION = "v1.7.6"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.6", "2026-10-16", [
+        "修复：**「顶部的筛选框全都没有了」**（用户第三次反馈，这次查到了真因）。"
+        "先按用户要求做了版本对照：把 v1.3.1 的界面代码整个拉出来逐项比对，"
+        "**顶部筛选控件一个都没少** —— ◧设置 / 连接状态 / 连接登录 / 刷新列表 / 🔍搜索 / "
+        "类型 / 分组 / 只看已勾选 / 获取统计 / 停止统计 / ⏹停止全部 / 🗒日志 共 12 项，"
+        "以及主区的快捷筛选（预设 / 用户数 / 作品数 / 活跃天数 / 隐藏未获取）、"
+        "选择条（全选 / 反选 / 清空全部 / 🔒白名单 / 🚫异常 / 🕘历史 / 📊概览 / ⏯任务 / "
+        "📁分组 / 隐藏受保护项 / 导出）全部在位。**所以不是功能被删，是压根没画出来**",
+        "① **真因（v1.7.3 引入折行时就埋下了）**：控件是用 `pack(in_=row)` 摆进行容器的，"
+        "但它们的 Tk parent 仍然是 FlowBar **而不是那个行容器** —— 于是控件与行容器成了"
+        "**同级窗口**，而行容器是后创建的，默认就**盖在控件上面**。一整排按钮被自己的"
+        "行容器遮住，用户看到的就是「全都没有了」，而且**点也点不到**",
+        "② 为什么查了三次才查出来：这个 bug 能骗过所有常规检查 —— "
+        "`winfo_ismapped()` 是 1、宽 / 高 / 坐标全部正常、甚至自检里「控件右边界不超过窗口」"
+        "也是通过的。只有问一句**「这个坐标点上最顶层的窗口到底是谁」**才会露馅："
+        "`winfo_containing()` 返回的是 `!frame4`（行容器）而不是 `!button`。"
+        "修法是 `_relayout` 结束时把所有行容器 `lower()` 压到窗口栈底",
+        "③ 顺手修掉自检本身的盲区（这才是真正的教训）：旧扫描用 `winfo_children()` 遍历，"
+        "而 `pack(in_=row)` 的控件**根本不在行容器的 children 里** —— "
+        "所以「检查全界面有没有控件被裁」这项对四条 FlowBar **从来没生效过**。"
+        "现在统一用 `pack_slaves / grid_slaves / place_slaves`；并且补上了**纵向**检查"
+        "（以前只查横向，而「默认窗口下很多东西看不见」恰恰是纵向问题）",
+        "④ 新增护栏 `FlowBar.covered_items()`：逐个控件问「你中心点那个位置最顶层是谁」，"
+        "不是自己或自己的子孙就算被盖住。自检里有断言，回归测试里还有一条**反向验证**"
+        "（人为把行容器抬到控件之上，必须被检出）—— 防止这个检查退化成永远返回空",
+        "⑤ **默认窗口改成按屏幕自适应**（上限 1520x960，且保证不超出屏幕）。"
+        "起因：整个界面的纵向需求约 1190px，而旧默认窗口只有 780px —— "
+        "实测「左栏展开 + 日志展开」时**列表只剩 5px**，这才是「默认、非全屏时很多东西看不见」"
+        "的直接原因（最大化时观感正常，因为屏幕高度够）。窗口开得够大，界面才有地方放",
+        "新增回归：`test_flowbar` G 段（6 条，含反向验证）",
+    ]),
     ("v1.7.5", "2026-10-16", [
         "**界面重新设计。** 起因是用户说「界面太丑，是不是因为用 Python 写的」。"
         "先说结论：**丑不是语言的锅** —— 查下来是三个可量化的问题：44 种硬编码颜色散在 114 处"
@@ -1872,6 +1903,140 @@ class FlowBar(ttk.Frame):
                     continue
         for row in self._rows[len(lines):]:
             row.grid_remove()                   # 多余的行收起来（不销毁，下次还用它）
+        # ⚠️⚠️ 行容器必须压到本容器窗口栈的**最底层**，否则会把控件整片盖住。
+        # 真因：控件是 `pack(in_=row)` 摆进去的，它们的 Tk parent 仍是本 FlowBar（不是 row），
+        # 于是**与行容器同级**；行容器是后创建的 → 默认在控件之上 → 一整排按钮全被遮住。
+        # 现象 =「顶部的筛选框全都没有了」「点也点不到」。
+        # 这个 bug 能躲过所有常规检查：winfo_ismapped()=1、宽/高/坐标全正常，
+        # 只有 `winfo_containing(控件中心点)` 能看出它返回的是**行容器**而不是按钮。
+        # 回归护栏见 FlowBar.covered_items() 与自检里的断言。
+        for row in self._rows:
+            try:
+                row.lower()
+            except Exception:                   # noqa: BLE001
+                pass
+
+    def covered_items(self):
+        """哪些登记项被别的窗口盖住了 —— 返回 [(控件, 盖住它的窗口)]，自检护栏。
+
+        为什么必须有这个检查：控件用 `pack(in_=row)` 摆放时 Tk parent 仍是本容器，
+        与行容器**同级**；行容器一旦在上面，控件就整片看不见、点不到，
+        而 `winfo_ismapped()` / 宽 / 高 / 坐标**全都正常** —— 常规检查永远发现不了。
+        判定用 `winfo_containing(控件中心点)`：那个点上最顶层的窗口若不是它自己
+        （或它的子孙），就是被盖住了。
+
+        只在本窗口内部判定：返回外部窗口 / None 时无法判断，直接跳过（避免误报）。
+        """
+        out, mine = [], None
+        try:
+            mine = self.winfo_toplevel()
+        except Exception:                       # noqa: BLE001
+            return out
+        for widget, _stretch, _tail in self._items:
+            try:
+                if not widget.winfo_ismapped() or widget.winfo_width() <= 1:
+                    continue
+                cx = widget.winfo_rootx() + widget.winfo_width() // 2
+                cy = widget.winfo_rooty() + widget.winfo_height() // 2
+                top = widget.winfo_containing(cx, cy)
+                if top is None or top.winfo_toplevel() is not mine:
+                    continue
+            except Exception:                   # noqa: BLE001
+                continue
+            node, covered = top, True
+            while node is not None:
+                if node is widget:
+                    covered = False
+                    break
+                try:
+                    node = node.master
+                except Exception:               # noqa: BLE001
+                    break
+            if covered:
+                out.append((str(widget), str(top)))
+        return out
+
+
+# ---------------- 布局体检（自检用，也可单独调用排查） ----------------
+def managed_slaves(container):
+    """容器**实际管理**的控件（pack / grid / place 三种都算）。
+
+    ⚠️ 绝对不要用 `winfo_children()` 来做这件事：FlowBar 把控件 `pack(in_=row)` 摆放，
+    这些控件的 Tk parent 仍然是 FlowBar，于是 `row.winfo_children()` 恒为空 ——
+    旧版自检就是这么「全绿通过」却漏掉了整排顶部筛选框的。
+    """
+    out = []
+    for fn in ("pack_slaves", "grid_slaves", "place_slaves"):
+        try:
+            out.extend(getattr(container, fn)())
+        except Exception:                       # noqa: BLE001
+            pass
+    return out
+
+
+def find_clipped(root, skip=(), out_of_window_only=False):
+    """找出被父容器 / 窗口裁掉的控件：返回 [(控件, 容器, 方向)]。
+
+    横向与**纵向**都查。横向是历史上反复出问题的方向（按钮被窗口右边缘裁掉）；
+    纵向是默认窗口高度不足时的表现（一整排功能被推出可视区）。
+    `out_of_window_only=True` 只报「跑到窗口外面」的（任何尺寸下都是硬错误），
+    用于在未知大小的屏幕上也能安全断言。
+
+    已知正常例外：`Text` / `Canvas` 内部的滚动条本来就会贴到边缘外侧，跳过。
+    """
+    bad, skip = [], tuple(skip)
+    try:
+        rx0, ry0 = root.winfo_rootx(), root.winfo_rooty()
+        rx1, ry1 = rx0 + root.winfo_width(), ry0 + root.winfo_height()
+    except Exception:                           # noqa: BLE001
+        return bad
+    stack, seen = [root], set()
+    while stack:
+        c = stack.pop()
+        if id(c) in seen:
+            continue
+        seen.add(id(c))
+        try:
+            stack.extend(c.winfo_children())
+        except Exception:                       # noqa: BLE001
+            pass
+        try:
+            if not c.winfo_ismapped() or c.winfo_width() <= 1:
+                continue
+            cx0, cy0 = c.winfo_rootx(), c.winfo_rooty()
+            cx1, cy1 = cx0 + c.winfo_width(), cy0 + c.winfo_height()
+            c_cls = c.winfo_class()
+        except Exception:                       # noqa: BLE001
+            continue
+        for k in managed_slaves(c):
+            if k in skip or k is root:
+                continue
+            try:
+                if not k.winfo_ismapped() or k.winfo_width() <= 1:
+                    continue
+                if c_cls in ("Text", "Canvas"):   # 滚动条/内嵌滚动区域，属正常
+                    continue
+                kx0, ky0 = k.winfo_rootx(), k.winfo_rooty()
+                kx1, ky1 = kx0 + k.winfo_width(), ky0 + k.winfo_height()
+            except Exception:                   # noqa: BLE001
+                continue
+            d = []
+            if kx1 > rx1 + 1:
+                d.append("出窗口右%d" % (kx1 - rx1))
+            if ky1 > ry1 + 1:
+                d.append("出窗口下%d" % (ky1 - ry1))
+            if not out_of_window_only:
+                if kx1 > cx1 + 1:
+                    d.append("右%d" % (kx1 - cx1))
+                if ky1 > cy1 + 1:
+                    d.append("下%d" % (ky1 - cy1))
+                if kx0 < cx0 - 1:
+                    d.append("左%d" % (cx0 - kx0))
+                if ky0 < cy0 - 1:
+                    d.append("上%d" % (cy0 - ky0))
+            if d:
+                bad.append((str(k), str(c), "/".join(d)))
+    return bad
 
 
 # ---------------- 数据概览（图表用，Canvas 手绘、零依赖） ----------------
@@ -2844,7 +3009,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.geometry("1200x780")
+        self.root.geometry(self._default_geometry())
 
         self.client = None          # TelethonClient 实例
         self.loop = None            # 后台 asyncio 事件循环（单独线程拥有）
@@ -3154,6 +3319,31 @@ class App:
     #   设计原则：设置项收进左栏（不常点），主区整块留给表格（常看常点），
     #             状态与进度固定在底部，日志按需收起，尽量把纵向空间还给列表。
     # ================================================================
+    def _default_geometry(self):
+        """默认窗口尺寸：按屏幕自适应 —— 尽量大，但不超出屏幕。
+
+        为什么不能写死 1200x780：整个界面的纵向需求约 1190px。窗口只有 780 时，
+        纵向空间不够，Tk 会把有权重的那一行（列表）一路压扁 —— 实测「左栏展开 +
+        日志展开」时列表只剩 **5px**，用户看到的就是「很多东西都看不见」。
+        屏幕够大就开够大，界面自然放得下（这也是为什么最大化时观感正常）。
+
+        上限 1520x960：再大在大屏上也铺得夸张，且顶部条超过 1520 就会一直保持单行，
+        没必要继续拉宽。
+        """
+        try:
+            sw = int(self.root.winfo_screenwidth())
+            sh = int(self.root.winfo_screenheight())
+        except Exception:                       # noqa: BLE001
+            return "1200x780"
+        # 减 100/140 是给窗口边框、标题栏、任务栏留位置，保证整窗落在屏幕内
+        w = max(1080, min(1520, sw - 100))
+        h = max(680, min(960, sh - 140))
+        if w >= sw:                             # 极小屏兜底：不宽过屏幕
+            w = max(1000, sw - 40)
+        if h >= sh:
+            h = max(640, sh - 60)
+        return "%dx%d" % (w, h)
+
     def build_ui(self):
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.minsize(1080, 680)
@@ -4950,7 +5140,7 @@ class App:
         cfg = self.config or {}
         for k in ("win_geometry", "col_widths", "left_width", "left_visible", "log_visible"):
             cfg.pop(k, None)
-        self.root.geometry("1200x780")
+        self.root.geometry(self._default_geometry())
         for c, w in (("sel", 50), ("name", 220), ("username", 160), ("type", 60),
                      ("members", 80), ("posts", 80), ("active", 72), ("folder", 120),
                      ("risk", 118), ("id", 110), ("safe", 92)):
@@ -10048,30 +10238,23 @@ def selftest():
             except Exception:
                 pass
             if app.root.winfo_width() > 100:      # 已布局才做坐标扫描
-                _bad = []
-
-                def _scan(w):
-                    try:
-                        _kids = w.winfo_children()
-                    except Exception:
-                        return
-                    _ww = w.winfo_width()
-                    if _ww > 1:
-                        for _k in _kids:
-                            try:
-                                if _k is getattr(app, "bg_layer", None):
-                                    continue      # 背景图层故意铺满/溢出，不算被裁
-                                if (_k.winfo_ismapped() and _k.winfo_width() > 1
-                                        and (_k.winfo_rootx() + _k.winfo_width())
-                                        > (w.winfo_rootx() + _ww + 1)):
-                                    _bad.append(_k.winfo_class())
-                            except Exception:
-                                pass
-                    for _k in _kids:
-                        _scan(_k)
-
-                _scan(app.root)
-                assert not _bad, "有控件被父容器裁掉: %s" % _bad[:6]
+                _skip = tuple(x for x in (getattr(app, "bg_layer", None),) if x is not None)
+                # ① 出窗口：任何窗口尺寸下都是硬错误
+                _bad_win = find_clipped(app.root, skip=_skip, out_of_window_only=True)
+                assert not _bad_win, "有控件跑到窗口外面: %s" % _bad_win[:6]
+                # ② ⭐ 遮挡：FlowBar 的行容器若压在控件上，控件会整片看不见、点不到，
+                #    而宽/高/坐标**全部正常** —— 这是「顶部筛选框全都没有了」的真因，
+                #    只有查「这个点上最顶层的窗口是谁」才能发现（见 FlowBar.covered_items）
+                _cov = []
+                for _fl2 in (app._flow_header, app._flow_sel, app._flow_act,
+                             app._flow_log_head):
+                    _cov += _fl2.covered_items()
+                assert not _cov, "横排控件被自身行容器盖住（会看不见也点不到）: %s" % _cov[:4]
+                # ③ 出父容器：只在窗口高度足够时断言 —— 屏幕小的时候 Tk 压扁列表属正常
+                if app.root.winfo_height() >= 900:
+                    _bad2 = find_clipped(app.root, skip=_skip)
+                    assert not _bad2, "有控件被父容器裁掉（窗口高 %d）: %s" % (
+                        app.root.winfo_height(), _bad2[:6])
             assert app.btn_folder.winfo_width() != 32 or app.root.winfo_width() <= 100, \
                 "「📁 分组」按钮被挤扁了"
             _selftest_say(lines, "v1.7.4：选择条 / 操作条折行 + 全界面无控件被裁 OK")
@@ -10106,6 +10289,22 @@ def selftest():
             assert app.set_bg_image(os.path.join(BASE_DIR, "不存在.jpg"), quiet=True) is False
             assert app.set_bg_image(os.path.join(BASE_DIR, "没有这个文件.png"), quiet=True) is False
             _selftest_say(lines, "v1.7.5：背景图片（PNG/GIF 铺满 · JPG 明确拒绝 · 记忆路径）OK")
+            # v1.7.6：横排控件不被自身行容器遮挡 + 默认窗口按屏幕自适应
+            # 起因：控件是 pack(in_=row) 摆的，Tk parent 仍是 FlowBar，与行容器同级；
+            # 行容器后创建 → 盖在上面 → 顶部筛选框「全都没有了」（坐标却全正常）。
+            assert callable(managed_slaves) and callable(find_clipped)
+            _geo = app._default_geometry()
+            assert re.match(r"^\d+x\d+$", _geo), _geo
+            _gw, _gh = (int(x) for x in _geo.split("x"))
+            assert _gw >= 1080 and _gh >= 680, _geo
+            assert _gw <= app.root.winfo_screenwidth() and _gh <= app.root.winfo_screenheight(), \
+                "默认窗口比屏幕还大（会有一整块在屏幕外）: %s / 屏幕 %dx%d" % (
+                    _geo, app.root.winfo_screenwidth(), app.root.winfo_screenheight())
+            for _fl3 in (app._flow_header, app._flow_sel, app._flow_act, app._flow_log_head):
+                assert not _fl3.covered_items(), \
+                    "有 FlowBar 控件被行容器盖住: %s" % _fl3.covered_items()[:4]
+            _selftest_say(lines, "v1.7.6：横排控件不被遮挡（winfo_containing 复核）"
+                                "· 默认窗口自适应屏幕（%s）OK" % _geo)
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
