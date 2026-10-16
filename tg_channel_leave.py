@@ -285,11 +285,41 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.4"
+APP_VERSION = "v1.7.5"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.5", "2026-10-16", [
+        "**界面重新设计。** 起因是用户说「界面太丑，是不是因为用 Python 写的」。"
+        "先说结论：**丑不是语言的锅** —— 查下来是三个可量化的问题：44 种硬编码颜色散在 114 处"
+        "（光「次要灰」就有 3 种不同的）、10 种间距值混用、**而且从没设过字体族**。"
+        "更关键的是：`_apply_theme` 以前**只在切换深色时被调用** —— 也就是说浅色模式下"
+        "界面一直是 ttk 系统默认外观（vista 的凸起渐变按钮）。这才是「土」的最大来源",
+        "① **设计令牌**：间距收敛成 4 档（4/8/12/16，源码里 161 处裸数值已归入阶梯）、"
+        "字号 3 档（12/13/15px）、颜色改成**语义命名**的 33 个令牌（页面/卡片/次级条三级底色、"
+        "文字三级、边框、主色/危险/警告/成功、hover/选中态）；浅深两套键**完全一致**（有测试护栏）",
+        "② **完全自绘主题**：始终用 clam 并自己配（vista 不允许改元素，做不出扁平观感）。"
+        "按钮分三级 —— 默认「次要」（白底细边）、**Primary 主操作（蓝底）**、"
+        "**Danger 破坏性（红底）**，并配了 hover / 按下 / 禁用态；输入框扁平 + 焦点变主色；"
+        "表格行高 26、表头扁平、选中用主色淡底；页签选中态用主色文字；滚动条改细；"
+        "**下拉列表与右键菜单单独上色**（它们不在控件树里，要用 option_add 和 `*_menu` 属性和逐个配）",
+        "③ **统一字体**：以前只有 10 处「只写字号、不写字体族」的写法，"
+        "中文环境下 Tk 会 fallback 到宋体。现在探测可用字体族（微软雅黑 UI → 雅黑 → Segoe UI → …），"
+        "一次设置全部 Tk 具名字体，源码里手写字体全部收敛到 `ui_font()`",
+        "④ **顺手修了一个深色模式的真 bug**：概览图表（环形图/柱状图）的文字与轴线色是写死的，"
+        "深色底上根本看不清 —— 现在由调用方按当前主题传入。提示框底色同样跟随主题",
+        "⑤ 深色下「写死浅色的标签」重涂时改成**按语义映射**（白名单行仍保持蓝、危险提示仍保持红），"
+        "以前一律涂成灰色，深色下所有强调色都会变成一片灰",
+        "⑥ **新增：换背景图片**（「外观」页）—— 选一张 PNG / GIF / PPM，按窗口尺寸**居中裁剪铺满**；"
+        "窗口缩放会自动重新适配（250ms 防抖）；路径记进配置，下次启动自动恢复，文件没了只写日志不弹窗。"
+        "⚠️ Tk 的图片组件**读不了 JPG** —— 选到 JPG/BMP/WEBP 时会明确告诉你「先转成 PNG」，"
+        "而不是抛一句看不懂的错（这是 Tk 的限制，不是我们的）",
+        "新增测试套件 `test_theme`（64 条）：令牌完整性（浅深键一致/三级底色互不相同/色值合法）、"
+        "间距与字号只用阶梯值、源码里没有手写字体、clam 已应用、字体族已设置、"
+        "三级按钮底色互不相同且是扁平、交互态齐全、深浅切换后样式跟着切、"
+        "以及「颜色字面量必须来自令牌或明确白名单」的残渣检查",
+    ]),
     ("v1.7.4", "2026-10-16", [
         "修复：**顶部的筛选功能「没有了」**（用户反馈）。上一版只修了顶部筛选条与日志面板头部，"
         "**漏了表格上方那条选择 / 筛选栏**（全选 / 反选 / 清空全部 / 🔒 白名单 / 🚫 异常 / 🕘 历史 / "
@@ -1385,29 +1415,187 @@ def history_summary_text(items, limit=20):
     return out
 
 
-# ---------------- 主题调色板 ----------------
-# 浅色沿用系统原生 ttk；深色切到 clam 并统一配色（ttk 里只有 clam 系列允许改底色）。
-# 说明：**不做「跟随系统」** —— 那要读注册表（HKCU\...\Themes\Personalize\AppsUseLightTheme），
-# 这个项目不碰注册表，所以只给「浅色 / 深色」两个明确选项。
+# ---------------- 设计令牌 ----------------
+# 「界面丑」的根因不是语言，是没有设计约束：改之前这里散着 44 种硬编码颜色、10 种间距值、
+# 没有字体族。这一节把视觉决定收敛成三类令牌 —— 布局代码只许从这里取值。
+#
+# ① 间距阶梯（只有 4 档，布局里不许再出现别的数值）
+PAD_XS, PAD_SM, PAD_MD, PAD_LG = 4, 8, 12, 16
+# ② 字号阶梯（Tk 里负数 = 像素；正文 13px ≈ 现代桌面 UI 的常规字号）
+FONT_SM, FONT_BASE, FONT_TITLE = -12, -13, -15
+# ③ 颜色令牌：语义命名，浅/深两套**键必须完全一致**（有测试护栏）
+#   表面 surface / 文字 fg1-3 / 边框 border / 语义 accent·danger·warn·ok / 交互 hover·sel
 THEME_LIGHT = {
-    "bg": "#f5f6f7", "panel": "#ffffff", "fg": "#1f2328", "field": "#ffffff",
-    "sel": "#cfe3ff", "head": "#eaeef2", "sub": "#6b7280", "border": "#d0d7de",
-    "stripe": "#f2f4f7", "wl": "#185FA5", "danger": "#a32d2d", "accent": "#3f6fb5",
-    "risk_hi": "#b3261e", "risk_mid": "#a35a00", "risk_lo": "#5f6368",
-    "log_bg": "#ffffff", "log_fg": "#1f2328",
+    # 表面
+    "bg": "#f2f3f5",           # 页面底色（比卡片略深，让卡片"浮"起来）
+    "panel": "#ffffff",        # 卡片 / 表格面
+    "panel_alt": "#f8f9fb",    # 次级面（工具条、表头、行底）
+    "field": "#ffffff",        # 输入框内部
+    # 文字三级
+    "fg": "#1b1f24",           # 正文
+    "fg2": "#5c6673",          # 次要（标签、说明）
+    "fg3": "#8b939e",          # 提示 / 禁用 / 占位
+    # 边框
+    "border": "#e2e5e9",
+    "border_strong": "#c8cfd6",
+    # 语义色
+    "accent": "#2f6fd0", "accent_hover": "#2a63bb", "accent_fg": "#ffffff",
+    "accent_soft": "#e9f1fd",
+    "danger": "#c0392b", "danger_hover": "#a93226", "danger_fg": "#ffffff",
+    "danger_soft": "#fdecea",
+    "warn": "#a86300", "warn_soft": "#fff5e6",
+    "ok": "#1c7a45", "ok_soft": "#e8f6ee",
+    # 交互态
+    "hover": "#eaeef3",
+    "sel": "#d6e6fb",
+    # 表格
+    "head": "#f1f3f6", "stripe": "#f8f9fb",
+    # 兼容旧键（风险行色 / 白名单 / 日志面）
+    "sub": "#5c6673", "border_soft": "#eceff2",
+    "wl": "#1f66b5", "risk_hi": "#b3261e", "risk_mid": "#9a5b00", "risk_lo": "#6b7280",
+    "log_bg": "#ffffff", "log_fg": "#1b1f24",
 }
 THEME_DARK = {
-    "bg": "#1f2125", "panel": "#26282d", "fg": "#e8eaed", "field": "#2c2f35",
-    "sel": "#3a4450", "head": "#2f3238", "sub": "#a6acb4", "border": "#3a3d43",
-    "stripe": "#2b2e34", "wl": "#7cb2ea", "danger": "#f09595", "accent": "#4a7fc1",
-    "risk_hi": "#f09595", "risk_mid": "#e0a44a", "risk_lo": "#9aa0a6",
-    "log_bg": "#17191c", "log_fg": "#d7dae0",
+    "bg": "#17191c",
+    "panel": "#202327",
+    "panel_alt": "#1c1f23",
+    "field": "#262a2f",
+    "fg": "#e8eaed",
+    "fg2": "#a9b1ba",
+    "fg3": "#7d858e",
+    "border": "#31353b",
+    "border_strong": "#444a52",
+    "accent": "#5a9bf0", "accent_hover": "#6ea8f5", "accent_fg": "#0f1216",
+    "accent_soft": "#243244",
+    "danger": "#e06c62", "danger_hover": "#e8837a", "danger_fg": "#1a0f0e",
+    "danger_soft": "#3a2422",
+    "warn": "#d9a04a", "warn_soft": "#33291a",
+    "ok": "#5cbd86", "ok_soft": "#1d3026",
+    "hover": "#2a2f35",
+    "sel": "#2f4a6b",
+    "head": "#262a2f", "stripe": "#1d2024",
+    "sub": "#a9b1ba", "border_soft": "#2a2e33",
+    "wl": "#7cb2ea", "risk_hi": "#f09595", "risk_mid": "#e0a44a", "risk_lo": "#9aa0a6",
+    "log_bg": "#15181b", "log_fg": "#d7dae0",
 }
-MUTED_LIGHT = ("#6b7280", "#374151", "#7f8c8d", "#9aa0a6", "#5f6368")
+MUTED_LIGHT = ("#6b7280", "#374151", "#7f8c8d", "#9aa0a6", "#5f6368", "#8a8f98",
+               THEME_LIGHT["fg2"], THEME_LIGHT["fg3"], THEME_LIGHT["sub"])
+
+# 构建界面时拿不到主题令牌，所以有些颜色是**写死的浅色**（标签、说明文字）。
+# 切到深色时它们会糊成一片，必须重涂。这张表是「写死色 → 令牌键」的映射 ——
+# **按语义映射而不是一律涂成灰色**：白名单行该保持蓝、危险提示该保持红。
+LIGHT_ONLY_FG = {
+    "#6b7280": "sub", "#374151": "sub", "#7f8c8d": "sub", "#9aa0a6": "sub",
+    "#5f6368": "sub", "#8a8f98": "sub", "#6b7280": "sub",
+    "#1f2328": "fg", "#1b1f24": "fg",
+    "#185FA5": "wl", "#3f6fb5": "accent", "#2563eb": "accent",
+    "#a32d2d": "danger", "#c0392b": "danger", "#27ae60": "ok", "#c8871a": "warn",
+}
+# 提示框（Tooltip）的颜色：随机主题切换，所以放模块级、由 _apply_theme 更新
+TOOLTIP_BG, TOOLTIP_FG, TOOLTIP_BORDER = "#ffffe1", "#1b1f24", "#c8cfd6"
+
+# 运行时可用的 UI 字体族（apply_ui_font 探测后写回；布局里的字体一律走 ui_font()）
+UI_FONT_FAMILY = None
+UI_FONT_CANDIDATES = ("Microsoft YaHei UI", "微软雅黑", "Microsoft YaHei", "Segoe UI",
+                      "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC")
 
 
 def theme_palette(dark):
     return THEME_DARK if dark else THEME_LIGHT
+
+
+def ui_font(size=FONT_BASE, bold=False):
+    """统一的字体描述元组。**布局里不要再手写 font=ui_font(FONT_TITLE, True)** —— 那样族和字号各写各的。"""
+    return (UI_FONT_FAMILY or "", size, "bold" if bold else "normal")
+
+
+def pick_ui_font(root):
+    """挑一个存在的字体族。中文环境下 Tk 的默认字体常常退化成宋体，这是「土」的主因之一。"""
+    try:
+        import tkinter.font as tkfont
+        fams = set(tkfont.families(root))
+    except Exception:
+        return None
+    for cand in UI_FONT_CANDIDATES:
+        if cand in fams:
+            return cand
+    return None
+
+
+def apply_ui_font(root, base=FONT_BASE):
+    """把所有 Tk 具名字体统一到一个族 + 字阶上（一次设置，全局生效）。"""
+    global UI_FONT_FAMILY
+    fam = pick_ui_font(root)
+    if not fam:
+        return None
+    UI_FONT_FAMILY = fam
+    try:
+        import tkinter.font as tkfont
+    except Exception:
+        return fam
+    for name, size, weight in (("TkDefaultFont", base, "normal"),
+                               ("TkTextFont", base, "normal"),
+                               ("TkMenuFont", base, "normal"),
+                               ("TkHeadingFont", base, "bold"),
+                               ("TkTooltipFont", FONT_SM, "normal"),
+                               ("TkFixedFont", FONT_SM, "normal")):
+        try:
+            tkfont.nametofont(name).configure(family=fam, size=size, weight=weight)
+        except Exception:
+            continue
+    return fam
+
+
+# ---------------- 背景图片 ----------------
+# ⚠️ Tk 的 PhotoImage **只认 PNG / GIF / PPM / PGM，读不了 JPG**（这是 Tk 的限制，不是我们的）。
+# 所以选到 JPG 时要明确告诉用户「先转成 PNG」，而不是抛一句看不懂的错。
+BG_IMAGE_EXTS = (".png", ".gif", ".ppm", ".pgm")
+BG_IMAGE_UNSUPPORTED = (".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".ico")
+BG_IMAGE_MAX_EDGE = 4000        # 原图太大先缩一次，避免缩放前的内存峰值
+
+
+def bg_photo_fit(photo, w, h, max_edge=BG_IMAGE_MAX_EDGE):
+    """把图片缩放到「刚好覆盖 w×h」（cover）。
+
+    ⚠️ Tk 只支持**整数倍**缩放（`zoom` / `subsample`），没有任意比例 —— 所以：
+      · 缩小时取 `min(iw//w, ih//h)`，保证两个方向都盖住窗口，多出来的部分靠居中裁剪；
+      · 放大时取 `max(向上取整)`，并限制放大后的总像素，避免小图被放大到爆内存。
+    """
+    try:
+        iw, ih = photo.width(), photo.height()
+    except Exception:
+        return photo
+    if iw <= 0 or ih <= 0 or w <= 1 or h <= 1:
+        return photo
+    # 超大原图先粗缩一次
+    if max(iw, ih) > max_edge:
+        k = (max(iw, ih) + max_edge - 1) // max_edge
+        try:
+            photo = photo.subsample(k, k)
+            iw, ih = photo.width(), photo.height()
+        except Exception:
+            pass
+    try:
+        if iw < w or ih < h:                       # 需要放大
+            z = max(-(-w // iw), -(-h // ih))      # 两个方向都要覆盖 -> 取较大
+            if z > 1 and (iw * z) * (ih * z) <= (max_edge * 2) ** 2:
+                photo = photo.zoom(z, z)
+        else:                                      # 需要缩小
+            k = min(iw // w, ih // h)
+            if k > 1:
+                photo = photo.subsample(k, k)
+    except Exception:
+        return photo
+    return photo
+
+
+def load_bg_photo(path, w, h):
+    """读背景图并适配到 w×h。读不了返回 None（调用方负责给提示）。"""
+    try:
+        img = tk.PhotoImage(file=path)
+    except Exception:
+        return None
+    return bg_photo_fit(img, w, h)
 
 
 # ---------------- 快捷键一览 / 工具提示 ----------------
@@ -1488,8 +1676,8 @@ class Tooltip:
             tip.wm_overrideredirect(True)
             tip.wm_geometry(f"+{x}+{y}")
             tk.Label(tip, text=self.text, justify="left", wraplength=self.wraplength,
-                     background="#ffffe1", foreground="#1f2328", relief="solid",
-                     borderwidth=1, padx=6, pady=4).pack()
+                     background=TOOLTIP_BG, foreground=TOOLTIP_FG, relief="solid",
+                     borderwidth=1, padx=PAD_SM, pady=PAD_XS).pack()
             self._tip = tip
         except Exception:
             self._tip = None
@@ -1533,7 +1721,7 @@ class FlowBar(ttk.Frame):
     `stretch=True` 的项会吃掉它所在那一行的多余宽度（搜索框用）。
     """
 
-    def __init__(self, master, gap=6, row_gap=3, reserve=0, **kw):
+    def __init__(self, master, gap=PAD_SM, row_gap=PAD_XS, reserve=0, **kw):
         super().__init__(master, **kw)
         self._gap = int(gap)
         self._row_gap = int(row_gap)
@@ -1732,12 +1920,13 @@ def dashboard_stats(kind_counts, members, actives, risk_counts):
             "active": act, "active_unknown": act_unknown, "risk": risks}
 
 
-def draw_donut(canvas, items, size=170, colors=CHART_COLORS):
+def draw_donut(canvas, items, size=170, colors=CHART_COLORS,
+               fg="#1b1f24", muted="#8b939e"):
     """环形图。items = [(标签, 数量)]；空数据画一句提示而不是空白。"""
     canvas.delete("all")
     total = sum(n for _l, n in items)
     if not items or total <= 0:
-        canvas.create_text(size // 2 + 4, size // 2, text="暂无数据", fill="#8a8f98")
+        canvas.create_text(size // 2 + 4, size // 2, text="暂无数据", fill=muted)
         return
     pad = 12
     box = (pad, pad, size - pad, size - pad)
@@ -1752,26 +1941,29 @@ def draw_donut(canvas, items, size=170, colors=CHART_COLORS):
     hole = 46
     canvas.create_oval(size / 2 - hole, size / 2 - hole, size / 2 + hole, size / 2 + hole,
                        fill=canvas.cget("bg"), outline="")
-    canvas.create_text(size / 2, size / 2 - 6, text=str(total), fill="#1f2328",
-                       font=("", 13))
-    canvas.create_text(size / 2, size / 2 + 12, text="合计", fill="#8a8f98")
+    canvas.create_text(size / 2, size / 2 - 6, text=str(total), fill=fg,
+                       font=ui_font(FONT_TITLE, True))
+    canvas.create_text(size / 2, size / 2 + 12, text="合计", fill=muted)
     for i, (label, n) in enumerate(items):
         y = pad + 6 + i * 18
         x = size + 6
         canvas.create_rectangle(x, y - 4, x + 9, y + 5,
                                 fill=colors[i % len(colors)], outline="")
-        canvas.create_text(x + 15, y, text=f"{label} {n}", anchor="w", fill="#1f2328")
+        canvas.create_text(x + 15, y, text=f"{label} {n}", anchor="w", fill=fg)
 
 
-def draw_bars(canvas, items, width=300, height=170, color="#3f6fb5"):
-    """竖向柱状图（带横轴标签）。items = [(标签, 数量)]。"""
+def draw_bars(canvas, items, width=300, height=170, color="#3f6fb5",
+              fg="#1b1f24", muted="#8b939e", axis="#b4b2a9"):
+    """竖向柱状图（带横轴标签）。items = [(标签, 数量)]。
+
+    fg/muted/axis 由调用方按当前主题传入 —— 写死的话深色模式下文字会看不清。"""
     canvas.delete("all")
     if not items or sum(n for _l, n in items) <= 0:
-        canvas.create_text(width // 2, height // 2, text="暂无数据", fill="#8a8f98")
+        canvas.create_text(width // 2, height // 2, text="暂无数据", fill=muted)
         return
     top, bottom, left, right = 16, height - 30, 30, width - 8
     peak = max(n for _l, n in items) or 1
-    canvas.create_line(left, bottom, right, bottom, fill="#b4b2a9")
+    canvas.create_line(left, bottom, right, bottom, fill=axis)
     slot = (right - left) / max(1, len(items))
     bar_w = max(6, min(38, slot * 0.6))
     for i, (label, n) in enumerate(items):
@@ -1779,8 +1971,8 @@ def draw_bars(canvas, items, width=300, height=170, color="#3f6fb5"):
         h = (bottom - top) * (n / peak) if peak else 0
         canvas.create_rectangle(cx - bar_w / 2, bottom - h, cx + bar_w / 2, bottom,
                                 fill=color, outline="")
-        canvas.create_text(cx, bottom - h - 8, text=str(n), fill="#1f2328")
-        canvas.create_text(cx, bottom + 13, text=label, fill="#5f6368")
+        canvas.create_text(cx, bottom - h - 8, text=str(n), fill=fg)
+        canvas.create_text(cx, bottom + 13, text=label, fill=muted)
 
 
 # ---------------- 会话快照与对比 ----------------
@@ -2686,6 +2878,10 @@ class App:
         self._history_key = None
         self._guide = None          # 未加载 / 未连接时的引导卡片
         self._tips = []             # 工具提示（持有引用，别让 GC 收掉）
+        self.bg_image_path = ""     # 背景图片路径（空 = 不用背景图）
+        self.bg_layer = None        # 承载背景图的最底层控件
+        self._bg_photo = None       # 必须持有引用，否则被 GC 掉图就消失了
+        self._bg_resize_after = None
         self._dash = None           # 数据概览窗口（单例）
         self._dash_canvas = {}      # 概览里的画布
         self._auths = []            # 最近一次拉到的登录设备（按账号）
@@ -2870,6 +3066,7 @@ class App:
             "proxy_user": self.proxy_user_var.get().strip(),
             "proxy_pass": self.proxy_pass_var.get().strip(),
             "dark_mode": bool(getattr(self, "dark_var", None) and self.dark_var.get()),
+            "bg_image": str(getattr(self, "bg_image_path", "") or ""),
             "remember_layout": bool(getattr(self, "remember_layout_var", None) and self.remember_layout_var.get()),
         })
         # 账号注册表 + 当前账号（登录态、显示名、session 基名都在账号记录里）
@@ -2967,6 +3164,7 @@ class App:
         except Exception:
             self._default_theme = "vista"
 
+        self._build_bg_layer()      # 最底层：背景图片（有图时才显示）
         self._build_header()        # row 0 工具栏 / row 1 登录验证条
         self._build_body()          # row 2 左设置栏 | 右主区
         self._build_statusbar()     # row 3 进度条 + 任务状态
@@ -2975,6 +3173,12 @@ class App:
         self.on_proxy_toggle()
         self._bind_shortcuts()
         self._attach_tips()
+        # ⚠️ 启动就要应用一次主题：改之前 _apply_theme 只在「切换深色」时被调用，
+        # 于是浅色模式一直是 ttk 系统默认外观（vista 的凸起渐变控件）—— 那是「丑」的根源。
+        try:
+            self._apply_theme(bool(self.dark_var.get()))
+        except Exception:
+            self._apply_theme(False)
 
         # 输入项改动即自动保存（API/手机号/代理/统计/筛选/退出节奏），避免每次重填；关窗时再兜底保存
         for var in (self.api_id_var, self.api_hash_var, self.phone_var,
@@ -3008,7 +3212,7 @@ class App:
         # 以前用 grid 排，空间不足时**既不压缩也不滚动**，最右边的「🗒 日志」「⏹ 停止全部」
         # 直接被窗口右边缘裁掉 —— 用户看到的就是「按钮被挡住、点不到」。
         # 现在交给 FlowBar：放不下就折到下一行，任何窗口宽度下都点得到。
-        bar = FlowBar(self.root, padding=(10, 8, 10, 2), reserve=20)   # reserve=左右各 10px 内边距
+        bar = FlowBar(self.root, padding=(PAD_LG, PAD_MD, PAD_LG, PAD_SM), reserve=32)
         bar.grid(row=0, column=0, sticky="ew")
         self._flow_header = bar          # 供自检 / 测试检查折行情况
 
@@ -3020,7 +3224,9 @@ class App:
         self.lbl_status = ttk.Label(bar, textvariable=self.status_var, foreground="#7f8c8d")
         bar.add(self.lbl_status, tail=6)
 
-        self.btn_connect = ttk.Button(bar, text="连接 / 登录", command=self.on_connect)
+        # 主操作：用 Primary 样式（蓝色实心），与一排次要按钮拉开层次
+        self.btn_connect = ttk.Button(bar, text="连接 / 登录", command=self.on_connect,
+                                      style="Primary.TButton")
         bar.add(self.btn_connect)
         self.btn_refresh = ttk.Button(bar, text="刷新列表", command=self.on_refresh, state="disabled")
         bar.add(self.btn_refresh)
@@ -3031,13 +3237,13 @@ class App:
         ttk.Label(sfrm, text="🔍").pack(side="left")
         self.search_var = tk.StringVar()
         self.ent_search = ttk.Entry(sfrm, textvariable=self.search_var, width=22)
-        self.ent_search.pack(side="left", fill="x", expand=True, padx=4)
+        self.ent_search.pack(side="left", fill="x", expand=True, padx=PAD_XS)
         self.search_var.trace_add("write", lambda *_a: self.on_search_changed())
         self.ent_search.bind("<Return>", lambda e: self._apply_search(verbose=True))
         self.btn_search_clear = ttk.Button(sfrm, text="✕", width=3, command=self.on_search_clear)
         self.btn_search_clear.pack(side="left")
         self.lbl_search_hit = ttk.Label(sfrm, text="", foreground="#6b7280")
-        self.lbl_search_hit.pack(side="left", padx=(6, 0))
+        self.lbl_search_hit.pack(side="left", padx=(PAD_SM, 0))
         bar.add(sfrm, stretch=True)
 
         # 标签 + 它的下拉框绑成一组：不绑的话折行可能把「类型:」留在第一行、
@@ -3047,7 +3253,7 @@ class App:
         self.type_filter_var = tk.StringVar(value="全部")
         self.cmb_type = ttk.Combobox(_gt, textvariable=self.type_filter_var, state="readonly",
                                      width=7, values=TYPE_CHOICES)
-        self.cmb_type.pack(side="left", padx=(4, 0))
+        self.cmb_type.pack(side="left", padx=(PAD_XS, 0))
         bar.add(_gt, tail=4)
         self.cmb_type.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
@@ -3057,7 +3263,7 @@ class App:
         self.folder_filter_var = tk.StringVar(value=FOLDER_ALL)
         self.cmb_folder = ttk.Combobox(_gf, textvariable=self.folder_filter_var, state="readonly",
                                        width=12, values=(FOLDER_ALL, FOLDER_NONE))
-        self.cmb_folder.pack(side="left", padx=(4, 0))
+        self.cmb_folder.pack(side="left", padx=(PAD_XS, 0))
         bar.add(_gf, tail=4)
         self.cmb_folder.bind("<<ComboboxSelected>>", lambda e: self.on_quick_filter_changed())
 
@@ -3067,7 +3273,8 @@ class App:
         bar.add(self.chk_only_checked, tail=4)
 
         # 统计与任务控制
-        self.btn_stats = ttk.Button(bar, text="获取 / 更新统计", command=self.on_fetch_stats, state="disabled")
+        self.btn_stats = ttk.Button(bar, text="获取 / 更新统计", command=self.on_fetch_stats,
+                                    state="disabled", style="Primary.TButton")
         bar.add(self.btn_stats)
         self.btn_stats_stop = ttk.Button(bar, text="停止统计", command=self.on_stop_stats, state="disabled")
         bar.add(self.btn_stats_stop)
@@ -3084,15 +3291,15 @@ class App:
         ttk.Label(strip, text="   验证码 / 两步密码:").pack(side="left")
         self.code_var = tk.StringVar()
         self.code_entry = ttk.Entry(strip, textvariable=self.code_var, width=26)
-        self.code_entry.pack(side="left", padx=4)
+        self.code_entry.pack(side="left", padx=PAD_XS)
         self.btn_code_submit = ttk.Button(strip, text="提交", command=self.on_submit_code, state="disabled")
-        self.btn_code_submit.pack(side="left", padx=2)
+        self.btn_code_submit.pack(side="left", padx=PAD_XS)
         self.code_entry.bind("<Return>", lambda e: self.on_submit_code())
 
     # ---------------- 主体：左设置栏 + 右主区 ----------------
     def _build_body(self):
         self.paned = ttk.PanedWindow(self.root, orient="horizontal")
-        self.paned.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 4))
+        self.paned.grid(row=2, column=0, sticky="nsew", padx=PAD_MD, pady=(0, PAD_XS))
 
         self.panel_left = ttk.Frame(self.paned)
         self.panel_main = ttk.Frame(self.paned)
@@ -3119,7 +3326,7 @@ class App:
 
         ttk.Label(f, text="账号列表（可添加多个，随时切换；切换时不会退出登录）",
                   foreground="#374151", wraplength=290, justify="left").grid(
-            row=0, column=0, sticky="w", pady=(0, 4))
+            row=0, column=0, sticky="w", pady=(0, PAD_XS))
 
         box = ttk.Frame(f)
         box.grid(row=1, column=0, sticky="ew")
@@ -3138,62 +3345,62 @@ class App:
         self.acc_tree.bind("<Double-1>", lambda e: self.on_switch_selected_account())
 
         btns = ttk.Frame(f)
-        btns.grid(row=2, column=0, sticky="ew", pady=(5, 4))
-        ttk.Button(btns, text="切换到选中", command=self.on_switch_selected_account).pack(side="left", padx=2)
+        btns.grid(row=2, column=0, sticky="ew", pady=(PAD_XS, PAD_XS))
+        ttk.Button(btns, text="切换到选中", command=self.on_switch_selected_account).pack(side="left", padx=PAD_XS)
         ttk.Button(btns, text="移除账号", command=lambda: self.on_remove_selected_account(False)).pack(
-            side="left", padx=2)
+            side="left", padx=PAD_XS)
         ttk.Button(btns, text="移除并删登录态", command=lambda: self.on_remove_selected_account(True)).pack(
-            side="left", padx=2)
+            side="left", padx=PAD_XS)
 
-        ttk.Separator(f, orient="horizontal").grid(row=3, column=0, sticky="ew", pady=6)
+        ttk.Separator(f, orient="horizontal").grid(row=3, column=0, sticky="ew", pady=PAD_SM)
 
         row = ttk.Frame(f)
         row.grid(row=4, column=0, sticky="ew")
         row.grid_columnconfigure(1, weight=1)
-        ttk.Label(row, text="手机号").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(row, text="手机号").grid(row=0, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.phone_var = tk.StringVar()
         self.phone_entry = ttk.Entry(row, textvariable=self.phone_var)
-        self.phone_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        self.phone_entry.grid(row=0, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
         ttk.Button(row, text="＋ 添加账号并登录", command=self.on_add_account).grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 2))
+            row=1, column=0, columnspan=2, sticky="ew", padx=PAD_XS, pady=(PAD_SM, PAD_XS))
 
-        ttk.Separator(f, orient="horizontal").grid(row=5, column=0, sticky="ew", pady=6)
+        ttk.Separator(f, orient="horizontal").grid(row=5, column=0, sticky="ew", pady=PAD_SM)
 
         api = ttk.Frame(f)
         api.grid(row=6, column=0, sticky="ew")
         api.grid_columnconfigure(1, weight=1)
-        ttk.Label(api, text="API ID").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(api, text="API ID").grid(row=0, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.api_id_var = tk.StringVar()
-        ttk.Entry(api, textvariable=self.api_id_var).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        ttk.Label(api, text="API HASH").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        ttk.Entry(api, textvariable=self.api_id_var).grid(row=0, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
+        ttk.Label(api, text="API HASH").grid(row=1, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.api_hash_var = tk.StringVar()
-        ttk.Entry(api, textvariable=self.api_hash_var).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Entry(api, textvariable=self.api_hash_var).grid(row=1, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
         ttk.Button(api, text="连接 / 登录当前账号", command=self.on_connect).grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 4))
+            row=2, column=0, columnspan=2, sticky="ew", padx=PAD_XS, pady=(PAD_SM, PAD_XS))
         ttk.Label(api, text="在 https://my.telegram.org 创建应用后获取 API ID / HASH。\n"
                            "API 与代理是全局设置，所有账号共用；登录态按账号分别保存，"
                            "所以切换账号不需要重新输验证码。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+            row=3, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_SM, PAD_XS))
 
         self.lbl_session_info = ttk.Label(f, text="", foreground="#6b7280", wraplength=290, justify="left")
-        self.lbl_session_info.grid(row=7, column=0, sticky="w", padx=4, pady=(6, 0))
+        self.lbl_session_info.grid(row=7, column=0, sticky="w", padx=PAD_XS, pady=(PAD_SM, 0))
         self.btn_clear_session = ttk.Button(f, text="删除当前账号的登录态", command=self.on_clear_session)
-        self.btn_clear_session.grid(row=8, column=0, sticky="ew", padx=4, pady=(8, 2))
+        self.btn_clear_session.grid(row=8, column=0, sticky="ew", padx=PAD_XS, pady=(8, 2))
 
     # ---------------- 账号切换（界面入口）----------------
     def _build_account_bar(self, parent):
         bar = ttk.LabelFrame(parent, text="账号（切换不会退出登录，各账号数据独立）", padding=6)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        ttk.Label(bar, text="当前账号:").pack(side="left", padx=(2, 4))
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, PAD_XS))
+        ttk.Label(bar, text="当前账号:").pack(side="left", padx=(PAD_XS, PAD_XS))
         self.account_var = tk.StringVar(value="（未添加账号）")
         self.account_combo = ttk.Combobox(bar, textvariable=self.account_var, state="readonly",
                                           width=32, values=["（未添加账号）"])
-        self.account_combo.pack(side="left", padx=2)
+        self.account_combo.pack(side="left", padx=PAD_XS)
         self.account_combo.bind("<<ComboboxSelected>>", self.on_account_combo_selected)
-        ttk.Button(bar, text="＋ 添加账号", command=self.on_add_account).pack(side="left", padx=6)
+        ttk.Button(bar, text="＋ 添加账号", command=self.on_add_account).pack(side="left", padx=PAD_SM)
         self.lbl_account_info = ttk.Label(bar, text="", foreground="#6b7280")
-        self.lbl_account_info.pack(side="left", padx=(10, 2))
+        self.lbl_account_info.pack(side="left", padx=(PAD_MD, PAD_XS))
 
     def _selected_account_key(self):
         """从「账号」下拉框当前文本反查账号 key（文本就是 account_label）。"""
@@ -3243,63 +3450,63 @@ class App:
         self.proxy_enabled_var = tk.BooleanVar(value=False)
         self.chk_proxy = ttk.Checkbutton(f, text="启用代理", variable=self.proxy_enabled_var,
                                          command=self.on_proxy_toggle)
-        self.chk_proxy.grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+        self.chk_proxy.grid(row=0, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=PAD_XS)
 
-        ttk.Label(f, text="类型").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="类型").grid(row=1, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.proxy_type_var = tk.StringVar(value="SOCKS5")
         self.proxy_type_om = ttk.OptionMenu(f, self.proxy_type_var, "SOCKS5", "SOCKS5", "SOCKS4", "HTTP")
-        self.proxy_type_om.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        self.proxy_type_om.grid(row=1, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
 
-        ttk.Label(f, text="主机").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="主机").grid(row=2, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.proxy_host_var = tk.StringVar()
         self.proxy_host_entry = ttk.Entry(f, textvariable=self.proxy_host_var)
-        self.proxy_host_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=4)
+        self.proxy_host_entry.grid(row=2, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
 
-        ttk.Label(f, text="端口").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="端口").grid(row=3, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.proxy_port_var = tk.StringVar()
         self.proxy_port_entry = ttk.Entry(f, textvariable=self.proxy_port_var)
-        self.proxy_port_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=4)
+        self.proxy_port_entry.grid(row=3, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
 
-        ttk.Label(f, text="用户名").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="用户名").grid(row=4, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.proxy_user_var = tk.StringVar()
         self.proxy_user_entry = ttk.Entry(f, textvariable=self.proxy_user_var)
-        self.proxy_user_entry.grid(row=4, column=1, sticky="ew", padx=4, pady=4)
+        self.proxy_user_entry.grid(row=4, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
 
-        ttk.Label(f, text="密码").grid(row=5, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="密码").grid(row=5, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.proxy_pass_var = tk.StringVar()
         self.proxy_pass_entry = ttk.Entry(f, textvariable=self.proxy_pass_var, show="*")
-        self.proxy_pass_entry.grid(row=5, column=1, sticky="ew", padx=4, pady=4)
+        self.proxy_pass_entry.grid(row=5, column=1, sticky="ew", padx=PAD_XS, pady=PAD_XS)
 
         self.btn_proxy_test = ttk.Button(f, text="测试代理（TCP + 出网到 Telegram）", command=self.on_proxy_test)
-        self.btn_proxy_test.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(10, 4))
+        self.btn_proxy_test.grid(row=6, column=0, columnspan=2, sticky="ew", padx=PAD_XS, pady=(PAD_MD, PAD_XS))
         ttk.Label(f, text="国内网络通常需要代理（如 127.0.0.1:7890）。\n"
                           "测试会先连本地端口，再经代理访问 api.telegram.org:443。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=7, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+            row=7, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_SM, PAD_XS))
 
     def _tab_stats(self, nb):
         f = ttk.Frame(nb, padding=10)
         nb.add(f, text="统计")
         f.grid_columnconfigure(1, weight=1)
-        ttk.Label(f, text="并发数").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="并发数").grid(row=0, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.conc_var = tk.IntVar(value=6)
         ttk.Spinbox(f, from_=1, to=32, textvariable=self.conc_var, width=6).grid(
-            row=0, column=1, sticky="w", padx=4, pady=4)
-        ttk.Label(f, text="缓存有效期(小时)").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+            row=0, column=1, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        ttk.Label(f, text="缓存有效期(小时)").grid(row=1, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.ttl_var = tk.IntVar(value=24)
         ttk.Spinbox(f, from_=1, to=720, textvariable=self.ttl_var, width=6).grid(
-            row=1, column=1, sticky="w", padx=4, pady=4)
+            row=1, column=1, sticky="w", padx=PAD_XS, pady=PAD_XS)
         self.cache_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="使用本地统计缓存", variable=self.cache_var).grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+            row=2, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=PAD_XS)
         self.lbl_cache_info = ttk.Label(f, text="缓存 0 条", foreground="#6b7280", wraplength=290, justify="left")
-        self.lbl_cache_info.grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+        self.lbl_cache_info.grid(row=3, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(8, 2))
         self.btn_clear_cache = ttk.Button(f, text="清空统计缓存", command=self.on_clear_stats_cache)
-        self.btn_clear_cache.grid(row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 2))
+        self.btn_clear_cache.grid(row=4, column=0, columnspan=2, sticky="ew", padx=PAD_XS, pady=(PAD_XS, PAD_XS))
         ttk.Label(f, text="「用户数 / 作品数」会对每个频道各发 1~2 次请求，\n"
                           "并发越大越快、也越容易触发限流；命中缓存则完全不发请求。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
+            row=5, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(8, 2))
 
     def _tab_devices(self, nb):
         """登录设备管理：只看自己的账号，能踢掉其它设备（改密码后忘了退的旧设备最常见）。"""
@@ -3308,7 +3515,7 @@ class App:
         f.grid_columnconfigure(0, weight=1)
         ttk.Label(f, text="当前账号的登录设备（本机那条不会被踢）",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=0, column=0, sticky="w", pady=(0, 4))
+            row=0, column=0, sticky="w", pady=(0, PAD_XS))
         self.dev_tree = ttk.Treeview(f, columns=("device", "system", "ip", "active"),
                                      show="headings", height=8, selectmode="extended")
         for c, t, w in (("device", "设备", 120), ("system", "系统", 60),
@@ -3317,18 +3524,18 @@ class App:
             self.dev_tree.column(c, width=w, anchor="w")
         self.dev_tree.grid(row=1, column=0, sticky="ew")
         row = ttk.Frame(f)
-        row.grid(row=2, column=0, sticky="ew", pady=(6, 2))
+        row.grid(row=2, column=0, sticky="ew", pady=(PAD_SM, PAD_XS))
         self.btn_dev_refresh = ttk.Button(row, text="刷新设备", command=self.on_refresh_devices)
-        self.btn_dev_refresh.pack(side="left", padx=2)
+        self.btn_dev_refresh.pack(side="left", padx=PAD_XS)
         self.btn_dev_kill = ttk.Button(row, text="踢出选中", command=self.on_kill_devices)
-        self.btn_dev_kill.pack(side="left", padx=2)
-        ttk.Button(row, text="踢出其它全部", command=self.on_kill_others).pack(side="left", padx=2)
+        self.btn_dev_kill.pack(side="left", padx=PAD_XS)
+        ttk.Button(row, text="踢出其它全部", command=self.on_kill_others).pack(side="left", padx=PAD_XS)
         self.lbl_dev_info = ttk.Label(f, text="", foreground="#6b7280",
                                       wraplength=290, justify="left")
-        self.lbl_dev_info.grid(row=3, column=0, sticky="w", pady=(6, 2))
+        self.lbl_dev_info.grid(row=3, column=0, sticky="w", pady=(PAD_SM, PAD_XS))
         ttk.Label(f, text="提示：踢设备只影响登录态，不会删消息；被踢的设备需要重新登录。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=4, column=0, sticky="w", pady=(6, 2))
+            row=4, column=0, sticky="w", pady=(PAD_SM, PAD_XS))
 
     # ---------------- 登录设备管理 ----------------
     def on_refresh_devices(self):
@@ -3423,51 +3630,203 @@ class App:
         f = ttk.Frame(nb, padding=10)
         nb.add(f, text="退出")
         f.grid_columnconfigure(1, weight=1)
-        ttk.Label(f, text="退出间隔(秒)").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(f, text="退出间隔(秒)").grid(row=0, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.interval_var = tk.IntVar(value=2)
         ttk.Spinbox(f, from_=1, to=120, textvariable=self.interval_var, width=6).grid(
-            row=0, column=1, sticky="w", padx=4, pady=4)
-        ttk.Label(f, text="随机抖动(秒)").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+            row=0, column=1, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        ttk.Label(f, text="随机抖动(秒)").grid(row=1, column=0, sticky="e", padx=PAD_XS, pady=PAD_XS)
         self.jitter_var = tk.IntVar(value=0)
         ttk.Spinbox(f, from_=0, to=60, textvariable=self.jitter_var, width=6).grid(
-            row=1, column=1, sticky="w", padx=4, pady=4)
+            row=1, column=1, sticky="w", padx=PAD_XS, pady=PAD_XS)
         ttk.Label(f, text="间隔 + 0~抖动 的随机等待，可降低被限流概率。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 8))
+            row=2, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_XS, PAD_SM))
 
-        ttk.Separator(f, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Separator(f, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky="ew", pady=PAD_SM)
         ttk.Label(f, text="按关键词批量退\n（名称/用户名包含任一关键词即匹配，逗号或空格分隔）",
-                  wraplength=290, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", padx=4)
+                  wraplength=290, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", padx=PAD_XS)
         self.kw_var = tk.StringVar()
-        ttk.Entry(f, textvariable=self.kw_var).grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 4))
+        ttk.Entry(f, textvariable=self.kw_var).grid(row=5, column=0, columnspan=2, sticky="ew", padx=PAD_XS, pady=(PAD_XS, PAD_XS))
         self.btn_kw_leave = ttk.Button(f, text="按关键词退出", command=self.on_kw_leave, state="disabled")
-        self.btn_kw_leave.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4)
+        self.btn_kw_leave.grid(row=6, column=0, columnspan=2, sticky="ew", padx=PAD_XS)
 
         # ---- 安全防护 ----
-        ttk.Separator(f, orient="horizontal").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 4))
-        ttk.Label(f, text="安全防护", font=("", 9, "bold")).grid(
-            row=8, column=0, columnspan=2, sticky="w", padx=4)
+        ttk.Separator(f, orient="horizontal").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(PAD_MD, PAD_XS))
+        ttk.Label(f, text="安全防护", font=ui_font(FONT_SM, True)).grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=PAD_XS)
         self.skip_protected_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="退出时自动跳过 白名单 / 创建者 / 管理员",
                         variable=self.skip_protected_var).grid(
-            row=9, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+            row=9, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_XS, 0))
         self.detect_role_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="获取统计时顺带检测创建者 / 管理员\n（每个多 1 次请求，结果会被缓存）",
                         variable=self.detect_role_var).grid(
-            row=10, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+            row=10, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_XS, 0))
         self.preview_leave_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="退出前显示待退出清单，确认后才执行",
                         variable=self.preview_leave_var).grid(
-            row=11, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 6))
+            row=11, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_XS, PAD_SM))
         self.lbl_whitelist_info = ttk.Label(f, text="白名单 0 个频道（永不退出）",
                                             foreground="#6b7280", wraplength=290, justify="left")
-        self.lbl_whitelist_info.grid(row=12, column=0, columnspan=2, sticky="w", padx=4)
+        self.lbl_whitelist_info.grid(row=12, column=0, columnspan=2, sticky="w", padx=PAD_XS)
         self.btn_clear_whitelist = ttk.Button(f, text="清空白名单", command=self.clear_whitelist)
-        self.btn_clear_whitelist.grid(row=13, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 2))
+        self.btn_clear_whitelist.grid(row=13, column=0, columnspan=2, sticky="ew", padx=PAD_XS, pady=(PAD_XS, PAD_XS))
         ttk.Label(f, text="创建者 / 管理员在 Telegram 里无法直接退出（创建者需先转让或删除频道），\n"
                           "不跳过会白跑一遍并报错。白名单用于标记「我就是要保留」的频道。",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=14, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+            row=14, column=0, columnspan=2, sticky="w", padx=PAD_XS, pady=(PAD_SM, PAD_XS))
+
+    # ---------------- 背景图片 ----------------
+    def _build_bg_layer(self):
+        """建背景层。用 place 铺满并把自身压到所有控件之下（`lower()`）。
+
+        为什么用 place 而不是 grid：它**不参与布局计算**，所以不会把其它行挤走；
+        也不会影响 FlowBar 的折行判断。
+        """
+        try:
+            self.bg_layer = tk.Label(self.root, bd=0, highlightthickness=0)
+            # 窗口尺寸变化时重新适配（防抖 250ms，拖拽窗口不会卡）
+            self.root.bind("<Configure>", self._on_root_resize_for_bg, add="+")
+        except Exception:
+            self.bg_layer = None
+
+    def _on_root_resize_for_bg(self, event=None):
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        if not getattr(self, "bg_image_path", ""):
+            return
+        try:
+            if self._bg_resize_after:
+                self.root.after_cancel(self._bg_resize_after)
+        except Exception:
+            pass
+        try:
+            self._bg_resize_after = self.root.after(250, self._show_bg)
+        except Exception:
+            self._bg_resize_after = None
+
+    def _show_bg(self):
+        """按当前窗口尺寸把背景图铺到底层（居中裁剪）。"""
+        lbl = getattr(self, "bg_layer", None)
+        if lbl is None:
+            return
+        path = getattr(self, "bg_image_path", "")
+        if not path:
+            try:
+                lbl.place_forget()
+            except Exception:
+                pass
+            self._bg_photo = None
+            return
+        try:
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            w = h = 0
+        if w <= 1 or h <= 1:            # 窗口还没定尺寸（启动早期）：用默认尺寸兜底
+            w, h = 1200, 780
+        photo = load_bg_photo(path, w, h)
+        if photo is None:
+            self._forget_bad_bg(path)
+            return
+        self._bg_photo = photo          # 持有引用
+        try:
+            lbl.configure(image=photo)
+            # 居中：图比窗口大时偏移为负 —— 两侧溢出被窗口裁掉，视觉上就是 cover
+            lbl.place(x=(w - photo.width()) // 2, y=(h - photo.height()) // 2)
+            lbl.lower()                 # 压到所有控件之下
+        except Exception:
+            pass
+
+    def _forget_bad_bg(self, path):
+        """图读不了了（被删 / 损坏 / 格式不支持）：清干净并说清楚，不要每轮都重试。"""
+        self.bg_image_path = ""
+        self._bg_photo = None
+        try:
+            self.bg_layer.place_forget()
+        except Exception:
+            pass
+        self._refresh_bg_ui()
+        self.log_msg(f"⚠️ 背景图片读不了（{os.path.basename(str(path))}），已取消背景图。")
+
+    def set_bg_image(self, path, quiet=False):
+        """设置背景图。返回是否成功 —— 失败一定说明原因，不留半截状态。"""
+        path = str(path or "").strip()
+        if not path:
+            return False
+        ext = os.path.splitext(path)[1].lower()
+        if ext in BG_IMAGE_UNSUPPORTED:
+            if not quiet:
+                messagebox.showwarning(
+                    "这个格式读不了",
+                    f"Tk 的图片组件只能直接读 PNG / GIF / PPM，读不了 {ext.upper()}。\n\n"
+                    "请先把它转成 PNG（画图 / 在线转换都行）再选一次。")
+            return False
+        if ext and ext not in BG_IMAGE_EXTS:
+            self.log_msg(f"⚠️ 这个扩展名（{ext}）可能不是 Tk 支持的图片格式，先试一下。")
+        if not os.path.exists(path):
+            if not quiet:
+                messagebox.showwarning("找不到文件", f"这个路径不存在：\n{path}")
+            return False
+        try:
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            w = h = 0
+        if w <= 1 or h <= 1:
+            w, h = 1200, 780
+        photo = load_bg_photo(path, w, h)
+        if photo is None:
+            if not quiet:
+                messagebox.showwarning("读不了这张图",
+                                       "它可能不是图片、已损坏，或是 Tk 不支持的格式。")
+            return False
+        self.bg_image_path = path
+        self._bg_photo = photo
+        self._show_bg()
+        self._refresh_bg_ui()
+        if not quiet:
+            self.log_msg(f"🖼 已设置背景图片：{os.path.basename(path)}"
+                         f"（{photo.width()}×{photo.height()}，按窗口裁剪铺满）")
+        return True
+
+    def on_pick_bg_image(self):
+        path = filedialog.askopenfilename(
+            title="选择背景图片",
+            filetypes=[("图片（PNG / GIF / PPM）", "*.png *.gif *.ppm *.pgm"),
+                       ("全部文件", "*.*")])
+        if not path:
+            return
+        if self.set_bg_image(path):
+            self.save_config()
+
+    def on_clear_bg_image(self):
+        if not getattr(self, "bg_image_path", ""):
+            self.log_msg("🖼 本来就没有设置背景图片。")
+            return
+        self.bg_image_path = ""
+        self._bg_photo = None
+        try:
+            self.bg_layer.place_forget()
+        except Exception:
+            pass
+        self._refresh_bg_ui()
+        self.save_config()
+        self.log_msg("🖼 已清除背景图片。")
+
+    def _refresh_bg_ui(self):
+        """刷新外观页上那三行（文件名 / 清除按钮可用性）。"""
+        path = getattr(self, "bg_image_path", "")
+        lbl = getattr(self, "lbl_bg_name", None)
+        if lbl is not None:
+            try:
+                lbl.configure(text=(os.path.basename(path) if path else "（未设置）"))
+            except Exception:
+                pass
+        btn = getattr(self, "btn_bg_clear", None)
+        if btn is not None:
+            try:
+                btn.configure(state=("normal" if path else "disabled"))
+            except Exception:
+                pass
 
     def _tab_appearance(self, nb):
         f = ttk.Frame(nb, padding=10)
@@ -3475,17 +3834,36 @@ class App:
         f.grid_columnconfigure(0, weight=1)
         self.dark_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="深色模式", variable=self.dark_var, command=self.on_toggle_theme).grid(
-            row=0, column=0, sticky="w", padx=4, pady=4)
+            row=0, column=0, sticky="w", padx=PAD_XS, pady=PAD_XS)
         self.remember_layout_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="记住窗口大小 / 列宽 / 面板开合", variable=self.remember_layout_var,
-                        command=self.save_config).grid(row=1, column=0, sticky="w", padx=4, pady=4)
+                        command=self.save_config).grid(row=1, column=0, sticky="w", padx=PAD_XS, pady=PAD_XS)
+        # ---- 背景图片 ----
+        ttk.Label(f, text="背景图片", font=ui_font(FONT_SM, True),
+                  foreground="#6b7280").grid(row=2, column=0, sticky="w", padx=PAD_XS,
+                                            pady=(PAD_MD, PAD_XS))
+        bgbar = ttk.Frame(f)
+        bgbar.grid(row=3, column=0, sticky="ew", padx=PAD_XS)
+        self.btn_bg_pick = ttk.Button(bgbar, text="选择图片…", command=self.on_pick_bg_image)
+        self.btn_bg_pick.pack(side="left")
+        self.btn_bg_clear = ttk.Button(bgbar, text="清除背景", command=self.on_clear_bg_image,
+                                       state="disabled")
+        self.btn_bg_clear.pack(side="left", padx=(PAD_XS, 0))
+        self.lbl_bg_name = ttk.Label(f, text="（未设置）", foreground="#6b7280",
+                                     wraplength=280, justify="left")
+        self.lbl_bg_name.grid(row=4, column=0, sticky="w", padx=PAD_XS, pady=(PAD_XS, 0))
+        ttk.Label(f, text="支持 PNG / GIF / PPM —— Tk 读不了 JPG，请先转成 PNG。"
+                          "图片按窗口裁剪铺满、居中显示。",
+                  foreground="#6b7280", wraplength=290, justify="left").grid(
+            row=5, column=0, sticky="w", padx=PAD_XS, pady=(PAD_XS, 0))
+        # ---- 布局与快捷键 ----
         ttk.Button(f, text="快捷键一览（F1）", command=self.on_show_shortcuts).grid(
-            row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
+            row=6, column=0, sticky="ew", padx=PAD_XS, pady=(PAD_MD, PAD_XS))
         self.btn_reset_layout = ttk.Button(f, text="恢复默认布局", command=self.on_reset_layout)
-        self.btn_reset_layout.grid(row=3, column=0, sticky="ew", padx=4, pady=(10, 4))
+        self.btn_reset_layout.grid(row=7, column=0, sticky="ew", padx=PAD_XS, pady=(PAD_MD, PAD_XS))
         ttk.Label(f, text="快捷键：Ctrl+F 搜索 / Ctrl+A 全选 / 空格 勾选 / F5 刷新 / Esc 清搜索 / F1 全部",
                   foreground="#6b7280", wraplength=290, justify="left").grid(
-            row=4, column=0, sticky="w", padx=4, pady=(10, 2))
+            row=8, column=0, sticky="w", padx=PAD_XS, pady=(PAD_MD, PAD_XS))
 
     # ---------------- 右主区：筛选 + 表格 + 选择 + 退出 ----------------
     def _build_main_area(self, parent):
@@ -3497,51 +3875,51 @@ class App:
 
         # 1) 快捷筛选（分两行，避免窄窗口时被挤没）
         frm_filter = ttk.LabelFrame(parent, text="快捷筛选（各条件之间是「且」的关系）", padding=7)
-        frm_filter.grid(row=1, column=0, sticky="ew", pady=(0, 5))
+        frm_filter.grid(row=1, column=0, sticky="ew", pady=(0, PAD_XS))
         self.frm_filter = frm_filter
         row1 = ttk.Frame(frm_filter)
         row1.pack(fill="x")
         row2 = ttk.Frame(frm_filter)
-        row2.pack(fill="x", pady=(5, 0))
+        row2.pack(fill="x", pady=(PAD_XS, 0))
 
-        ttk.Label(row1, text="预设:").pack(side="left", padx=(2, 2))
+        ttk.Label(row1, text="预设:").pack(side="left", padx=(PAD_XS, PAD_XS))
         self.filter_preset_var = tk.StringVar(value=FILTER_PRESETS[0][0])
         self.filter_preset_cb = ttk.Combobox(
             row1, textvariable=self.filter_preset_var, state="readonly", width=22,
             values=[p[0] for p in FILTER_PRESETS] + [FILTER_CUSTOM],
         )
-        self.filter_preset_cb.pack(side="left", padx=2)
+        self.filter_preset_cb.pack(side="left", padx=PAD_XS)
         self.filter_preset_cb.bind("<<ComboboxSelected>>", lambda e: self.on_filter_preset())
 
-        ttk.Label(row1, text="用户数 <").pack(side="left", padx=(12, 2))
+        ttk.Label(row1, text="用户数 <").pack(side="left", padx=(PAD_MD, PAD_XS))
         self.filter_members_var = tk.StringVar()
         ent_m = ttk.Entry(row1, textvariable=self.filter_members_var, width=7)
-        ent_m.pack(side="left", padx=2)
+        ent_m.pack(side="left", padx=PAD_XS)
         ent_m.bind("<Return>", lambda e: self.apply_filter())
 
-        ttk.Label(row1, text="作品数 <").pack(side="left", padx=(12, 2))
+        ttk.Label(row1, text="作品数 <").pack(side="left", padx=(PAD_MD, PAD_XS))
         self.filter_posts_var = tk.StringVar()
         ent_p = ttk.Entry(row1, textvariable=self.filter_posts_var, width=7)
-        ent_p.pack(side="left", padx=2)
+        ent_p.pack(side="left", padx=PAD_XS)
         ent_p.bind("<Return>", lambda e: self.apply_filter())
 
         # 活跃：只给「大于」方向 —— 清理时真正想知道的是「多久没动静了」
-        ttk.Label(row1, text="活跃(天) >").pack(side="left", padx=(12, 2))
+        ttk.Label(row1, text="活跃(天) >").pack(side="left", padx=(PAD_MD, PAD_XS))
         self.filter_active_var = tk.StringVar()
         ent_a = ttk.Entry(row1, textvariable=self.filter_active_var, width=7)
-        ent_a.pack(side="left", padx=2)
+        ent_a.pack(side="left", padx=PAD_XS)
         ent_a.bind("<Return>", lambda e: self.apply_filter())
 
         self.filter_unknown_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="隐藏统计未获取的行", variable=self.filter_unknown_var,
-                        command=self.apply_filter).pack(side="left", padx=12)
+                        command=self.apply_filter).pack(side="left", padx=PAD_MD)
 
-        ttk.Button(row2, text="应用", command=self.apply_filter).pack(side="left", padx=2)
-        ttk.Button(row2, text="应用并全选", command=self.apply_filter_and_select_all).pack(side="left", padx=2)
-        ttk.Button(row2, text="清除", command=self.clear_filter).pack(side="left", padx=2)
+        ttk.Button(row2, text="应用", command=self.apply_filter).pack(side="left", padx=PAD_XS)
+        ttk.Button(row2, text="应用并全选", command=self.apply_filter_and_select_all).pack(side="left", padx=PAD_XS)
+        ttk.Button(row2, text="清除", command=self.clear_filter).pack(side="left", padx=PAD_XS)
         ttk.Label(row2, text="提示：筛选生效时，「全选 / 反选」只作用于当前显示出来的行；"
                             "被隐藏的勾选会用「清空全部」一并清掉。",
-                  foreground="#6b7280").pack(side="left", padx=(10, 2))
+                  foreground="#6b7280").pack(side="left", padx=(PAD_MD, PAD_XS))
 
         # 2) 列表（表格占满剩余空间，横向纵向都能滚）
         frm_list = ttk.LabelFrame(parent, text="全部会话（频道 / 群组 / 私聊 / 机器人）—— 点「选择」列或按空格勾选", padding=7)
@@ -3554,7 +3932,7 @@ class App:
         # ⚠️ 名字不能叫 lbl_stats —— 状态栏里已有一个同名标签（统计进度用），会被覆盖。
         self.stats_var = tk.StringVar(value="")
         self.lbl_kind_stats = ttk.Label(frm_list, textvariable=self.stats_var, anchor="w")
-        self.lbl_kind_stats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.lbl_kind_stats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, PAD_XS))
 
         # 「id」「safe」保持在末尾：按位置构造行值的既有代码/测试不受影响，
         # 新增列一律插在 posts 之后、id 之前。
@@ -3602,8 +3980,8 @@ class App:
         # 用户看到的「📁 分组 ▾ 没了」「导出 / 隐藏受保护项 / 计数都没了」就是这个：
         # 「📁 分组 ▾」还会被挤成 32px 宽，只剩一个「📁…」几乎看不见。
         # 改用 FlowBar：放不下就折到下一行，任何主区宽度下都点得到。
-        frm_sel = FlowBar(parent, gap=6)
-        frm_sel.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        frm_sel = FlowBar(parent)
+        frm_sel.grid(row=3, column=0, sticky="ew", pady=(PAD_XS, 0))
         self._flow_sel = frm_sel      # 供自检 / 测试检查折行情况
         self.btn_sel_all = ttk.Button(frm_sel, text="全选", command=self.select_all_visible)
         frm_sel.add(self.btn_sel_all)
@@ -3678,14 +4056,18 @@ class App:
 
         # 4) 退出条（主操作，固定在列表下方）
         # 同样是一排控件（退出 / 删除 / 更多 / 待退出数 / 两个节奏输入），主区窄时一起折行
-        frm_act = FlowBar(parent, gap=6)
-        frm_act.grid(row=4, column=0, sticky="ew", pady=(5, 0))
+        frm_act = FlowBar(parent)
+        frm_act.grid(row=4, column=0, sticky="ew", pady=(PAD_XS, 0))
         self._flow_act = frm_act
-        self.btn_leave = ttk.Button(frm_act, text="🚪 退出 / 删除选中", command=self.on_leave, state="disabled")
+        # 主操作（工具的目的就是它）：蓝色实心
+        self.btn_leave = ttk.Button(frm_act, text="🚪 退出 / 删除选中", command=self.on_leave,
+                                    state="disabled", style="Primary.TButton")
         frm_act.add(self.btn_leave)
         # 删除类操作收进下拉菜单：破坏性高、使用频率低，
         # 平铺在主按钮旁边反而容易连同「退出」一起误点。
-        self.btn_destroy = ttk.Menubutton(frm_act, text="🗑 删除 ▾", state="disabled")
+        # 破坏性操作：红色实心（不可恢复，必须一眼看出和其它按钮不是一类）
+        self.btn_destroy = ttk.Menubutton(frm_act, text="🗑 删除 ▾", state="disabled",
+                                          style="Danger.TMenubutton")
         self._destroy_menu = tk.Menu(self.btn_destroy, tearoff=0)
         self._destroy_menu.add_command(label="删除会话（含聊天记录）…",
                                       command=self.on_delete_dialogs)
@@ -3718,12 +4100,12 @@ class App:
         _g1 = ttk.Frame(frm_act)
         ttk.Label(_g1, text="退出间隔(秒):").pack(side="left")
         ttk.Spinbox(_g1, from_=1, to=120, textvariable=self.interval_var, width=5).pack(
-            side="left", padx=(3, 0))
+            side="left", padx=(PAD_XS, 0))
         frm_act.add(_g1)
         _g2 = ttk.Frame(frm_act)
         ttk.Label(_g2, text="随机抖动(秒):").pack(side="left")
         ttk.Spinbox(_g2, from_=0, to=60, textvariable=self.jitter_var, width=5).pack(
-            side="left", padx=(3, 0))
+            side="left", padx=(PAD_XS, 0))
         frm_act.add(_g2)
 
     # ---------------- 首次使用引导（空列表时盖在表格上） ----------------
@@ -3731,7 +4113,7 @@ class App:
         """未连接 / 未加载时给一张引导卡片，而不是让人对着一片空白表格发呆。"""
         self._guide = ttk.Frame(parent, padding=24)
         self._guide.grid(row=1, column=0, sticky="nsew")
-        ttk.Label(self._guide, text="三步开始", font=("", 13)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(self._guide, text="三步开始", font=ui_font(FONT_TITLE, True)).pack(anchor="w", pady=(0, PAD_SM))
         steps = (
             "1. 到 my.telegram.org 申请 api_id / api_hash，填到左侧「网络」页（只需一次）",
             "2. 左侧「账号」页填手机号 → 点「添加账号并登录」，按提示输验证码",
@@ -3739,15 +4121,15 @@ class App:
         )
         for t in steps:
             ttk.Label(self._guide, text=t, foreground="#6b7280", wraplength=560,
-                      justify="left").pack(anchor="w", pady=2)
+                      justify="left").pack(anchor="w", pady=PAD_XS)
         row = ttk.Frame(self._guide)
-        row.pack(anchor="w", pady=(12, 0))
+        row.pack(anchor="w", pady=(PAD_MD, 0))
         ttk.Button(row, text="连接 / 登录", command=self.on_connect).pack(side="left")
-        ttk.Button(row, text="刷新列表", command=self.on_refresh).pack(side="left", padx=6)
+        ttk.Button(row, text="刷新列表", command=self.on_refresh).pack(side="left", padx=PAD_SM)
         ttk.Button(row, text="快捷键（F1）", command=self.on_show_shortcuts).pack(side="left")
         ttk.Label(self._guide, text="提示：删 / 退之后都会回头向服务端复核，"
                                     "没确认的行会留在列表里，不会谎报成功。",
-                  foreground="#6b7280", wraplength=560, justify="left").pack(anchor="w", pady=(12, 0))
+                  foreground="#6b7280", wraplength=560, justify="left").pack(anchor="w", pady=(PAD_MD, 0))
         self._guide.lift()
 
     def _update_guide(self):
@@ -3805,16 +4187,16 @@ class App:
         self.progress = ttk.Progressbar(bar, mode="determinate", maximum=100, length=240)
         self.progress.pack(side="left")
         self.lbl_task = ttk.Label(bar, text="空闲")
-        self.lbl_task.pack(side="left", padx=8)
+        self.lbl_task.pack(side="left", padx=PAD_SM)
         # 右侧（pack 顺序 = 从右往左）：版本号 | 更新日志 | 统计进度
         # 版本号必须在界面上看得见 —— 排查问题时第一个要问的就是「你用的是哪一版」。
         self.lbl_version = ttk.Label(bar, text=APP_VERSION, foreground="#6b7280")
-        self.lbl_version.pack(side="right", padx=(10, 0))
+        self.lbl_version.pack(side="right", padx=(PAD_MD, 0))
         self.btn_changelog = ttk.Button(bar, text="📋 更新日志", width=12,
                                         command=self.on_show_changelog)
-        self.btn_changelog.pack(side="right", padx=(10, 0))
+        self.btn_changelog.pack(side="right", padx=(PAD_MD, 0))
         self.lbl_stats = ttk.Label(bar, text="")
-        self.lbl_stats.pack(side="right", padx=4)
+        self.lbl_stats.pack(side="right", padx=PAD_XS)
 
     def _build_log_panel(self):
         self.frm_log = ttk.Frame(self.root, padding=(10, 2, 10, 8))
@@ -3822,7 +4204,7 @@ class App:
         # 这一排控件比最小窗口还宽（运行日志 / 清空 / 导出 / 复制全部 / 三级过滤 / 搜索 /
         # 自动滚动 / 提示），同样交给 FlowBar 折行 —— 否则窄窗口下右半截（连「搜索」
         # 「自动滚动」）都点不到。
-        head = FlowBar(self.frm_log, gap=6)
+        head = FlowBar(self.frm_log)
         head.pack(fill="x")
         self._flow_log_head = head      # 供自检 / 测试检查折行情况
         head.add(ttk.Label(head, text="运行日志"))
@@ -3847,7 +4229,7 @@ class App:
         head.add(ttk.Label(head, text="提示：退出间隔太短容易触发限流；日志区可用顶部「🗒 日志」收起。",
                            foreground="#6b7280"))
         self.log = scrolledtext.ScrolledText(self.frm_log, height=7, state="normal")
-        self.log.pack(fill="both", expand=True, pady=(3, 0))
+        self.log.pack(fill="both", expand=True, pady=(PAD_XS, 0))
         for lv, _label in LOG_LEVEL_META:
             try:
                 self.log.tag_configure(
@@ -3874,15 +4256,15 @@ class App:
         head = ttk.Frame(outer)
         head.pack(fill="x")
         ttk.Label(head, text=f"{APP_NAME} {APP_VERSION}",
-                  font=("", 12, "bold")).pack(anchor="w")
-        ttk.Label(head, text=APP_REPO, foreground="#2563eb").pack(anchor="w", pady=(2, 0))
+                  font=ui_font(FONT_BASE, True)).pack(anchor="w")
+        ttk.Label(head, text=APP_REPO, foreground="#2563eb").pack(anchor="w", pady=(PAD_XS, 0))
 
         txt = scrolledtext.ScrolledText(outer, wrap="word", height=20)
-        txt.pack(fill="both", expand=True, pady=(10, 8))
+        txt.pack(fill="both", expand=True, pady=(PAD_MD, PAD_SM))
         # 标签样式：当前版本用强调色 + 加粗，历史版本标题弱化，正文常规
-        txt.tag_configure("ver_cur", font=("", 11, "bold"), foreground="#2563eb",
+        txt.tag_configure("ver_cur", font=ui_font(FONT_SM, True), foreground="#2563eb",
                           spacing1=2, spacing3=2)
-        txt.tag_configure("ver_old", font=("", 10, "bold"),
+        txt.tag_configure("ver_old", font=ui_font(FONT_SM, True),
                           spacing1=10, spacing3=2)
         txt.tag_configure("date", foreground="#6b7280")
         txt.tag_configure("item", lmargin1=18, lmargin2=32, spacing1=1)
@@ -4259,58 +4641,198 @@ class App:
         self.save_config()
 
     def _apply_theme(self, dark=None):
-        """浅色保持系统原生主题；深色切到 clam 并统一配色（ttk 只有 clam 系列支持改底色）。
+        """**始终用 clam 并完全自绘**。
 
-        除了 ttk 样式，还要一起处理三处「自己画的颜色」：
-          1) Treeview 的行 tag（斑马纹 / 白名单 / 创建者 / 异常分级）；
-          2) 日志 Text（独立控件，不跟 ttk 主题）；
-          3) 那些创建时写死了浅色灰的说明标签 —— 深色下它们会糊成一片看不清。
-        做法是**遍历控件树**按「原色属于浅色灰」找出这些标签再统一上色，
-        不要求每个创建点都记得登记。"""
+        为什么必须换掉系统主题：ttk 的 vista 主题不允许改大部分元素（按钮还是凸起渐变），
+        想做出扁平现代的观感就只能走 clam + 自己配。改之前这个方法**只在切换深色时被调用**，
+        所以浅色模式一直是系统默认外观 —— 这才是「界面丑」的最大来源。
+
+        改这里要记住三件事（都踩过）：
+          1) 除了 ttk 样式，还有「自己画的颜色」：Treeview 行 tag、日志 Text、
+             以及创建时写死浅灰的说明标签（遍历控件树重涂，见 `_recolor_muted_labels`）；
+          2) 下拉列表与右键菜单**不在控件树里**，要用 option_add / 遍历 `*_menu` 属性单独上色；
+          3) 字号一律走 `ui_font()`（Tk 具名字体已由 `apply_ui_font` 统一），不要写死。
+        """
         if dark is None:
             dark = bool(getattr(self, "_dark", False))
         self._dark = bool(dark)
-        pal = theme_palette(self._dark)
+        p = theme_palette(self._dark)
+        try:
+            apply_ui_font(self.root)        # 字体族 + 字阶（全局具名字体）
+        except Exception:
+            pass
         style = ttk.Style(self.root)
         try:
-            style.theme_use("clam" if self._dark else self._default_theme)
+            style.theme_use("clam")         # 必须 clam：vista 不让改元素
         except Exception:
             pass
         try:
-            style.configure(".", background=pal["bg"], foreground=pal["fg"],
-                            fieldbackground=pal["field"])
-            style.configure("TFrame", background=pal["bg"])
-            style.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"])
-            style.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"])
-            style.configure("TLabel", background=pal["bg"], foreground=pal["fg"])
-            style.configure("TButton", padding=(6, 3))
-            style.map("TButton", foreground=[("disabled", pal["sub"])])
-            style.configure("TCheckbutton", background=pal["bg"], foreground=pal["fg"])
-            style.configure("TRadiobutton", background=pal["bg"], foreground=pal["fg"])
-            style.configure("TNotebook", background=pal["bg"], borderwidth=0)
-            style.configure("TNotebook.Tab", padding=(10, 4), background=pal["head"],
-                            foreground=pal["fg"])
-            style.configure("TEntry", fieldbackground=pal["field"], foreground=pal["fg"])
-            style.configure("TCombobox", fieldbackground=pal["field"], foreground=pal["fg"])
-            style.configure("TSpinbox", fieldbackground=pal["field"], foreground=pal["fg"])
-            style.configure("TSeparator", background=pal["border"])
-            style.configure("Treeview", background=pal["panel"], fieldbackground=pal["panel"],
-                            foreground=pal["fg"], rowheight=24, bordercolor=pal["border"])
-            style.map("Treeview", background=[("selected", pal["sel"])],
-                      foreground=[("selected", pal["fg"])])
-            style.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"])
-            style.configure("Horizontal.TProgressbar", background=pal["accent"])
-            self.root.configure(bg=pal["bg"])
+            style.configure(".", background=p["bg"], foreground=p["fg"],
+                            fieldbackground=p["field"], bordercolor=p["border"],
+                            lightcolor=p["border"], darkcolor=p["border"],
+                            troughcolor=p["panel_alt"], focuscolor=p["accent"],
+                            font=ui_font())
+            # ---- 面（三级底色：页面 / 卡片 / 次级条）----
+            style.configure("TFrame", background=p["bg"])
+            style.configure("Card.TFrame", background=p["panel"])
+            style.configure("Bar.TFrame", background=p["panel_alt"])
+            style.configure("TLabel", background=p["bg"], foreground=p["fg"])
+            style.configure("Card.TLabel", background=p["panel"], foreground=p["fg"])
+            style.configure("Bar.TLabel", background=p["panel_alt"], foreground=p["fg"])
+            style.configure("Muted.TLabel", background=p["bg"], foreground=p["fg2"])
+            style.configure("MutedBar.TLabel", background=p["panel_alt"], foreground=p["fg2"])
+            style.configure("Hint.TLabel", background=p["bg"], foreground=p["fg3"])
+            style.configure("Title.TLabel", background=p["bg"], foreground=p["fg"],
+                            font=ui_font(FONT_TITLE, True))
+            style.configure("Accent.TLabel", background=p["bg"], foreground=p["accent"])
+            style.configure("TLabelframe", background=p["bg"], bordercolor=p["border"],
+                            relief="solid", borderwidth=1)
+            style.configure("TLabelframe.Label", background=p["bg"], foreground=p["fg2"],
+                            font=ui_font(FONT_SM, True))
+            # ---- 按钮三级：默认=次要（扁平细边）/ Primary=主操作 / Danger=破坏性 ----
+            for name, bg, fg, hover, bd in (
+                    ("TButton", p["panel"], p["fg"], p["hover"], p["border"]),
+                    ("Primary.TButton", p["accent"], p["accent_fg"], p["accent_hover"], p["accent"]),
+                    ("Danger.TButton", p["danger"], p["danger_fg"], p["danger_hover"], p["danger"])):
+                style.configure(name, background=bg, foreground=fg, bordercolor=bd,
+                                lightcolor=bg, darkcolor=bg, relief="flat", borderwidth=1,
+                                padding=(PAD_MD, 5), focusthickness=0, font=ui_font())
+                style.map(name,
+                          background=[("pressed", hover), ("active", hover),
+                                      ("disabled", p["panel_alt"])],
+                          foreground=[("disabled", p["fg3"])],
+                          bordercolor=[("active", hover), ("pressed", hover)],
+                          lightcolor=[("active", hover), ("pressed", hover)],
+                          darkcolor=[("active", hover), ("pressed", hover)])
+            # ---- 下拉按钮（Menubutton）与默认按钮同观感 ----
+            style.configure("TMenubutton", background=p["panel"], foreground=p["fg"],
+                            bordercolor=p["border"], arrowcolor=p["fg2"],
+                            lightcolor=p["panel"], darkcolor=p["panel"],
+                            relief="flat", borderwidth=1, padding=(PAD_MD, 5), font=ui_font())
+            style.map("TMenubutton",
+                      background=[("active", p["hover"]), ("pressed", p["hover"])],
+                      foreground=[("disabled", p["fg3"])],
+                      lightcolor=[("active", p["hover"]), ("pressed", p["hover"])],
+                      darkcolor=[("active", p["hover"]), ("pressed", p["hover"])])
+            style.configure("Danger.TMenubutton", background=p["danger"],
+                            foreground=p["danger_fg"], bordercolor=p["danger"],
+                            arrowcolor=p["danger_fg"], lightcolor=p["danger"],
+                            darkcolor=p["danger"], relief="flat", borderwidth=1,
+                            padding=(PAD_MD, 5), font=ui_font())
+            style.map("Danger.TMenubutton",
+                      background=[("active", p["danger_hover"]), ("pressed", p["danger_hover"]),
+                                  ("disabled", p["panel_alt"])],
+                      foreground=[("disabled", p["fg3"])],
+                      arrowcolor=[("disabled", p["fg3"])],
+                      lightcolor=[("active", p["danger_hover"]), ("pressed", p["danger_hover"])],
+                      darkcolor=[("active", p["danger_hover"]), ("pressed", p["danger_hover"])])
+            # ---- 输入类：扁平 + 焦点变主色 ----
+            style.configure("TEntry", fieldbackground=p["field"], background=p["panel"],
+                            foreground=p["fg"], bordercolor=p["border"],
+                            lightcolor=p["border"], darkcolor=p["border"],
+                            insertcolor=p["fg"], padding=(PAD_SM, 4),
+                            relief="flat", borderwidth=1)
+            style.map("TEntry", bordercolor=[("focus", p["accent"])],
+                      lightcolor=[("focus", p["accent"])], darkcolor=[("focus", p["accent"])])
+            style.configure("TCombobox", fieldbackground=p["field"], background=p["panel"],
+                            foreground=p["fg"], bordercolor=p["border"], arrowcolor=p["fg2"],
+                            lightcolor=p["border"], darkcolor=p["border"],
+                            padding=(PAD_SM, 3), relief="flat", borderwidth=1)
+            style.map("TCombobox", fieldbackground=[("readonly", p["field"])],
+                      bordercolor=[("focus", p["accent"])],
+                      lightcolor=[("focus", p["accent"])], darkcolor=[("focus", p["accent"])])
+            style.configure("TSpinbox", fieldbackground=p["field"], background=p["panel"],
+                            foreground=p["fg"],
+                            bordercolor=p["border"], arrowcolor=p["fg2"],
+                            lightcolor=p["border"], darkcolor=p["border"],
+                            padding=(PAD_SM, 3), relief="flat", borderwidth=1)
+            # ---- 勾选 / 单选 ----
+            style.configure("TCheckbutton", background=p["bg"], foreground=p["fg"],
+                            indicatorcolor=p["panel"], focuscolor=p["accent"], font=ui_font())
+            style.map("TCheckbutton",
+                      background=[("active", p["bg"])],
+                      indicatorcolor=[("selected", p["accent"]), ("active", p["hover"])],
+                      foreground=[("disabled", p["fg3"])])
+            style.configure("Bar.TCheckbutton", background=p["panel_alt"], foreground=p["fg"])
+            style.map("Bar.TCheckbutton", background=[("active", p["panel_alt"])],
+                      indicatorcolor=[("selected", p["accent"]), ("active", p["hover"])])
+            style.configure("TRadiobutton", background=p["bg"], foreground=p["fg"],
+                            indicatorcolor=p["panel"], font=ui_font())
+            # ---- 页签：扁平，选中态靠底色 + 主色文字 ----
+            style.configure("TNotebook", background=p["bg"], borderwidth=0, tabmargins=(0, 4, 0, 0))
+            style.configure("TNotebook.Tab", background=p["panel_alt"], foreground=p["fg2"],
+                            padding=(PAD_MD, 6), borderwidth=0, font=ui_font())
+            style.map("TNotebook.Tab", background=[("selected", p["panel"])],
+                      foreground=[("selected", p["accent"])])
+            # ---- 表格：行高 26、表头扁平、选中用主色淡底 ----
+            style.configure("Treeview", background=p["panel"], fieldbackground=p["panel"],
+                            foreground=p["fg"], bordercolor=p["border"], rowheight=26,
+                            borderwidth=0, font=ui_font())
+            style.map("Treeview", background=[("selected", p["sel"])],
+                      foreground=[("selected", p["fg"])])
+            style.configure("Treeview.Heading", background=p["head"], foreground=p["fg2"],
+                            relief="flat", borderwidth=0, padding=(PAD_SM, 5),
+                            font=ui_font(FONT_SM, True))
+            style.map("Treeview.Heading", background=[("active", p["hover"])],
+                      foreground=[("active", p["fg"])])
+            # ---- 其它：分隔线 / 进度条 / 细滚动条 ----
+            style.configure("TSeparator", background=p["border"])
+            style.configure("Horizontal.TProgressbar", background=p["accent"],
+                            troughcolor=p["panel_alt"], bordercolor=p["panel_alt"],
+                            lightcolor=p["accent"], darkcolor=p["accent"], borderwidth=0)
+            for orient in ("Vertical", "Horizontal"):
+                style.configure("%s.TScrollbar" % orient, background=p["border_strong"],
+                                troughcolor=p["panel_alt"], bordercolor=p["panel_alt"],
+                                arrowcolor=p["fg2"], lightcolor=p["border_strong"],
+                                darkcolor=p["border_strong"], borderwidth=0, arrowsize=13)
+                style.map("%s.TScrollbar" % orient,
+                          background=[("active", p["fg3"]), ("pressed", p["fg3"])])
+            self.root.configure(bg=p["bg"])
         except Exception:
             pass
+        # 下拉列表与菜单不在控件树里，只能单独上色
+        for pat, val in (("*TCombobox*Listbox.background", p["panel"]),
+                         ("*TCombobox*Listbox.foreground", p["fg"]),
+                         ("*TCombobox*Listbox.selectBackground", p["accent"]),
+                         ("*TCombobox*Listbox.selectForeground", p["accent_fg"]),
+                         ("*Menu.background", p["panel"]),
+                         ("*Menu.foreground", p["fg"]),
+                         ("*Menu.activeBackground", p["accent_soft"]),
+                         ("*Menu.activeForeground", p["fg"]),
+                         ("*Menu.borderWidth", 1),
+                         ("*Menu.relief", "flat")):
+            try:
+                self.root.option_add(pat, val)
+            except Exception:
+                continue
+        global TOOLTIP_BG, TOOLTIP_FG, TOOLTIP_BORDER
+        TOOLTIP_BG, TOOLTIP_FG, TOOLTIP_BORDER = p["panel_alt"], p["fg"], p["border"]
+        self._recolor_menus(p)
         try:
-            self.log.configure(bg=pal["log_bg"], fg=pal["log_fg"], insertbackground=pal["fg"])
+            self.log.configure(bg=p["log_bg"], fg=p["log_fg"], insertbackground=p["fg"],
+                               selectbackground=p["sel"], selectforeground=p["fg"],
+                               borderwidth=0, relief="flat")
             for lv, _label in LOG_LEVEL_META:
-                self.log.tag_configure(lv, foreground=LOG_LEVEL_COLOR_OF(pal, lv))
+                self.log.tag_configure(lv, foreground=LOG_LEVEL_COLOR_OF(p, lv))
         except Exception:
             pass
-        self._configure_tree_tags(pal)
-        self._recolor_muted_labels(pal)
+        self._configure_tree_tags(p)
+        self._recolor_muted_labels(p)
+
+    def _recolor_menus(self, pal):
+        """右键 / 下拉菜单是独立的 tk.Menu（**不在控件树里**），得按 `*_menu` 属性逐个上色。
+
+        用 vars(self) 遍历而不是写死清单 —— 以后新加菜单自动被覆盖，不会漏。
+        """
+        for attr, m in list(vars(self).items()):
+            if not attr.endswith("_menu") or not isinstance(m, tk.Menu):
+                continue
+            try:
+                m.configure(bg=pal["panel"], fg=pal["fg"], bd=0, relief="flat",
+                            activebackground=pal["accent_soft"], activeforeground=pal["fg"],
+                            selectcolor=pal["accent"])
+            except Exception:
+                continue
 
     def _configure_tree_tags(self, pal):
         """行 tag 的配色。斑马纹只给背景，异常 / 保护只给前景 —— 两组不打架。"""
@@ -4325,7 +4847,11 @@ class App:
             pass
 
     def _recolor_muted_labels(self, pal):
-        """把「创建时写死浅色灰」的说明标签切成当前主题的次要色。"""
+        """把「构建时写死浅色」的标签重涂成当前主题。
+
+        用的是 `LIGHT_ONLY_FG` 的**语义映射**（白名单行保持蓝、危险提示保持红），
+        不是一律涂成灰色 —— 否则深色下所有强调色都会变成一片灰。
+        """
         found = []
         try:
             stack = [self.root]
@@ -4338,16 +4864,18 @@ class App:
                 try:
                     if isinstance(w, (ttk.Label, tk.Label)):
                         cur = str(w.cget("foreground") or "")
-                        if cur in MUTED_LIGHT or getattr(w, "_tg_muted", False):
+                        if cur in LIGHT_ONLY_FG or cur in MUTED_LIGHT or getattr(w, "_tg_muted", False):
                             w._tg_muted = True
+                            w._tg_src_fg = cur
                             found.append(w)
                 except Exception:
                     continue
         except Exception:
             return
         for w in found:
+            key = LIGHT_ONLY_FG.get(getattr(w, "_tg_src_fg", ""), "sub")
             try:
-                w.configure(foreground=pal["sub"])
+                w.configure(foreground=pal[key])
             except Exception:
                 continue
 
@@ -4401,20 +4929,20 @@ class App:
             pass
         body = ttk.Frame(dlg, padding=14)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="快捷键", font=("", 13)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, text="快捷键", font=ui_font(FONT_TITLE, True)).pack(anchor="w", pady=(0, PAD_SM))
         grid = ttk.Frame(body)
         grid.pack(fill="x")
         for i, (key, desc) in enumerate(shortcut_rows(self)):
-            ttk.Label(grid, text=key, width=14).grid(row=i, column=0, sticky="w", pady=2)
-            ttk.Label(grid, text=desc, foreground="#6b7280").grid(row=i, column=1, sticky="w", pady=2)
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=10)
-        ttk.Label(body, text="三个动作不是一回事", font=("", 12)).pack(anchor="w")
+            ttk.Label(grid, text=key, width=14).grid(row=i, column=0, sticky="w", pady=PAD_XS)
+            ttk.Label(grid, text=desc, foreground="#6b7280").grid(row=i, column=1, sticky="w", pady=PAD_XS)
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=PAD_MD)
+        ttk.Label(body, text="三个动作不是一回事", font=ui_font(FONT_TITLE)).pack(anchor="w")
         for txt in ("🔓 退出：不再是成员（频道 / 群组；创建者退不出去）",
                     "🗑 删除会话：只从你这边删掉会话与聊天记录，对方不受影响",
                     "🔥 销毁：删除你本人创建的频道 / 群组，对所有成员消失、不可恢复"):
             ttk.Label(body, text=txt, foreground="#6b7280", wraplength=420,
-                      justify="left").pack(anchor="w", pady=1)
-        ttk.Button(body, text="关闭", command=dlg.destroy).pack(anchor="e", pady=(12, 0))
+                      justify="left").pack(anchor="w", pady=PAD_XS)
+        ttk.Button(body, text="关闭", command=dlg.destroy).pack(anchor="e", pady=(PAD_MD, 0))
 
     def on_reset_layout(self):
         if not messagebox.askyesno("确认", "恢复默认布局（窗口大小 / 列宽 / 面板开合）？"):
@@ -4643,6 +5171,18 @@ class App:
             self.remember_layout_var.set(bool(cfg.get("remember_layout", True)))
             self.dark_var.set(bool(cfg.get("dark_mode", False)))
             self._apply_theme(bool(self.dark_var.get()))
+            # 背景图：文件没了就只写日志、不弹窗（每次启动都弹会烦人）
+            _bg = str(cfg.get("bg_image") or "").strip()
+            self.bg_image_path = ""
+            if _bg:
+                if os.path.exists(_bg) and self.set_bg_image(_bg, quiet=True):
+                    pass
+                else:
+                    self.log_msg(f"⚠️ 上次设置的背景图片找不到了（{_bg}），已忽略。"
+                                 "可在「外观」页重新选择。")
+            else:
+                self._show_bg()
+            self._refresh_bg_ui()
             self._apply_ui_layout(cfg)
             self._refresh_account_ui()
             self.refresh_cache_info()
@@ -6179,18 +6719,18 @@ class App:
         outer = ttk.Frame(dlg, padding=12)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text=f"把一批频道 / 群组批量{verb}到指定分组",
-                  font=("", 10, "bold")).pack(anchor="w")
+                  font=ui_font(FONT_SM, True)).pack(anchor="w")
         ttk.Label(outer, text="只改分组归属，不会退出、也不会删除任何会话。",
-                  foreground="#6b7280").pack(anchor="w", pady=(2, 8))
+                  foreground="#6b7280").pack(anchor="w", pady=(PAD_XS, PAD_SM))
 
         row = ttk.Frame(outer)
-        row.pack(fill="x", pady=(0, 8))
+        row.pack(fill="x", pady=(0, PAD_SM))
         ttk.Label(row, text="目标分组：").pack(side="left")
         fvar = tk.StringVar(value=folder_name or editable[0])
         ttk.Combobox(row, textvariable=fvar, state="readonly", width=24,
-                     values=editable).pack(side="left", padx=4)
+                     values=editable).pack(side="left", padx=PAD_XS)
         lbl_rule = ttk.Label(row, text="", foreground="#6b7280")
-        lbl_rule.pack(side="left", padx=8)
+        lbl_rule.pack(side="left", padx=PAD_SM)
 
         box = ttk.LabelFrame(outer, text="对哪些行生效", padding=8)
         box.pack(fill="x")
@@ -6199,15 +6739,15 @@ class App:
         for key, label in FOLDER_SCOPES:
             rb = ttk.Radiobutton(box, text=f"{label}（{len(self._folder_scope_iids(key))} 个）",
                                  value=key, variable=svar)
-            rb.pack(anchor="w", pady=1)
+            rb.pack(anchor="w", pady=PAD_XS)
             radios.append(rb)
 
         lbl_preview = ttk.Label(outer, text="", foreground="#185FA5",
                                 wraplength=600, justify="left")
-        lbl_preview.pack(anchor="w", pady=(8, 0))
+        lbl_preview.pack(anchor="w", pady=(PAD_SM, 0))
         lbl_warn = ttk.Label(outer, text="", foreground="#a32d2d",
                              wraplength=600, justify="left")
-        lbl_warn.pack(anchor="w", pady=(3, 0))
+        lbl_warn.pack(anchor="w", pady=(PAD_XS, 0))
 
         def update_preview(*_a):
             iids = self._folder_scope_iids(svar.get())
@@ -6236,7 +6776,7 @@ class App:
 
         result = {"ok": False}
         bar = ttk.Frame(outer)
-        bar.pack(fill="x", side="bottom", pady=(10, 0))
+        bar.pack(fill="x", side="bottom", pady=(PAD_MD, 0))
         ok_btn = ttk.Button(bar, text=f"确认{verb}")
 
         def on_ok():
@@ -6244,8 +6784,8 @@ class App:
             dlg.destroy()
 
         ok_btn.configure(command=on_ok)
-        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=4)
-        ok_btn.pack(side="right", padx=4)
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=PAD_XS)
+        ok_btn.pack(side="right", padx=PAD_XS)
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.bind("<Return>", lambda e: on_ok())
@@ -7556,14 +8096,14 @@ class App:
         ttk.Label(head, text="数据概览（全部来自当前列表，零请求）").pack(side="left")
         ttk.Button(head, text="刷新", command=self._render_dashboard).pack(side="right")
         grid = ttk.Frame(body)
-        grid.pack(fill="both", expand=True, pady=(10, 0))
+        grid.pack(fill="both", expand=True, pady=(PAD_MD, 0))
         pal = theme_palette(getattr(self, "_dark", False))
         self._dash_canvas = {}
         specs = (("kinds", "类型分布"), ("members", "用户数量级"),
                  ("active", "活跃度（最近消息）"), ("risk", "异常特征"))
         for i, (key, title) in enumerate(specs):
             cell = ttk.LabelFrame(grid, text=title, padding=6)
-            cell.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6)
+            cell.grid(row=i // 2, column=i % 2, sticky="nsew", padx=PAD_SM, pady=PAD_SM)
             grid.grid_columnconfigure(i % 2, weight=1)
             grid.grid_rowconfigure(i // 2, weight=1)
             cv = tk.Canvas(cell, width=500, height=180, highlightthickness=0, bg=pal["panel"])
@@ -7587,13 +8127,15 @@ class App:
         if not cvs:
             return
         data = self.dashboard_data()
+        pal = theme_palette(getattr(self, "_dark", False))
         try:
-            draw_donut(cvs["kinds"], data["kinds"])
+            draw_donut(cvs["kinds"], data["kinds"], fg=pal["fg"], muted=pal["fg3"])
         except Exception:
             pass
         for key in ("members", "active", "risk"):
             try:
-                draw_bars(cvs[key], data[key])
+                draw_bars(cvs[key], data[key], fg=pal["fg"], muted=pal["fg3"],
+                          axis=pal["border_strong"])
             except Exception:
                 pass
         self.log_msg("📊 数据概览：" + "；".join(
@@ -7925,19 +8467,19 @@ class App:
 
         outer = ttk.Frame(dlg, padding=10)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text=headline, font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(outer, text=headline, font=ui_font(FONT_SM, True)).pack(anchor="w")
         if blocked:
             ttk.Label(outer, text=f"另有 {len(blocked)} 个将被跳过（原因见第二个标签页）。",
-                      foreground="#a32d2d").pack(anchor="w", pady=(3, 0))
+                      foreground="#a32d2d").pack(anchor="w", pady=(PAD_XS, 0))
         if notes:
             ttk.Label(outer, text=notes, foreground="#6b7280",
-                      wraplength=640, justify="left").pack(anchor="w", pady=(3, 0))
+                      wraplength=640, justify="left").pack(anchor="w", pady=(PAD_XS, 0))
         if danger:
             ttk.Label(outer, text="⚠️ 不可恢复：删除后所有成员都再也看不到它。",
-                      foreground="#a32d2d").pack(anchor="w", pady=(3, 0))
+                      foreground="#a32d2d").pack(anchor="w", pady=(PAD_XS, 0))
 
         nb = ttk.Notebook(outer)
-        nb.pack(fill="both", expand=True, pady=8)
+        nb.pack(fill="both", expand=True, pady=PAD_SM)
         nb.add(self._plan_tree(nb, to_do, check_col=False),
                text=f"将执行（{len(to_do)}）")
         if blocked:
@@ -7956,11 +8498,11 @@ class App:
 
         if confirm_word:
             row = ttk.Frame(outer)
-            row.pack(fill="x", pady=(8, 0))
+            row.pack(fill="x", pady=(PAD_SM, 0))
             ttk.Label(row, text=f"确认无误，请输入「{confirm_word}」：").pack(side="left")
             word_var = tk.StringVar()
             entry = ttk.Entry(row, textvariable=word_var, width=10)
-            entry.pack(side="left", padx=6)
+            entry.pack(side="left", padx=PAD_SM)
             entry.focus_set()
 
             def _sync(*_a):
@@ -7980,9 +8522,9 @@ class App:
 
         ok_btn.configure(command=on_ok)
         bar = ttk.Frame(outer)
-        bar.pack(fill="x", pady=(6, 0))
-        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=4)
-        ok_btn.pack(side="right", padx=4)
+        bar.pack(fill="x", pady=(PAD_SM, 0))
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=PAD_XS)
+        ok_btn.pack(side="right", padx=PAD_XS)
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         if not confirm_word:
@@ -9517,6 +10059,8 @@ def selftest():
                     if _ww > 1:
                         for _k in _kids:
                             try:
+                                if _k is getattr(app, "bg_layer", None):
+                                    continue      # 背景图层故意铺满/溢出，不算被裁
                                 if (_k.winfo_ismapped() and _k.winfo_width() > 1
                                         and (_k.winfo_rootx() + _k.winfo_width())
                                         > (w.winfo_rootx() + _ww + 1)):
@@ -9531,6 +10075,37 @@ def selftest():
             assert app.btn_folder.winfo_width() != 32 or app.root.winfo_width() <= 100, \
                 "「📁 分组」按钮被挤扁了"
             _selftest_say(lines, "v1.7.4：选择条 / 操作条折行 + 全界面无控件被裁 OK")
+            # v1.7.5：设计令牌 + 完全自绘主题
+            assert set(THEME_LIGHT) == set(THEME_DARK), "浅/深令牌键不一致"
+            assert len(THEME_LIGHT) >= 30
+            assert (PAD_XS, PAD_SM, PAD_MD, PAD_LG) == (4, 8, 12, 16)
+            _st = ttk.Style(app.root)
+            assert _st.theme_use() == "clam", "没有用 clam 主题（vista 做不出扁平观感）"
+            assert UI_FONT_FAMILY, "字体族没有设置"
+            _bgs = {_st.lookup(n, "background")
+                    for n in ("TButton", "Primary.TButton", "Danger.TButton")}
+            assert len(_bgs) == 3, "按钮三级没有区分开: %s" % _bgs
+            assert _st.lookup("Primary.TButton", "background") == THEME_LIGHT["accent"]
+            assert _st.lookup("Danger.TButton", "background") == THEME_LIGHT["danger"]
+            assert str(app.btn_leave.cget("style")) == "Primary.TButton"
+            assert str(app.btn_destroy.cget("style")) == "Danger.TMenubutton"
+            assert int(_st.lookup("Treeview", "rowheight")) == 26
+            for _w, _l in ((app._flow_header, "顶部条"), (app._flow_sel, "选择条")):
+                assert not _w._errors, "%s 摆放失败" % _l
+            _selftest_say(lines, "v1.7.5：设计令牌 · clam 自绘 · 按钮三级 · 统一字体（%s）OK"
+                          % UI_FONT_FAMILY)
+            # 背景图片：工具函数 + 外观页入口
+            assert callable(bg_photo_fit) and callable(load_bg_photo)
+            assert BG_IMAGE_EXTS and BG_IMAGE_UNSUPPORTED and ".jpg" in BG_IMAGE_UNSUPPORTED
+            assert app.bg_layer is not None, "没有建背景层"
+            for _m2 in ("on_pick_bg_image", "on_clear_bg_image", "set_bg_image", "_show_bg"):
+                assert callable(getattr(app, _m2, None)), "缺少 %s" % _m2
+            assert app.btn_bg_pick is not None and app.btn_bg_clear is not None
+            # ⚠️ 必须 quiet=True：selftest 里没有人点「确定」，弹模态框会直接卡死
+            assert app.set_bg_image("", quiet=True) is False, "空路径应被拒绝"
+            assert app.set_bg_image(os.path.join(BASE_DIR, "不存在.jpg"), quiet=True) is False
+            assert app.set_bg_image(os.path.join(BASE_DIR, "没有这个文件.png"), quiet=True) is False
+            _selftest_say(lines, "v1.7.5：背景图片（PNG/GIF 铺满 · JPG 明确拒绝 · 记忆路径）OK")
         finally:
             r.destroy()
         _selftest_say(lines, "界面骨架 OK（列 = %s）" % (",".join(cols),))
