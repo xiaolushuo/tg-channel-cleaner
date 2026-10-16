@@ -54,13 +54,13 @@ except ModuleNotFoundError:
     guide = (
         "[错误] 当前 Python 未包含 tkinter（GUI 模块），无法启动界面。\n"
         "解决办法（任选其一）：\n"
-        "  1) 直接用已打包好的单文件程序：dist/TG频道批量退出工具.%s.exe（无需安装 Python）。\n" % _ver
+        "  1) 直接用已打包好的单文件程序：dist/TG频道批量退出工具.%s.exe（无需安装 Python）。\n"
         "  2) 换用带 tkinter 的完整版 Python：\n"
         "     - Windows：从 https://www.python.org 安装官方 CPython（默认即含 tkinter）。\n"
         "     - Linux(Debian/Ubuntu)：sudo apt install python3-tk\n"
         "     - macOS：brew install python-tk，或重装 python.org 版。\n"
         "  3) 装好 tkinter 后，再 pip install -r requirements.txt 运行本脚本。\n"
-    )
+    ) % _ver
 
     # 若已存在打包好的 exe，直接询问是否打开它（最省事，不依赖 tkinter）
     launched = False
@@ -294,11 +294,19 @@ ROLE_LABEL = {"creator": "创建者", "admin": "管理员"}
 # 版本号只有一个真源：窗口标题、状态栏标签、更新日志窗口、--selftest 全部读这里。
 # 发版时改 APP_VERSION，并在 CHANGELOG 最前面插一条（仓库里的 CHANGELOG.md 同步更新）。
 APP_NAME = "TG 频道批量退出工具"
-APP_VERSION = "v1.7.6"
+APP_VERSION = "v1.7.7"
 APP_REPO = "https://github.com/xiaolushuo/tg-channel-cleaner"
 
 # [(版本, 日期, [变更条目, ...]), ...] —— 新的放最前面
 CHANGELOG = [
+    ("v1.7.7", "2026-10-16", [
+        "新增：**会话列表可点击跳转到本机 Telegram 客户端会话窗口**。双击任意会话行，"
+        "或在右键菜单点「在客户端打开」，即用 `tg://` 深链调起已安装的 Telegram 桌面端并定位到该会话"
+        "（公开频道/群组走 `tg://resolve?domain=用户名`；私有频道/群组走 `tg://openmessage?chat_id=` "
+        "且频道/超级组自动带 -100 前缀）。本机没装/没关联 Telegram 客户端时自动降级为浏览器打开 t.me 网页版",
+        "说明：列表每行原本就有「复制 t.me 链接」和「在浏览器打开」（开网页版），本次新增的是"
+        "「跳转到客户端会话窗口」这一条 —— 两者并存，互不替代",
+    ]),
     ("v1.7.6", "2026-10-16", [
         "修复：**「顶部的筛选框全都没有了」**（用户第三次反馈，这次查到了真因）。"
         "先按用户要求做了版本对照：把 v1.3.1 的界面代码整个拉出来逐项比对，"
@@ -4162,6 +4170,7 @@ class App:
                              anchor="center" if c in ("sel", "type", "members", "posts",
                                                        "active", "risk", "safe") else "w")
         self.tree.bind("<ButtonRelease-1>", self.on_tree_click)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)   # 双击 → 在客户端打开会话
 
         vsb = ttk.Scrollbar(frm_list, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(frm_list, orient="horizontal", command=self.tree.xview)
@@ -5181,6 +5190,7 @@ class App:
             m.add_command(label="复制用户名", command=lambda: self._ctx_copy("username"))
             m.add_command(label="复制 ID", command=lambda: self._ctx_copy("id"))
             m.add_command(label="复制 t.me 链接", command=self._ctx_copy_link)
+            m.add_command(label="在客户端打开", command=self._ctx_open_client)
             m.add_command(label="在浏览器打开", command=self._ctx_open_link)
             m.add_separator()
             m.add_command(label="只看该类型", command=self._ctx_filter_type)
@@ -5253,6 +5263,72 @@ class App:
             self.log_msg(f"🌐 已用浏览器打开：{link}")
         except Exception as e:
             self.log_msg(f"❌ 打开链接失败：{humanize_error(e)}")
+
+    def _tclient_link(self, iid):
+        """构造能在「本机 Telegram 客户端」打开会话的深链（tg:// 协议）。
+
+        有用户名（公开频道/公开群组）走 tg://resolve?domain=，最稳；
+        无用户名的私有频道/群组走 tg://openmessage?chat_id=（-100 前缀是
+        Telegram 客户端识别超级组/频道聊天的方式）；私聊走 user_id=。
+        兜底：拿不到实体时退回树里存的 id。"""
+        ent = self.channels.get(iid)
+        uname = str(self.tree.set(iid, "username") or "").strip().lstrip("@")
+        if uname:
+            return "tg://resolve?domain=%s" % uname
+        if ent is not None:
+            raw = getattr(ent, "id", None)
+            if raw is not None:
+                if isinstance(ent, Channel):
+                    return "tg://openmessage?chat_id=-100%d" % raw
+                if isinstance(ent, tl_types.User):
+                    return "tg://openmessage?user_id=%d" % raw
+                if isinstance(ent, tl_types.Chat):
+                    return "tg://openmessage?chat_id=%d" % raw
+                return "tg://openmessage?chat_id=%d" % raw
+        cid = str(self.tree.set(iid, "id") or "").strip()
+        return "tg://openmessage?chat_id=%s" % cid if cid else "tg://resolve"
+
+    def _try_open(self, url):
+        """用系统关联程序打开 URL（能正确触发 tg:// 协议处理器）；失败逐级兜底。"""
+        try:
+            os.startfile(url)              # Windows：ShellExecute，自定义协议也能调起
+            return True
+        except Exception:                  # noqa: BLE001
+            pass
+        try:
+            import webbrowser
+            return bool(webbrowser.open(url))
+        except Exception:                  # noqa: BLE001
+            return False
+
+    def _open_in_client(self, iid):
+        if not iid or iid not in self.channels:
+            return
+        link = self._tclient_link(iid)
+        name = (self.tree.set(iid, "name") or self.tree.set(iid, "username")
+                or link)
+        if self._try_open(link):
+            self.log_msg("🚀 已在 Telegram 客户端打开会话：%s" % name)
+            return
+        # tg:// 没调起（多半本机没装/没关联 Telegram 客户端）→ 退而求其次用浏览器打开网页版
+        web = self._tme_link(iid)
+        if self._try_open(web):
+            self.log_msg("⚠️ 本机未关联 Telegram 客户端，已改用浏览器打开：%s" % web)
+        else:
+            self.log_msg("❌ 打开失败（%s）。可手动复制链接：%s" % (name, link))
+
+    def on_tree_double_click(self, event):
+        """双击会话行 → 在本机 Telegram 客户端打开该会话窗口。"""
+        iid = self.tree.identify_row(event.y)
+        if not iid or iid not in self.channels:
+            return
+        self._open_in_client(iid)
+
+    def _ctx_open_client(self):
+        iid, _ = self._ctx_row()
+        if not iid:
+            return
+        self._open_in_client(iid)
 
     def _ctx_toggle_whitelist(self):
         iid, _ = self._ctx_row()
@@ -10104,6 +10180,26 @@ def selftest():
             # 空列表下三档都必须返回空（未连接 / 未加载时不能抛）
             assert app._folder_scope_iids(FOLDER_SCOPE_ALL) == []
             _selftest_say(lines, "批量划分分组：分组按钮 / 操作菜单 / 三档范围（勾选·筛选结果·全部）OK")
+            # v1.7.7：会话列表可点击跳转到本机 Telegram 客户端会话窗口
+            assert callable(app.on_tree_double_click) and callable(app._open_in_client)
+            assert callable(app._tclient_link) and callable(app._ctx_open_client)
+            _dbl = app.tree.bind("<Double-1>")
+            assert _dbl and "on_tree_double_click" in str(_dbl), "Treeview 未绑定双击跳客户端"
+            # 深链构造：有用户名走 resolve；无用户名（私有）走 openmessage，频道带 -100 前缀
+            app.channels.clear()
+            app.tree.delete(*app.tree.get_children())
+            _i1 = app.tree.insert("", "end", values=("☐", "公开频道", "@pubchan", "频道",
+                                                     "1", "2", "3天前", "", "", "100200", "可退出"))
+            app.channels[_i1] = type("E", (), {"id": 100200, "username": "pubchan"})()
+            assert app._tclient_link(_i1) == "tg://resolve?domain=pubchan", app._tclient_link(_i1)
+            _i2 = app.tree.insert("", "end", values=("☐", "私有频道", "", "频道",
+                                                     "1", "2", "3天前", "", "", "300400", "可退出"))
+            app.channels[_i2] = Channel(id=300400, title="", photo=None, date=None)
+            assert app._tclient_link(_i2) == "tg://openmessage?chat_id=-100300400", app._tclient_link(_i2)
+            # 复原：清掉测试用的假行，避免污染后续「名额 = 0」等断言
+            app.channels.clear()
+            app.tree.delete(*app.tree.get_children())
+            _selftest_say(lines, "v1.7.7：双击会话行 / 右键「在客户端打开」→ tg:// 深链跳本机 Telegram 客户端 OK")
             # 异常特征提取：按钮 + 菜单 + 分类器（全部来自服务端字段，零请求）
             assert app.btn_risk is not None, "缺少「🚫 异常」按钮"
             assert app._risk_menu is not None, "缺少异常筛选菜单"
