@@ -1,5 +1,21 @@
 # TG 频道批量退出工具
 
+> ⚡ **Web 版 v3（当前主线）**：React 19 + Tailwind CSS + Framer Motion 前端，
+> FastAPI + Telethon 后端，源码在 [`tg-leave-web/`](tg-leave-web/)。
+> 一键启动 `tg-leave-web/启动.bat`，浏览器打开 `http://127.0.0.1:8787`；
+> **演示模式零凭据**即可体验全部功能（500 条模拟数据）。
+> 功能对齐 Python v1.7.7 全集并持续增强：媒体统计（全历史真实总数）/ 快照对比 / 导出 Excel /
+> 断点续跑 / 白名单 / 分组 / 设备管理 / 风险识别（只认服务端字段）……
+> 当前 **v3.20.7**，详细说明与更新日志见 [`tg-leave-web/README.md`](tg-leave-web/README.md)。
+
+## 界面预览（Web 版 · 演示模式）
+
+| 主界面 · 亮色（概览展开） | 主界面 · 暗色 |
+|:---:|:---:|
+| ![主界面亮色](tg-leave-web/docs/screenshots/demo-main-light.png) | ![主界面暗色](tg-leave-web/docs/screenshots/demo-main-dark.png) |
+| **媒体分布详情弹窗** | **列表视图（概览收起）** |
+| ![媒体分布详情](tg-leave-web/docs/screenshots/demo-media-detail.png) | ![列表视图](tg-leave-web/docs/screenshots/demo-overview.png) |
+
 > 一个单文件的 Windows 桌面工具：把账号里**全部会话**一次性列出来，看清类型 / 用户数 / 作品数 / 活跃天数 / 所属分组，勾选后批量**退出**、批量**删除会话**，**批量划分到某个分组**，或**删除自己创建的群组与频道**。
 > **支持多账号**：多个账号随时切换，切换时不会退出登录。
 > 纯本地运行，不依赖任何第三方服务器。
