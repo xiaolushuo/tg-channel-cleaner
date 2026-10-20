@@ -56,3 +56,21 @@ env/
 Thumbs.db
 desktop.ini
 tkinter_missing.log
+
+# ============================================================
+# Web 版（tg-leave-web）—— 运行时数据 / 凭据 / 依赖 / 构建产物
+# ============================================================
+# 本机账号数据：登录态 .session、api_id/hash 配置、统计/历史/媒体/快照/白名单缓存、头像
+tg-leave-web/data/
+# 调试转储（真实会话数据）
+tg-leave-web/_dl.json
+# Python 虚拟环境与字节码缓存
+.venv/
+venv/
+__pycache__/
+*.pyc
+# 前端依赖与构建产物（使用者自行 npm install / npm run build）
+node_modules/
+tg-leave-web/ui/dist/
+# 浏览器自动化临时目录
+.playwright-cli/
